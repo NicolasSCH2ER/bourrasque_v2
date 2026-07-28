@@ -1,0 +1,19 @@
+# Build CMake / Visual Studio
+build/
+out/
+x64/
+*.vcxproj.user
+
+# Artefacts déposés par le POST_BUILD, reconstruits à chaque build
+extension/bin/
+
+# Dumps de simulation et sidecars matériaux
+*.bqd
+*.mat
+
+# Cache de bake Blender
+bourrasque_cache/
+
+# Python
+__pycache__/
+*.pyc
