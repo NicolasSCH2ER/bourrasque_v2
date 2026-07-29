@@ -1,0 +1,33 @@
+schema_version = "1.0.0"
+
+id = "bourrasque"
+version = "0.1.0"
+name = "Bourrasque"
+tagline = "Solveur de fluides MLS-MPM accéléré GPU"
+maintainer = "Nicolas Scheer <nicolasscheer2003@gmail.com>"
+type = "add-on"
+
+blender_version_min = "5.1.0"
+
+# bin/bourrasque.dll est Windows-only (voir lib.py, _DLL_NAME) : l'extension
+# ne doit pas s'installer sur d'autres plateformes pour y echouer au premier
+# usage (chargement de la DLL).
+platforms = ["windows-x64"]
+
+# License conforming to https://spdx.org/licenses/ (use "SPDX:" prefix)
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+tags = ["Physics", "3D View"]
+
+[permissions]
+files = "Charge le moteur natif et lit/écrit le cache de bake sur disque"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/*.zip",
+  "/tests/",
+]

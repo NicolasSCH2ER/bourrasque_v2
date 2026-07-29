@@ -118,7 +118,7 @@ struct MaterialGpu {
 };
 
 struct SimParamsGpu {
-    int   res;
+    int3  res;
     float dx, inv_dx, dt;
     float gravity_y;
     int   bound;
@@ -197,6 +197,10 @@ __global__ void k_p2g(const float3* __restrict__ x,
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j)
             for (int k = 0; k < 3; ++k) {
+                int gx = base.x + i, gy = base.y + j, gz = base.z + k;
+                if (gx < 0 || gx >= c_p.res.x || gy < 0 || gy >= c_p.res.y ||
+                    gz < 0 || gz >= c_p.res.z)
+                    continue; /* noeud hors grille : ignore (UB evite) */
                 float3 dpos = make_float3((i - fx.x) * c_p.dx,
                                           (j - fx.y) * c_p.dx,
                                           (k - fx.z) * c_p.dx);
@@ -205,8 +209,7 @@ __global__ void k_p2g(const float3* __restrict__ x,
                 mom.x = weight * (m.p_mass * vp.x + mom.x);
                 mom.y = weight * (m.p_mass * vp.y + mom.y);
                 mom.z = weight * (m.p_mass * vp.z + mom.z);
-                int idx = ((base.x + i) * c_p.res + (base.y + j)) * c_p.res
-                          + (base.z + k);
+                int idx = (gx * c_p.res.y + gy) * c_p.res.z + gz;
                 atomicAdd(&grid[idx].x, mom.x);
                 atomicAdd(&grid[idx].y, mom.y);
                 atomicAdd(&grid[idx].z, mom.z);
@@ -223,17 +226,17 @@ __global__ void k_grid_update(float4* grid, int ncell) {
     float3 v = make_float3(g.x / g.w, g.y / g.w, g.z / g.w);
     v.y += c_p.dt * c_p.gravity_y;
 
-    int res = c_p.res, b = c_p.bound;
-    int i = id / (res * res);
-    int j = (id / res) % res;
-    int k = id % res;
+    int3 res = c_p.res; int b = c_p.bound;
+    int i = id / (res.y * res.z);
+    int j = (id / res.z) % res.y;
+    int k = id % res.z;
     /* conditions separantes : composante normale annulee vers la paroi */
     if (i < b && v.x < 0.f) v.x = 0.f;
-    if (i >= res - b && v.x > 0.f) v.x = 0.f;
+    if (i >= res.x - b && v.x > 0.f) v.x = 0.f;
     if (j < b && v.y < 0.f) v.y = 0.f;
-    if (j >= res - b && v.y > 0.f) v.y = 0.f;
+    if (j >= res.y - b && v.y > 0.f) v.y = 0.f;
     if (k < b && v.z < 0.f) v.z = 0.f;
-    if (k >= res - b && v.z > 0.f) v.z = 0.f;
+    if (k >= res.z - b && v.z > 0.f) v.z = 0.f;
 
     grid[id] = make_float4(v.x, v.y, v.z, g.w);
 }
@@ -262,12 +265,15 @@ __global__ void k_g2p(float3* __restrict__ x,
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j)
             for (int k = 0; k < 3; ++k) {
+                int gx = base.x + i, gy = base.y + j, gz = base.z + k;
+                if (gx < 0 || gx >= c_p.res.x || gy < 0 || gy >= c_p.res.y ||
+                    gz < 0 || gz >= c_p.res.z)
+                    continue; /* noeud hors grille : contribution nulle */
                 float3 dpos = make_float3((i - fx.x) * c_p.dx,
                                           (j - fx.y) * c_p.dx,
                                           (k - fx.z) * c_p.dx);
                 float weight = w[i][0] * w[j][1] * w[k][2];
-                int idx = ((base.x + i) * c_p.res + (base.y + j)) * c_p.res
-                          + (base.z + k);
+                int idx = (gx * c_p.res.y + gy) * c_p.res.z + gz;
                 float4 g = grid[idx];
                 float3 gv = make_float3(g.x, g.y, g.z);
                 nv.x += weight * gv.x;
@@ -281,10 +287,12 @@ __global__ void k_g2p(float3* __restrict__ x,
     v[p] = nv;
 
     float lo = c_p.bound * c_p.dx;
-    float hi = c_p.res * c_p.dx - lo;
-    x[p] = make_float3(fminf(fmaxf(xp.x + c_p.dt * nv.x, lo), hi),
-                       fminf(fmaxf(xp.y + c_p.dt * nv.y, lo), hi),
-                       fminf(fmaxf(xp.z + c_p.dt * nv.z, lo), hi));
+    float hi_x = c_p.res.x * c_p.dx - lo;
+    float hi_y = c_p.res.y * c_p.dx - lo;
+    float hi_z = c_p.res.z * c_p.dx - lo;
+    x[p] = make_float3(fminf(fmaxf(xp.x + c_p.dt * nv.x, lo), hi_x),
+                       fminf(fmaxf(xp.y + c_p.dt * nv.y, lo), hi_y),
+                       fminf(fmaxf(xp.z + c_p.dt * nv.z, lo), hi_z));
 
     if (c_p.mats[mat[p]].model == BQ_MODEL_WATER) {
         float tr = C.m[0] + C.m[4] + C.m[8];
@@ -319,11 +327,11 @@ static int upload_params(BqSim* s) {
     float c_max = 1e-3f;
     for (int i = 0; i < s->n_mats; ++i)
         c_max = fmaxf(c_max, material_sound_speed(s->mats_host[i]));
-    float dx = s->cfg.domain / s->cfg.grid_res;
+    float dx = s->cfg.cell_size;
     s->dt = s->cfg.cfl * dx / c_max;
 
     SimParamsGpu& p = s->prm;
-    p.res = s->cfg.grid_res;
+    p.res = make_int3(s->cfg.grid_res[0], s->cfg.grid_res[1], s->cfg.grid_res[2]);
     p.dx = dx;
     p.inv_dx = 1.f / dx;
     p.dt = s->dt;
@@ -348,9 +356,19 @@ static int upload_params(BqSim* s) {
 /* -------------------------------------------------------------------- API */
 extern "C" {
 
+/* A appeler en tout premier, avant bq_create : ne touchent a aucun etat ni
+   au GPU, donc ne peuvent jamais echouer. */
+BQ_API int bq_abi_version(void) {
+    return BQ_ABI_VERSION;
+}
+
+BQ_API int bq_config_size(void) {
+    return (int)sizeof(BqConfig);
+}
+
 BQ_API void bq_default_config(BqConfig* cfg) {
-    cfg->grid_res = 64;
-    cfg->domain = 1.f;
+    cfg->grid_res[0] = cfg->grid_res[1] = cfg->grid_res[2] = 64;
+    cfg->cell_size = 1.f / 64.f;
     cfg->gravity_y = -9.8f;
     cfg->cfl = 0.3f;
     cfg->ppc_axis = 2;
@@ -361,7 +379,7 @@ BQ_API BqSim* bq_create(const BqConfig* cfg) {
     BqSim* s = new BqSim();
     s->cfg = cfg ? *cfg : (bq_default_config(&s->cfg), s->cfg);
     int cap = s->cfg.max_particles;
-    int ncell = s->cfg.grid_res * s->cfg.grid_res * s->cfg.grid_res;
+    int ncell = s->cfg.grid_res[0] * s->cfg.grid_res[1] * s->cfg.grid_res[2];
     if (cudaMalloc(&s->d_x, cap * sizeof(float3)) != cudaSuccess ||
         cudaMalloc(&s->d_v, cap * sizeof(float3)) != cudaSuccess ||
         cudaMalloc(&s->d_C, cap * 9 * sizeof(float)) != cudaSuccess ||
@@ -395,52 +413,153 @@ BQ_API int bq_add_material(BqSim* s, const BqMaterial* mat) {
     return id;
 }
 
+/* Chemin d'initialisation/upload partage par bq_emit_box, bq_emit_points et
+ * bq_emit_points_vel : verifie mat_id, capacite et que chaque point est dans
+ * le domaine valide, puis initialise F=I, C=0, J=1, v=pv[i], mat=mat_id et
+ * televerse vers le device. pv doit pointer sur count vitesses (une par
+ * particule ; l'appelant duplique une vitesse uniforme si besoin).
+ * Retourne le nombre de particules emises, ou -1 (g_error rempli). */
+static int emit_particles(BqSim* s, int mat_id, const float3* px,
+                           const float3* pv, int count) {
+    if (mat_id < 0 || mat_id >= s->n_mats) {
+        snprintf(g_error, sizeof(g_error), "mat_id %d invalide", mat_id);
+        return -1;
+    }
+    if (s->n + count > s->cfg.max_particles) {
+        snprintf(g_error, sizeof(g_error), "capacite depassee (%d + %d > %d)",
+                 s->n, count, s->cfg.max_particles);
+        return -1;
+    }
+    {
+        float valid_lo = s->prm.bound * s->prm.dx;
+        float valid_hi_x = s->cfg.grid_res[0] * s->prm.dx - s->prm.bound * s->prm.dx;
+        float valid_hi_y = s->cfg.grid_res[1] * s->prm.dx - s->prm.bound * s->prm.dx;
+        float valid_hi_z = s->cfg.grid_res[2] * s->prm.dx - s->prm.bound * s->prm.dx;
+        for (int i = 0; i < count; ++i) {
+            const float3& p = px[i];
+            if (p.x < valid_lo || p.x > valid_hi_x ||
+                p.y < valid_lo || p.y > valid_hi_y ||
+                p.z < valid_lo || p.z > valid_hi_z) {
+                snprintf(g_error, sizeof(g_error),
+                         "point %d hors domaine (x=%g y=%g z=%g), "
+                         "bornes valides [%g, %g]x[%g, %g]x[%g, %g]",
+                         i, p.x, p.y, p.z, valid_lo, valid_hi_x,
+                         valid_lo, valid_hi_y, valid_lo, valid_hi_z);
+                return -1;
+            }
+        }
+    }
+
+    std::vector<float> id9(count * 9, 0.f), ones(count, 1.f);
+    for (int i = 0; i < count; ++i) { id9[9 * i] = id9[9 * i + 4] = id9[9 * i + 8] = 1.f; }
+    std::vector<float> zero9(count * 9, 0.f);
+    std::vector<uint8_t> mid(count, (uint8_t)mat_id);
+
+    int off = s->n;
+    BQ_CUDA_CHECK(cudaMemcpy(s->d_x + off, px, count * sizeof(float3),
+                             cudaMemcpyHostToDevice));
+    BQ_CUDA_CHECK(cudaMemcpy(s->d_v + off, pv, count * sizeof(float3),
+                             cudaMemcpyHostToDevice));
+    BQ_CUDA_CHECK(cudaMemcpy(s->d_F + 9 * off, id9.data(),
+                             count * 9 * sizeof(float), cudaMemcpyHostToDevice));
+    BQ_CUDA_CHECK(cudaMemcpy(s->d_C + 9 * off, zero9.data(),
+                             count * 9 * sizeof(float), cudaMemcpyHostToDevice));
+    BQ_CUDA_CHECK(cudaMemcpy(s->d_J + off, ones.data(), count * sizeof(float),
+                             cudaMemcpyHostToDevice));
+    BQ_CUDA_CHECK(cudaMemcpy(s->d_mat + off, mid.data(), count * sizeof(uint8_t),
+                             cudaMemcpyHostToDevice));
+    s->n += count;
+    return count;
+}
+
 BQ_API int bq_emit_box(BqSim* s, int mat_id, const float lo[3],
                        const float hi[3], const float vel[3]) {
     if (mat_id < 0 || mat_id >= s->n_mats) {
         snprintf(g_error, sizeof(g_error), "mat_id %d invalide", mat_id);
         return -1;
     }
+    {
+        static const char* axis_name[3] = { "x", "y", "z" };
+        float valid_lo = s->prm.bound * s->prm.dx;
+        for (int a = 0; a < 3; ++a) {
+            float valid_hi = s->cfg.grid_res[a] * s->prm.dx - s->prm.bound * s->prm.dx;
+            if (lo[a] >= hi[a]) {
+                snprintf(g_error, sizeof(g_error),
+                         "bq_emit_box: boite degeneree sur l'axe %s (lo=%g >= hi=%g)",
+                         axis_name[a], lo[a], hi[a]);
+                return -1;
+            }
+            if (lo[a] < valid_lo || hi[a] > valid_hi) {
+                snprintf(g_error, sizeof(g_error),
+                         "bq_emit_box: boite hors domaine sur l'axe %s "
+                         "(lo=%g hi=%g, bornes valides [%g, %g])",
+                         axis_name[a], lo[a], hi[a], valid_lo, valid_hi);
+                return -1;
+            }
+        }
+    }
     float spacing = s->prm.dx / s->cfg.ppc_axis;
-    std::vector<float3> px, pv;
+    std::vector<float3> px;
     for (float x = lo[0] + spacing / 2; x < hi[0]; x += spacing)
         for (float y = lo[1] + spacing / 2; y < hi[1]; y += spacing)
-            for (float z = lo[2] + spacing / 2; z < hi[2]; z += spacing) {
+            for (float z = lo[2] + spacing / 2; z < hi[2]; z += spacing)
                 px.push_back(make_float3(x, y, z));
-                pv.push_back(make_float3(vel[0], vel[1], vel[2]));
-            }
-    int add = (int)px.size();
-    if (s->n + add > s->cfg.max_particles) {
-        snprintf(g_error, sizeof(g_error), "capacite depassee (%d + %d > %d)",
-                 s->n, add, s->cfg.max_particles);
+
+    std::vector<float3> pv(px.size(), make_float3(vel[0], vel[1], vel[2]));
+    return emit_particles(s, mat_id, px.data(), pv.data(), (int)px.size());
+}
+
+BQ_API int bq_emit_points(BqSim* s, int mat_id, const float* pos, int count,
+                          const float vel[3]) {
+    if (mat_id < 0 || mat_id >= s->n_mats) {
+        snprintf(g_error, sizeof(g_error), "mat_id %d invalide", mat_id);
         return -1;
     }
-    std::vector<float> id9(add * 9, 0.f), ones(add, 1.f);
-    for (int i = 0; i < add; ++i) { id9[9 * i] = id9[9 * i + 4] = id9[9 * i + 8] = 1.f; }
-    std::vector<float> zero9(add * 9, 0.f);
-    std::vector<uint8_t> mid(add, (uint8_t)mat_id);
+    if (count <= 0 || pos == NULL) {
+        snprintf(g_error, sizeof(g_error),
+                 "bq_emit_points: count invalide ou pos nul (count=%d)", count);
+        return -1;
+    }
+    std::vector<float3> px(count);
+    for (int i = 0; i < count; ++i)
+        px[i] = make_float3(pos[3 * i], pos[3 * i + 1], pos[3 * i + 2]);
 
-    int off = s->n;
-    BQ_CUDA_CHECK(cudaMemcpy(s->d_x + off, px.data(), add * sizeof(float3),
-                             cudaMemcpyHostToDevice));
-    BQ_CUDA_CHECK(cudaMemcpy(s->d_v + off, pv.data(), add * sizeof(float3),
-                             cudaMemcpyHostToDevice));
-    BQ_CUDA_CHECK(cudaMemcpy(s->d_F + 9 * off, id9.data(),
-                             add * 9 * sizeof(float), cudaMemcpyHostToDevice));
-    BQ_CUDA_CHECK(cudaMemcpy(s->d_C + 9 * off, zero9.data(),
-                             add * 9 * sizeof(float), cudaMemcpyHostToDevice));
-    BQ_CUDA_CHECK(cudaMemcpy(s->d_J + off, ones.data(), add * sizeof(float),
-                             cudaMemcpyHostToDevice));
-    BQ_CUDA_CHECK(cudaMemcpy(s->d_mat + off, mid.data(), add * sizeof(uint8_t),
-                             cudaMemcpyHostToDevice));
-    s->n += add;
-    return add;
+    std::vector<float3> pv(count, make_float3(vel[0], vel[1], vel[2]));
+    return emit_particles(s, mat_id, px.data(), pv.data(), count);
+}
+
+/* Comme bq_emit_points, mais avec une vitesse propre a chaque particule
+ * (vel entrelace vx,vy,vz, meme indexation que pos). Meme validation que
+ * bq_emit_points, plus le rejet de vel nul. */
+BQ_API int bq_emit_points_vel(BqSim* s, int mat_id, const float* pos,
+                              const float* vel, int count) {
+    if (mat_id < 0 || mat_id >= s->n_mats) {
+        snprintf(g_error, sizeof(g_error), "mat_id %d invalide", mat_id);
+        return -1;
+    }
+    if (count <= 0 || pos == NULL) {
+        snprintf(g_error, sizeof(g_error),
+                 "bq_emit_points_vel: count invalide ou pos nul (count=%d)", count);
+        return -1;
+    }
+    if (vel == NULL) {
+        snprintf(g_error, sizeof(g_error),
+                 "bq_emit_points_vel: vel nul (count=%d)", count);
+        return -1;
+    }
+    std::vector<float3> px(count), pv(count);
+    for (int i = 0; i < count; ++i) {
+        px[i] = make_float3(pos[3 * i], pos[3 * i + 1], pos[3 * i + 2]);
+        pv[i] = make_float3(vel[3 * i], vel[3 * i + 1], vel[3 * i + 2]);
+    }
+
+    return emit_particles(s, mat_id, px.data(), pv.data(), count);
 }
 
 BQ_API int bq_step(BqSim* s, float frame_dt) {
     if (s->n == 0 || s->n_mats == 0) return 0;
     int substeps = (int)ceilf(frame_dt / s->dt);
-    int ncell = s->prm.res * s->prm.res * s->prm.res;
+    int ncell = s->prm.res.x * s->prm.res.y * s->prm.res.z;
     dim3 bp(256), gp((s->n + 255) / 256), gc((ncell + 255) / 256);
 
     for (int i = 0; i < substeps; ++i) {

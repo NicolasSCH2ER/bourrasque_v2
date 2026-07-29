@@ -4,6 +4,9 @@ out/
 x64/
 *.vcxproj.user
 
+# Paquets d'extension construits par `blender --command extension build`
+dist/
+
 # Artefacts déposés par le POST_BUILD, reconstruits à chaque build
 extension/bin/
 

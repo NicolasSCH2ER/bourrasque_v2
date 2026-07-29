@@ -26,6 +26,10 @@ extern "C" {
 
 typedef struct BqSim BqSim; /* handle opaque */
 
+/* Version de l'ABI : a incrementer des que la disposition d'une struct
+   publique ou la signature d'une fonction exportee change. */
+#define BQ_ABI_VERSION 2
+
 /* Modeles constitutifs. D'autres viendront (sable, neige) sans changer
  * l'API : c'est tout l'interet du pipeline MPM unifie. */
 enum BqModel {
@@ -34,8 +38,8 @@ enum BqModel {
 };
 
 typedef struct BqConfig {
-    int   grid_res;      /* noeuds par axe (defaut 64)                  */
-    float domain;        /* cote du domaine cubique en metres (defaut 1)*/
+    int   grid_res[3];   /* nombre de cellules par axe (x, y, z) (defaut 64,64,64) */
+    float cell_size;     /* taille de maille, uniforme sur les trois axes, en metres (defaut 1/64) */
     float gravity_y;     /* defaut -9.8                                 */
     float cfl;           /* defaut 0.3 (CFL acoustique)                 */
     int   ppc_axis;      /* particules/cellule/axe (defaut 2 -> 8/cell) */
@@ -50,6 +54,14 @@ typedef struct BqMaterial {
     float bulk;   /* module de compressibilite k (WATER)       */
     float gamma;  /* exposant de Tait (WATER, typ. 3-7)        */
 } BqMaterial;
+
+/* Version d'ABI de la bibliotheque compilee. A comparer a BQ_ABI_VERSION
+   par l'appelant avant tout autre appel. */
+BQ_API int bq_abi_version(void);
+
+/* sizeof(BqConfig) tel que la bibliotheque le voit. Detecte un decalage de
+   struct meme si la version d'ABI a ete oubliee. */
+BQ_API int bq_config_size(void);
 
 /* Remplit cfg avec les valeurs par defaut. */
 BQ_API void bq_default_config(BqConfig* cfg);
@@ -66,6 +78,18 @@ BQ_API int bq_add_material(BqSim* sim, const BqMaterial* mat);
 BQ_API int bq_emit_box(BqSim* sim, int mat_id,
                        const float lo[3], const float hi[3],
                        const float vel[3]);
+
+/* Emet des particules a des positions explicites (count triplets xyz).
+ * Meme initialisation que bq_emit_box. Retourne le nombre emis, ou < 0. */
+BQ_API int bq_emit_points(BqSim* sim, int mat_id,
+                          const float* pos, int count,
+                          const float vel[3]);
+
+/* Comme bq_emit_points, mais avec une vitesse propre a chaque particule.
+   `vel` pointe sur count*3 floats (vx,vy,vz entrelaces), meme indexation
+   que `pos`. Renvoie le nombre de particules emises, ou -1 sur erreur. */
+BQ_API int bq_emit_points_vel(BqSim* sim, int mat_id,
+                              const float* pos, const float* vel, int count);
 
 /* Avance d'une frame ; le solveur decoupe en substeps via la CFL.
  * Retourne le nombre de substeps effectues. */
