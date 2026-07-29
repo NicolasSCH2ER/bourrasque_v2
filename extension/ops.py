@@ -28,6 +28,7 @@ from .props import (
     estimate_particle_count,
     world_to_solver_dir,
 )
+from .transform import world_to_solver_array, world_to_solver_dir_array
 
 __all__ = ("classes", "register", "unregister")
 
@@ -492,6 +493,45 @@ class _InflowState:
         self.noise = noise
 
 
+# ---------------------------------------------------------------------------
+# Colliders animes
+# ---------------------------------------------------------------------------
+#
+# Contrairement aux emetteurs, un collider est reevalue a CHAQUE frame (voir
+# `BQ_OT_bake._advance_scene_frame` / `_update_colliders`) : sa geometrie et
+# sa vitesse par sommet dependent de la pose courante du depsgraph, qui
+# n'existe que parce que `_advance_frame` fait desormais avancer la frame
+# Blender avant chaque `step` (le point structurant de ce jalon).
+#
+# Vitesse par sommet : `(position_monde_courante - position_monde_precedente)
+# / frame_dt`, calculee en espace MONDE puis convertie en espace solveur par
+# `world_to_solver_dir_array` (SANS translation — voir sa docstring, le piege
+# documente du jalon). Nulle a la premiere frame d'un collider (pas de
+# position precedente).
+#
+# Topologie changeante (remesh, modificateur variable) : si le nombre de
+# sommets change d'une frame a l'autre, l'appariement sommet a sommet est
+# faux (l'indice N ne designe plus le "meme" sommet). Ce cas donne une
+# vitesse NULLE au collider pour cette frame (plutot qu'un vecteur delirant
+# calcule entre deux sommets sans rapport), et n'est signale a l'artiste
+# qu'UNE SEULE fois par collider (`warned_topology`), pas a chaque frame.
+
+
+class _ColliderState:
+    """Etat maintenu par `BQ_OT_bake` pour un collider, pour toute la duree
+    du bake : la position MONDE de ses sommets a la frame precedente (pour
+    la difference finie de vitesse), et si l'avertissement de topologie
+    changeante a deja ete emis."""
+
+    __slots__ = ("obj", "friction", "prev_verts_world", "warned_topology")
+
+    def __init__(self, obj, friction):
+        self.obj = obj
+        self.friction = friction
+        self.prev_verts_world = None
+        self.warned_topology = False
+
+
 def _tag_redraw(context):
     """Force le redessin de toutes les zones UI (barre de progression)."""
     for window in context.window_manager.windows:
@@ -573,6 +613,37 @@ class BQ_OT_add_emitter(bpy.types.Operator):
             self.report({"INFO"}, f"« {obj.name} » est déjà un émetteur.")
             return {"FINISHED"}
         obj.bourrasque.role = "EMITTER"
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# BQ_OT_add_collider
+# ---------------------------------------------------------------------------
+
+
+class BQ_OT_add_collider(bpy.types.Operator):
+    """Passe l'objet actif en collider."""
+
+    bl_idname = "bq.add_collider"
+    bl_label = "Ajouter l'objet actif comme collider"
+    bl_description = "Fait de l'objet actif un obstacle avec lequel le fluide interagit"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if obj is None or obj.type != "MESH":
+            return False
+        if obj == context.scene.bourrasque.domain_object:
+            return False
+        return True
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj.bourrasque.role == "COLLIDER":
+            self.report({"INFO"}, f"« {obj.name} » est déjà un collider.")
+            return {"FINISHED"}
+        obj.bourrasque.role = "COLLIDER"
         return {"FINISHED"}
 
 
@@ -733,6 +804,18 @@ class BQ_OT_bake(bpy.types.Operator):
     # de context/scene (methode appelable hors cycle modal, cf.
     # _advance_frame).
     _usable_bounds = None
+    # (origin, size) du pave SOLVEUR, memorises a invoke() : necessaires a
+    # chaque frame pour convertir la geometrie des colliders animes
+    # (_update_colliders), pas seulement a la mise en place du bake.
+    _domain_transform = None
+    # Colliders de la scene (liste de _ColliderState), collectes une fois a
+    # invoke() ; chacun est reevalue a chaque frame (_update_colliders).
+    _collider_states = ()
+    # Frame Blender courante au moment ou bq.bake a ete invoque : restauree
+    # dans _cleanup, sur TOUS les chemins de sortie (fin normale,
+    # annulation, exception) — voir _advance_scene_frame, qui fait avancer
+    # scene.frame_current a chaque frame simulee.
+    _start_frame = None
     # Scene visee par ce bake, memorisee dans invoke() : voir sa docstring.
     # Ne jamais lire context.scene apres invoke() dans cet operateur.
     _scene = None
@@ -895,6 +978,11 @@ class BQ_OT_bake(bpy.types.Operator):
         scene = self._scene
         props = scene.bourrasque
 
+        # Memorisee AVANT tout `frame_set` (voir _advance_scene_frame) :
+        # c'est la valeur a restaurer dans _cleanup, sur tous les chemins de
+        # sortie (fin normale, annulation, exception).
+        self._start_frame = scene.frame_current
+
         validated = self._validate(context)
         if validated is None:
             return {"CANCELLED"}
@@ -933,6 +1021,17 @@ class BQ_OT_bake(bpy.types.Operator):
             self._inflow_states = []
             self._saturated = False
             self._usable_bounds = domain_usable_bounds(scene)
+            self._domain_transform = (origin, size)
+
+            # Colliders : collectes une fois ici (objet + friction), chacun
+            # est reevalue a CHAQUE frame du bake (voir
+            # _advance_scene_frame / _update_colliders), contrairement aux
+            # emetteurs dont la geometrie n'est echantillonnee qu'une fois.
+            self._collider_states = [
+                _ColliderState(obj, obj.bourrasque.friction)
+                for obj in scene.objects
+                if obj.bourrasque.role == "COLLIDER"
+            ]
 
             for emitter_index, (obj, mat_index) in enumerate(emitter_specs):
                 op = obj.bourrasque
@@ -1312,7 +1411,15 @@ class BQ_OT_bake(bpy.types.Operator):
             )
 
             if usable is not None:
-                ulo, uhi = usable
+                # `domain_usable_bounds` renvoie des tuples de float Python,
+                # pas des ndarray : `tuple - float` leve TypeError des que
+                # cette branche est exercee (elle ne l'etait par aucun test
+                # existant, `self._usable_bounds` etant laisse `None` dans
+                # les scripts de validation precedents). Conversion en
+                # ndarray, seul endroit qui en a besoin pour la soustraction
+                # vectorisee ci-dessous.
+                ulo = np.asarray(usable[0], dtype=np.float64)
+                uhi = np.asarray(usable[1], dtype=np.float64)
                 # Tolerance qui absorbe la divergence float64 (ce filtre,
                 # cote Python) / float32 (la borne recalculee cote coeur a
                 # partir de `config.cell_size`, tronque a float32) sur la
@@ -1363,15 +1470,129 @@ class BQ_OT_bake(bpy.types.Operator):
                     )
         return total
 
+    def _advance_scene_frame(self):
+        """Avance `self._scene` a la frame Blender correspondant a
+        `self._frame_index`, et reevalue le depsgraph UNE FOIS pour cette
+        frame (`self._depsgraph`) — c'est le seul moyen d'obtenir une
+        geometrie de collider animee (voir docstring de module) : la scene
+        n'etait auparavant JAMAIS avancee pendant un bake.
+
+        Le cout de reevaluation du depsgraph est assume, mais ne doit pas
+        etre paye plusieurs fois par frame : `_update_colliders` reutilise
+        `self._depsgraph` pour TOUS les colliders de cette frame plutot que
+        d'appeler `evaluated_depsgraph_get()` par collider.
+
+        Hors perimetre de ce jalon : ceci rend de fait les emetteurs
+        animables (leur `matrix_world`/forme suivrait desormais l'anim), en
+        particulier l'ensemencement volumique de l'inflow, dont le nuage de
+        sites (`_InflowState.sites`) reste calcule UNE FOIS dans `invoke()`
+        (avant tout `frame_set`) et n'est PAS recalcule ici.
+
+        `bpy.context.evaluated_depsgraph_get()` resout le depsgraph via
+        `context.scene`/`context.view_layer`, PAS via `self._scene`
+        directement : sans precaution, si l'utilisateur change la scene
+        active de la fenetre pendant le bake (le modal ne consomme que les
+        evenements TIMER, tout le reste passe en PASS_THROUGH — voir
+        `invoke`), le depsgraph obtenu serait celui de la MAUVAISE scene.
+        `temp_override` force la resolution sur `self._scene` quel que soit
+        l'etat de `context.window.scene` a cet instant, en mode UI comme en
+        `--background` (ou `context.window` n'existe pas, mais
+        `evaluated_depsgraph_get` n'a besoin que de `scene`/`view_layer`).
+        """
+        target = self._scene.bourrasque.frame_start + self._frame_index
+        with bpy.context.temp_override(
+            scene=self._scene, view_layer=self._scene.view_layers[0]
+        ):
+            self._scene.frame_set(target)
+            self._depsgraph = bpy.context.evaluated_depsgraph_get()
+
+    def _update_colliders(self):
+        """Reevalue tous les colliders a la frame courante (geometrie via
+        `self._depsgraph`, deja mis a jour par `_advance_scene_frame`) et
+        transmet leurs triangles au coeur pour cette frame, en UN SEUL appel
+        (`Sim.set_colliders`) concatenant tous les colliders.
+
+        Positions : converties monde -> solveur via `world_to_solver_array`
+        (AVEC translation, ce sont des points). Vitesse par sommet :
+        `(position_monde_courante - position_monde_precedente) /
+        frame_dt`, calculee en espace MONDE puis convertie via
+        `world_to_solver_dir_array` (SANS translation, ce sont des
+        directions) — ne jamais confondre les deux, voir docstring de
+        module. Nulle a la premiere frame d'un collider, ou si son nombre
+        de sommets a change depuis la frame precedente (topologie non
+        appariable, voir `_ColliderState`).
+
+        Ne fait rien si aucun collider n'est configure pour ce bake (la
+        simulation cote coeur n'a jamais eu de collider a effacer).
+        """
+        if not self._collider_states:
+            return
+
+        from . import sampling
+
+        origin, size = self._domain_transform
+
+        tri_chunks = []
+        vel_chunks = []
+        fric_chunks = []
+
+        for state in self._collider_states:
+            obj_eval = state.obj.evaluated_get(self._depsgraph)
+            verts_world, tris = sampling.evaluated_world_mesh(obj_eval)
+            n_tri = tris.shape[0]
+            if n_tri == 0:
+                state.prev_verts_world = verts_world
+                continue
+
+            prev = state.prev_verts_world
+            topology_ok = prev is not None and prev.shape[0] == verts_world.shape[0]
+            if prev is not None and not topology_ok and not state.warned_topology:
+                self.report(
+                    {"WARNING"},
+                    f"« {state.obj.name} » : le nombre de sommets a changé "
+                    "d'une frame à l'autre (remesh, modificateur variable) "
+                    "— vitesse nulle pour ce collider tant que sa "
+                    "topologie n'est pas stable.",
+                )
+                state.warned_topology = True
+
+            if topology_ok:
+                vel_world = (verts_world - prev) / self._frame_dt
+            else:
+                vel_world = np.zeros_like(verts_world)
+
+            verts_solver = world_to_solver_array(verts_world, origin, size)
+            vel_solver = world_to_solver_dir_array(vel_world)
+
+            tri_chunks.append(verts_solver[tris].astype(np.float32))
+            vel_chunks.append(vel_solver[tris].astype(np.float32))
+            fric_chunks.append(np.full(n_tri, state.friction, dtype=np.float32))
+
+            state.prev_verts_world = verts_world
+
+        if tri_chunks:
+            tri_all = np.concatenate(tri_chunks, axis=0)
+            vel_all = np.concatenate(vel_chunks, axis=0)
+            fric_all = np.concatenate(fric_chunks, axis=0)
+        else:
+            tri_all = np.empty((0, 3, 3), dtype=np.float32)
+            vel_all = np.empty((0, 3, 3), dtype=np.float32)
+            fric_all = np.empty((0,), dtype=np.float32)
+
+        self._sim.set_colliders(tri_all, vel_all, fric_all)
+
     def _advance_frame(self):
-        """Avance la simulation d'UNE frame : emet les sites d'inflow
-        libres, fait avancer le solveur, lit les positions et les ajoute au
-        cache.
+        """Avance la simulation d'UNE frame : avance la frame Blender (pour
+        une geometrie de collider animee), met a jour les colliders, emet
+        les sites d'inflow libres, fait avancer le solveur, lit les
+        positions et les ajoute au cache.
 
         Ne depend d'aucun etat modal (timer, evenement bpy) : appelable
         directement depuis un script de validation hors du cycle modal de
         Blender (l'operateur modal ne s'execute pas en `--background`).
         """
+        self._advance_scene_frame()
+        self._update_colliders()
         self._emit_inflow_sites()
         self._sim.step(self._frame_dt)
         self._pos_buffer = self._sim.read_positions(out=self._pos_buffer)
@@ -1429,6 +1650,15 @@ class BQ_OT_bake(bpy.types.Operator):
 
         self._inflow_states = ()
         self._saturated = False
+        self._collider_states = ()
+
+        # Restaure la frame Blender d'origine, sur TOUS les chemins de
+        # sortie (fin normale, ESC, exception) : `_advance_scene_frame` a
+        # deplace `scene.frame_current` a chaque frame simulee, la scene ne
+        # doit pas rester sur la derniere frame du bake.
+        if self._start_frame is not None:
+            scene.frame_set(self._start_frame)
+            self._start_frame = None
 
         props.is_baking = False
         BQ_OT_bake.cancel_requested = False
@@ -1443,6 +1673,7 @@ class BQ_OT_bake(bpy.types.Operator):
 classes = (
     BQ_OT_add_domain,
     BQ_OT_add_emitter,
+    BQ_OT_add_collider,
     BQ_OT_remove_element,
     BQ_OT_bake,
     BQ_OT_cancel_bake,

@@ -28,7 +28,7 @@ typedef struct BqSim BqSim; /* handle opaque */
 
 /* Version de l'ABI : a incrementer des que la disposition d'une struct
    publique ou la signature d'une fonction exportee change. */
-#define BQ_ABI_VERSION 2
+#define BQ_ABI_VERSION 4
 
 /* Modeles constitutifs. D'autres viendront (sable, neige) sans changer
  * l'API : c'est tout l'interet du pipeline MPM unifie. */
@@ -95,11 +95,24 @@ BQ_API int bq_emit_points_vel(BqSim* sim, int mat_id,
  * Retourne le nombre de substeps effectues. */
 BQ_API int bq_step(BqSim* sim, float frame_dt);
 
+/* Remplace l'ensemble des colliders. Les triangles de tous les objets sont
+   concatenes. `tri` : 9*n_tri floats (3 sommets xyz, espace solveur).
+   `tri_vel` : 9*n_tri floats, vitesse par SOMMET. `tri_friction` : n_tri
+   floats, coefficient par triangle. A appeler une fois par frame, avant
+   bq_step. n_tri == 0 efface les colliders. Renvoie 0, ou -1 sur erreur. */
+BQ_API int bq_set_colliders(BqSim* sim, const float* tri, const float* tri_vel,
+                            const float* tri_friction, int n_tri);
+
 BQ_API int bq_particle_count(const BqSim* sim);
 
 /* Copie device -> hote. dst doit contenir n*3 floats / n octets. */
 BQ_API int bq_read_positions(BqSim* sim, float* dst);
 BQ_API int bq_read_materials(BqSim* sim, uint8_t* dst);
+
+/* Copie le champ de distance signee courant vers `dst`, qui doit pouvoir
+   contenir grid_res[0]*grid_res[1]*grid_res[2] floats. Diagnostic et
+   validation. Renvoie le nombre de cellules copiees, ou -1 sur erreur. */
+BQ_API int bq_read_sdf(BqSim* sim, float* dst);
 
 BQ_API const char* bq_last_error(void);
 

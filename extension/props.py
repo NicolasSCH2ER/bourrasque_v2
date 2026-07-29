@@ -39,6 +39,7 @@ __all__ = (
     "emitter_overflow",
     "estimate_particle_count",
     "estimate_inflow_count",
+    "collider_triangle_count",
     "classes",
     "register",
     "unregister",
@@ -82,6 +83,11 @@ class BqObjectProps(PropertyGroup):
             ("NONE", "Aucun", "Cet objet n'a aucun role dans la simulation"),
             ("DOMAIN", "Domaine", "Definit le domaine de la simulation"),
             ("EMITTER", "Émetteur", "Emet des particules dans la simulation"),
+            (
+                "COLLIDER",
+                "Collider",
+                "Obstacle solide avec lequel le fluide interagit",
+            ),
         ),
         default="NONE",
     )
@@ -213,6 +219,17 @@ class BqObjectProps(PropertyGroup):
         update=_on_preset_update,
     )
 
+    friction: FloatProperty(
+        name="Friction",
+        description=(
+            "Frottement du fluide contre cet obstacle : 0 laisse le fluide "
+            "glisser librement le long de sa surface, 1 le fait y adhérer"
+        ),
+        default=0.2,
+        min=0.0,
+        max=1.0,
+    )
+
 
 class BqSceneProps(PropertyGroup):
     """Reglages du solveur et de la simulation, stockes par scene."""
@@ -327,20 +344,24 @@ class BqSceneProps(PropertyGroup):
 def iter_elements(scene):
     """Itere sur tous les objets de `scene` dont `role != NONE`.
 
-    Ordre : le domaine d'abord (s'il existe), puis les emetteurs, dans
-    l'ordre du nom.
+    Ordre : le domaine d'abord (s'il existe), puis les emetteurs, puis les
+    colliders, chaque groupe trie dans l'ordre du nom.
     """
     domain = []
     emitters = []
+    colliders = []
     for obj in scene.objects:
         role = obj.bourrasque.role
         if role == "DOMAIN":
             domain.append(obj)
         elif role == "EMITTER":
             emitters.append(obj)
+        elif role == "COLLIDER":
+            colliders.append(obj)
     domain.sort(key=lambda o: o.name)
     emitters.sort(key=lambda o: o.name)
-    return domain + emitters
+    colliders.sort(key=lambda o: o.name)
+    return domain + emitters + colliders
 
 
 # Demi-largeur du stencil B-spline quadratique du MLS-MPM (`p.bound` dans
@@ -604,6 +625,99 @@ def _mesh_block_count(obj, origin, size, dx, ppc_axis):
         return None
 
 
+# ---------------------------------------------------------------------------
+# Cache de collider_triangle_count
+# ---------------------------------------------------------------------------
+#
+# collider_triangle_count() est appelee par `ui.py` A CHAQUE REDESSIN du
+# panneau — plusieurs fois par seconde des que la souris bouge dans la barre
+# laterale, meme quand rien n'a change dans la scene. Sans cache, chaque
+# redessin refait un `to_mesh()` / `calc_loop_triangles()` / produit
+# matriciel PAR COLLIDER (voir `sampling.evaluated_world_mesh`),
+# potentiellement plusieurs fois par seconde sur un maillage dense.
+#
+# Signal d'invalidation retenu : un compteur global incremente par un
+# handler `depsgraph_update_post`, qui ne se declenche QUE quand la scene
+# change reellement (edition de maillage, modificateur, transformation,
+# changement de frame, ajout/suppression d'objet...), jamais sur un simple
+# redessin de panneau sans interaction sur la scene — c'est precisement la
+# distinction qui manquait. On sur-invalide deliberement (un
+# `depsgraph_update_post` sans rapport avec un collider invalide quand meme
+# le cache) plutot que d'inspecter finement quel objet a change : le but
+# n'est pas un cache parfait, seulement d'arreter de re-extraire le maillage
+# a chaque frame de redessin de l'UI, ce qui est deja obtenu avec ce signal
+# grossier.
+_triangle_count_generation = 0
+_triangle_count_cache = {"generation": None, "scene_name": None, "count": 0}
+
+
+@bpy.app.handlers.persistent
+def _bq_bump_triangle_count_generation(scene, depsgraph):
+    global _triangle_count_generation
+    _triangle_count_generation += 1
+
+
+def _remove_triangle_count_handler():
+    # Filtre par nom de fonction plutot que par identite d'objet : un
+    # rechargement du module change l'identite de la fonction sans changer
+    # son nom (voir meme discipline dans `display.py`).
+    for fn in list(bpy.app.handlers.depsgraph_update_post):
+        if fn.__name__ == _bq_bump_triangle_count_generation.__name__:
+            bpy.app.handlers.depsgraph_update_post.remove(fn)
+
+
+def collider_triangle_count(scene):
+    """Nombre total de triangles, tous colliders confondus (maillage EVALUE,
+    modificateurs appliques) — purement indicatif pour l'UI (`ui.py`), qui
+    n'affiche un avertissement qu'au-dela d'un seuil eleve (le champ de
+    distance du coeur, calcule par grille de buckets + propagation de
+    signe, ne croit PAS lineairement avec ce nombre — voir
+    `ui._COLLIDER_TRIANGLE_WARNING_THRESHOLD`).
+
+    Mis en cache entre deux redessins du panneau (voir le commentaire de
+    section ci-dessus) : ne re-extrait les maillages que si le depsgraph a
+    reellement change depuis le dernier appel, ou si la scene interrogee a
+    change de nom. Un compte legerement perime (une frame de retard sur une
+    edition qui n'a pas encore declenche `depsgraph_update_post`, cas rare
+    en pratique) est prefere a une re-extraction systematique.
+
+    Meme discipline defensive que `_mesh_block_count` : `extension.sampling`
+    peut etre absent ou en panne, ce panneau ne doit jamais planter pour
+    autant. Une exception sur un collider individuel (maillage degenere,
+    par exemple) ne fait pas echouer le compte des autres.
+    """
+    cache = _triangle_count_cache
+    if (
+        cache["generation"] == _triangle_count_generation
+        and cache["scene_name"] == scene.name
+    ):
+        return cache["count"]
+
+    try:
+        from .sampling import evaluated_world_mesh
+    except ImportError:
+        return 0
+
+    total = 0
+    depsgraph = None
+    for obj in scene.objects:
+        if obj.bourrasque.role != "COLLIDER":
+            continue
+        try:
+            if depsgraph is None:
+                depsgraph = bpy.context.evaluated_depsgraph_get()
+            obj_eval = obj.evaluated_get(depsgraph)
+            _verts, tris = evaluated_world_mesh(obj_eval)
+            total += tris.shape[0]
+        except Exception:
+            continue
+
+    cache["generation"] = _triangle_count_generation
+    cache["scene_name"] = scene.name
+    cache["count"] = total
+    return total
+
+
 def estimate_inflow_count(
     obj, origin, size, dx, ppc_axis, duration, gravity=0.0
 ):
@@ -848,8 +962,12 @@ def register():
     Object.bourrasque = PointerProperty(type=BqObjectProps)
     Scene.bourrasque = PointerProperty(type=BqSceneProps)
 
+    _remove_triangle_count_handler()
+    bpy.app.handlers.depsgraph_update_post.append(_bq_bump_triangle_count_generation)
+
 
 def unregister():
+    _remove_triangle_count_handler()
     del Scene.bourrasque
     del Object.bourrasque
     for cls in reversed(classes):

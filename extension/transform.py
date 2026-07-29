@@ -68,6 +68,46 @@ def world_to_solver_dir(v):
     return (vx, vz, -vy)
 
 
+def world_to_solver_array(positions, origin, size, out=None):
+    """Conversion vectorisee numpy, equivalente a `world_to_solver` appliquee
+    point par point, mais sur un tableau (n, 3) entier d'un coup.
+
+    Utilisee par `ops.py` pour convertir les sommets de collider (position,
+    donc AVEC translation) en espace solveur, une fois par frame de bake sur
+    potentiellement plusieurs milliers de sommets : une boucle scalaire
+    Python serait le chemin chaud le plus couteux de la mise a jour des
+    colliders.
+    """
+    mx, my, mz = origin
+    size_z = size[2]
+    if out is None or out.shape != positions.shape:
+        out = np.empty_like(positions)
+    out[:, 0] = positions[:, 0] - mx
+    out[:, 1] = positions[:, 2] - mz
+    out[:, 2] = (my + size_z) - positions[:, 1]
+    return out
+
+
+def world_to_solver_dir_array(vectors, out=None):
+    """Conversion vectorisee numpy, equivalente a `world_to_solver_dir`
+    appliquee ligne par ligne, mais sur un tableau (n, 3) entier d'un coup
+    (SANS translation : `vectors` sont des directions, typiquement des
+    vitesses de sommet).
+
+    Utilisee par `ops.py` pour convertir la vitesse par sommet des
+    colliders animes : c'est precisement le piege documente dans le plan du
+    jalon — une vitesse (direction) ne doit JAMAIS passer par
+    `world_to_solver_array` (qui translate), sous peine d'un collider a la
+    bonne forme mais a la vitesse absurde.
+    """
+    if out is None or out.shape != vectors.shape:
+        out = np.empty_like(vectors)
+    out[:, 0] = vectors[:, 0]
+    out[:, 1] = vectors[:, 2]
+    out[:, 2] = -vectors[:, 1]
+    return out
+
+
 def solver_to_world_array(positions, origin, size, out=None):
     """Conversion vectorisee numpy, equivalente a `solver_to_world` appliquee
     point par point, mais sur un tableau (n, 3) entier d'un coup.

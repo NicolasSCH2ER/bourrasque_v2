@@ -2,10 +2,10 @@
 
 C'est la surface que voit l'artiste, dans la barre laterale du viewport 3D
 (categorie « Bourrasque »). Ce module ne fait QUE de la presentation : il lit
-`scene.bourrasque` / `obj.bourrasque` (voir props.py) et invoque les six
-operateurs de ops.py (bq.add_domain, bq.add_emitter, bq.remove_element,
-bq.bake, bq.cancel_bake, bq.free_cache). Aucun appel a la DLL, aucune logique
-de simulation ici : voir lib.py et ops.py.
+`scene.bourrasque` / `obj.bourrasque` (voir props.py) et invoque les sept
+operateurs de ops.py (bq.add_domain, bq.add_emitter, bq.add_collider,
+bq.remove_element, bq.bake, bq.cancel_bake, bq.free_cache). Aucun appel a la
+DLL, aucune logique de simulation ici : voir lib.py et ops.py.
 """
 
 import math
@@ -15,12 +15,24 @@ import mathutils
 from bpy.types import Panel, UIList
 
 from .props import (
+    collider_triangle_count,
     domain_resolution,
     domain_transform,
     emitter_overflow,
     estimate_particle_count,
     iter_elements,
 )
+
+# Le champ de distance du coeur est calcule par grille de buckets + propa-
+# gation de signe (pas par test brut triangle x cellule) : mesure sur le
+# reference du coeur, 6,6 ms pour 5000 triangles, 41 ms pour 50 000 (a
+# comparer a ~50,8 ms pour un `step` complet du solveur a cette meme
+# resolution) — le cout croit BEAUCOUP moins vite que lineairement avec le
+# nombre de triangles, contrairement a une premiere estimation. Le seuil
+# ci-dessous est calibre pour ne s'allumer que quand le champ de distance
+# devient comparable au cout d'un step (donc perceptible sur le temps total
+# de bake), pas des la premiere dizaine de milliers de triangles.
+_COLLIDER_TRIANGLE_WARNING_THRESHOLD = 100000
 
 __all__ = ("classes", "register", "unregister")
 
@@ -120,7 +132,12 @@ class BQ_UL_elements(UIList):
     ):
         obj = item
         obj_props = obj.bourrasque
-        role_icon = "MESH_CUBE" if obj_props.role == "DOMAIN" else "PARTICLES"
+        if obj_props.role == "DOMAIN":
+            role_icon = "MESH_CUBE"
+        elif obj_props.role == "COLLIDER":
+            role_icon = "MOD_PHYSICS"
+        else:
+            role_icon = "PARTICLES"
 
         row = layout.row(align=True)
         op = row.operator(
@@ -131,6 +148,8 @@ class BQ_UL_elements(UIList):
 
         if obj_props.role == "EMITTER":
             row.label(text=_material_label(obj_props))
+        elif obj_props.role == "COLLIDER":
+            row.label(text=f"Friction {obj_props.friction:.2f}")
 
 
 # ---------------------------------------------------------------------------
@@ -245,8 +264,24 @@ class BQ_PT_elements(Panel):
             )
 
         row = layout.row(align=True)
-        row.operator("bq.add_emitter", text="Ajouter l'objet actif", icon="ADD")
+        row.operator("bq.add_emitter", text="Émetteur", icon="ADD")
+        row.operator("bq.add_collider", text="Collider", icon="MOD_PHYSICS")
         row.operator("bq.remove_element", text="", icon="X")
+
+        n_tri = collider_triangle_count(scene)
+        if n_tri > 0:
+            box = layout.box()
+            box.label(text=f"Triangles colliders : {_thousands(n_tri)}")
+            if n_tri > _COLLIDER_TRIANGLE_WARNING_THRESHOLD:
+                box.label(
+                    text=(
+                        "Nombre de triangles très élevé : le calcul du "
+                        "champ de distance devient comparable au coût "
+                        "d'un pas de simulation. Envisagez de décimer vos "
+                        "colliders."
+                    ),
+                    icon="ERROR",
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +420,34 @@ class BQ_PT_material(Panel):
 
 
 # ---------------------------------------------------------------------------
+# Collider
+# ---------------------------------------------------------------------------
+
+
+class BQ_PT_collider(Panel):
+    bl_idname = "BQ_PT_collider"
+    bl_label = "Collider"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_parent_id = "BQ_PT_main"
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.bourrasque.role == "COLLIDER"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+
+        scene = context.scene
+        layout.enabled = not scene.bourrasque.is_baking
+
+        obj_props = context.active_object.bourrasque
+        layout.prop(obj_props, "friction")
+
+
+# ---------------------------------------------------------------------------
 # Simulation
 # ---------------------------------------------------------------------------
 
@@ -512,6 +575,7 @@ classes = (
     BQ_PT_domain,
     BQ_PT_elements,
     BQ_PT_material,
+    BQ_PT_collider,
     BQ_PT_simulation,
     BQ_PT_bake,
     BQ_PT_display,

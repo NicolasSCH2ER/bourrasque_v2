@@ -46,7 +46,7 @@ BQ_MODEL_WATER = 1
 BQ_MAX_MATERIALS = 8
 
 # Doit rester synchronise avec la macro BQ_ABI_VERSION de core/include/bourrasque.h.
-BQ_ABI_VERSION = 2
+BQ_ABI_VERSION = 4
 
 _DLL_NAME = "bourrasque.dll" if os.name == "nt" else "libbourrasque.so"
 _DLL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", _DLL_NAME)
@@ -251,6 +251,15 @@ def _declare_prototypes(dll):
     ]
     dll.bq_emit_points_vel.restype = ctypes.c_int
 
+    dll.bq_set_colliders.argtypes = [
+        BqSimPtr,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+    ]
+    dll.bq_set_colliders.restype = ctypes.c_int
+
     dll.bq_step.argtypes = [BqSimPtr, ctypes.c_float]
     dll.bq_step.restype = ctypes.c_int
 
@@ -262,6 +271,9 @@ def _declare_prototypes(dll):
 
     dll.bq_read_materials.argtypes = [BqSimPtr, ctypes.POINTER(ctypes.c_uint8)]
     dll.bq_read_materials.restype = ctypes.c_int
+
+    dll.bq_read_sdf.argtypes = [BqSimPtr, ctypes.POINTER(ctypes.c_float)]
+    dll.bq_read_sdf.restype = ctypes.c_int
 
     dll.bq_last_error.argtypes = []
     dll.bq_last_error.restype = ctypes.c_char_p
@@ -302,6 +314,15 @@ class Sim:
 
     def __init__(self, config):
         self._dll = load()
+        # Memorise la resolution de grille (espace hote, pas cote coeur) :
+        # necessaire pour dimensionner le buffer de `read_sdf`, seule
+        # methode dont la taille du resultat ne se lit pas via
+        # `particle_count`.
+        self._grid_res = (
+            int(config.grid_res[0]),
+            int(config.grid_res[1]),
+            int(config.grid_res[2]),
+        )
         self._handle = self._dll.bq_create(ctypes.byref(config))
         if not self._handle:
             raise BourrasqueError(
@@ -393,6 +414,55 @@ class Sim:
             )
         )
 
+    def set_colliders(self, triangles, velocities, frictions):
+        """Remplace l'ensemble des colliders du solveur (espace solveur).
+
+        `triangles` et `velocities` doivent etre convertibles en ndarray
+        `(n_tri, 3, 3)` (triangle, sommet, xyz) de MEME forme : `velocities`
+        est la vitesse par SOMMET, pas par triangle. `frictions` doit etre
+        convertible en ndarray `(n_tri,)`, un coefficient par triangle.
+        Meme discipline `np.ascontiguousarray(..., dtype=np.float32)` que
+        `emit_points_vel` sur les trois tableaux : un tableau non contigu ou
+        en float64 (le dtype par defaut de numpy) passerait silencieusement
+        des octets errones a `bq_set_colliders`, qui attend des buffers
+        `float32` C-contigus.
+
+        `n_tri == 0` est un appel VALIDE (pas court-circuite cote Python,
+        contrairement a `emit_points`/`emit_points_vel`) : c'est la
+        convention du coeur pour effacer les colliders (voir
+        `bourrasque.h`), a appeler explicitement des qu'un bake n'a plus de
+        collider a transmettre pour la frame courante.
+        """
+        tri_arr = np.ascontiguousarray(triangles, dtype=np.float32)
+        if tri_arr.ndim != 3 or tri_arr.shape[1:] != (3, 3):
+            raise ValueError(
+                f"set_colliders: triangles doit etre de forme (n, 3, 3), "
+                f"recu {tri_arr.shape}"
+            )
+        vel_arr = np.ascontiguousarray(velocities, dtype=np.float32)
+        if vel_arr.shape != tri_arr.shape:
+            raise ValueError(
+                "set_colliders: velocities doit avoir la meme forme que "
+                f"triangles ({tri_arr.shape}), recu {vel_arr.shape}"
+            )
+        fric_arr = np.ascontiguousarray(frictions, dtype=np.float32)
+        if fric_arr.ndim != 1 or fric_arr.shape[0] != tri_arr.shape[0]:
+            raise ValueError(
+                f"set_colliders: frictions doit etre de forme (n,) avec "
+                f"n == {tri_arr.shape[0]} (nombre de triangles), recu "
+                f"{fric_arr.shape}"
+            )
+
+        n_tri = tri_arr.shape[0]
+        tri_ptr = tri_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        vel_ptr = vel_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        fric_ptr = fric_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        return self._check(
+            self._dll.bq_set_colliders(
+                self._handle, tri_ptr, vel_ptr, fric_ptr, n_tri
+            )
+        )
+
     def step(self, frame_dt):
         return self._check(self._dll.bq_step(self._handle, frame_dt))
 
@@ -418,6 +488,24 @@ class Sim:
             out = np.empty((n,), dtype=np.uint8)
         ptr = out.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
         self._check(self._dll.bq_read_materials(self._handle, ptr))
+        return out
+
+    def read_sdf(self, out=None):
+        """Renvoie le champ de distance signee courant, ndarray float32 de
+        forme `(grid_res[0], grid_res[1], grid_res[2])` (espace SOLVEUR),
+        rempli in-place si `out` est fourni.
+
+        Diagnostic et validation (voir `bq_read_sdf`, `bourrasque.h`) :
+        permet de verifier depuis Python qu'un collider produit bien un
+        champ coherent (signe negatif a l'interieur, distance nulle sur la
+        surface), sans avoir a en deduire l'etat indirectement via les
+        positions de particules.
+        """
+        shape = self._grid_res
+        if out is None or out.shape != shape or out.dtype != np.float32:
+            out = np.empty(shape, dtype=np.float32)
+        ptr = out.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        self._check(self._dll.bq_read_sdf(self._handle, ptr))
         return out
 
     def destroy(self):

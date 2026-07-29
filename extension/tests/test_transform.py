@@ -17,7 +17,15 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from transform import solver_to_world, world_to_solver, world_to_solver_dir  # noqa: E402
+import numpy as np  # noqa: E402
+
+from transform import (  # noqa: E402
+    solver_to_world,
+    world_to_solver,
+    world_to_solver_array,
+    world_to_solver_dir,
+    world_to_solver_dir_array,
+)
 
 FAILURES = []
 
@@ -214,6 +222,89 @@ def test_domain_bounds_non_cubic():
     )
 
 
+def test_world_to_solver_array_matches_scalar():
+    """`world_to_solver_array` (M6, colliders animes) doit coincider avec
+    `world_to_solver` point par point, y compris sur un domaine NON cubique
+    (meme mode d'echec que les tests round-trip ci-dessus : une confusion
+    d'axe silencieuse). Sert aussi de test de conversion de POSITIONS de
+    sommet de collider (avec translation)."""
+    origin = (-3.0, 2.0, -1.0)
+    size = (2.0, 6.0, 10.0)
+
+    points = np.array(
+        [
+            (0.0, 0.0, 0.0),
+            (1.0, 2.0, 3.0),
+            (-5.0, 7.5, -1.0),
+            (3.3, -2.2, 0.0),
+            (origin[0] + size[0], origin[1] + size[2], origin[2] + size[1]),
+        ],
+        dtype=np.float64,
+    )
+    expected = np.array(
+        [world_to_solver(tuple(p), origin, size) for p in points]
+    )
+    got = world_to_solver_array(points, origin, size)
+    check(
+        "world_to_solver_array: forme (n,3)",
+        got.shape == expected.shape,
+        f"got shape={got.shape}",
+    )
+    err = float(np.max(np.abs(got - expected)))
+    check(
+        "world_to_solver_array == world_to_solver point par point",
+        err < 1e-9,
+        f"err={err:.2e}",
+    )
+
+
+def test_world_to_solver_dir_array_matches_scalar():
+    """Meme verification que ci-dessus pour la partie LINEAIRE (sans
+    translation) : c'est la fonction utilisee pour convertir la vitesse par
+    sommet d'un collider anime (voir ops.py) — le piege le plus probable du
+    jalon M6 etant de la confondre avec la version AVEC translation."""
+    vectors = np.array(
+        [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (2.5, -1.5, 0.75),
+        ],
+        dtype=np.float64,
+    )
+    expected = np.array([world_to_solver_dir(tuple(v)) for v in vectors])
+    got = world_to_solver_dir_array(vectors)
+    check(
+        "world_to_solver_dir_array: forme (n,3)",
+        got.shape == expected.shape,
+        f"got shape={got.shape}",
+    )
+    err = float(np.max(np.abs(got - expected)))
+    check(
+        "world_to_solver_dir_array == world_to_solver_dir point par point",
+        err < 1e-9,
+        f"err={err:.2e}",
+    )
+
+
+def test_world_to_solver_dir_array_no_translation():
+    """Une vitesse (direction) convertie via `world_to_solver_dir_array` ne
+    doit JAMAIS deriver avec `origin`/`size` : contrairement a
+    `world_to_solver_array`, elle n'a pas de terme de translation. Verifie
+    explicitement le piege documente du jalon M6 (collider anime le long
+    d'un axe MONDE -> vitesse le long de l'axe SOLVEUR correspondant, sans
+    offset)."""
+    vel_world = np.array([[0.0, 1.0, 0.0]], dtype=np.float64)  # +Y monde
+    got = world_to_solver_dir_array(vel_world)
+    # +Y monde -> -sz solveur (voir docstring de world_to_solver_dir).
+    check(
+        "world_to_solver_dir_array: +Y monde -> -sz solveur",
+        approx_eq(got[0], (0.0, 0.0, -1.0), 1e-9),
+        f"got={got[0]}",
+    )
+
+
 if __name__ == "__main__":
     test_round_trip()
     test_round_trip_non_cubic()
@@ -221,6 +312,9 @@ if __name__ == "__main__":
     test_determinant()
     test_domain_bounds()
     test_domain_bounds_non_cubic()
+    test_world_to_solver_array_matches_scalar()
+    test_world_to_solver_dir_array_matches_scalar()
+    test_world_to_solver_dir_array_no_translation()
 
     print()
     if FAILURES:

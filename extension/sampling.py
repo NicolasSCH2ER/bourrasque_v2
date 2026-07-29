@@ -56,6 +56,8 @@ __all__ = (
     "sample_mesh_interior",
     "check_mesh_closed",
     "estimate_mesh_sample_count",
+    "evaluated_world_mesh",
+    "evaluated_world_triangles",
 )
 
 # Direction de rayon deliberement non alignee sur les axes : un rayon parti
@@ -136,21 +138,50 @@ def _lattice_candidates_solver(lo, hi, spacing):
     return np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=-1)
 
 
-def _world_bvh_from_evaluated(obj_eval):
-    """Construit un `BVHTree` en espace MONDE a partir du maillage evalue
-    de `obj_eval` : `BVHTree.FromObject` construit son arbre en espace
-    LOCAL (sans appliquer `matrix_world`), ce qui desaccorde geometrie et
-    rayons des que l'objet est deplace/tourne/mis a l'echelle (voir
-    docstring du module). On transforme donc explicitement les sommets par
-    `matrix_world` avant de construire l'arbre via `BVHTree.FromPolygons`,
-    sur les triangles du maillage (`loop_triangles`, calcules a la volee)."""
+def evaluated_world_mesh(obj_eval):
+    """Sommets et triangles du maillage evalue de `obj_eval`, en espace
+    MONDE : `(verts_world, tris)`, `verts_world` `(n_verts, 3)` float64,
+    `tris` `(n_tris, 3)` int64 (indices dans `verts_world`).
+
+    Brique de base PARTAGEE par `_world_bvh_from_evaluated` (BVH pour
+    l'emission par maillage, voir docstring du module) et par
+    `ops.BQ_OT_bake._update_colliders` (extraction des triangles de
+    colliders, y compris animes, frame par frame) : c'est le seul endroit
+    qui sait extraire un maillage evalue en espace monde (`to_mesh()`,
+    `calc_loop_triangles()`, `foreach_get`, `matrix_world`,
+    `to_mesh_clear()`), pour ne pas dupliquer cette logique.
+
+    Chiralite : si `matrix_world` a un determinant NEGATIF (echelle
+    negative sur un ou trois axes, modificateur Mirror — tres courant),
+    l'orientation des faces est INVERSEE une fois transformee en espace
+    monde (une reflexion inverse le sens du produit vectoriel des aretes
+    d'un triangle). Le signe du champ de distance du coeur depend de cette
+    orientation (normale = (v1-v0) x (v2-v0), voir
+    `core/src/mlsmpm.cu::k_sdf_unsigned`) : sans correction, un collider en
+    miroir produirait un champ de signe inverse (interieur vu comme
+    exterieur). On retablit ici l'orientation en permutant deux sommets de
+    chaque triangle (colonnes 1 et 2 de `tris`), au point UNIQUE de
+    production des triangles monde, pour que tous les consommateurs
+    (colliders, BVH d'emission par maillage) en beneficient sans avoir a y
+    penser individuellement. Le test d'interieur par parite de rayons
+    (`_count_ray_hits`) est lui insensible a l'orientation des faces (il ne
+    depend que du nombre d'intersections, pas de leur sens) : cette
+    correction ne change donc rien pour l'emission par maillage, seulement
+    pour le signe du champ de distance des colliders.
+
+    Tableaux vides (formes `(0, 3)`) si le maillage evalue n'a ni sommet ni
+    triangle.
+    """
     mesh = obj_eval.to_mesh()
     try:
         mesh.calc_loop_triangles()
         n_verts = len(mesh.vertices)
         n_tris = len(mesh.loop_triangles)
         if n_verts == 0 or n_tris == 0:
-            return None
+            return (
+                np.empty((0, 3), dtype=np.float64),
+                np.empty((0, 3), dtype=np.int64),
+            )
 
         verts_local = np.empty(n_verts * 3, dtype=np.float64)
         mesh.vertices.foreach_get("co", verts_local)
@@ -162,8 +193,43 @@ def _world_bvh_from_evaluated(obj_eval):
 
         mat = np.array(obj_eval.matrix_world, dtype=np.float64)
         verts_world = verts_local @ mat[:3, :3].T + mat[:3, 3]
+
+        if obj_eval.matrix_world.determinant() < 0.0:
+            tris = tris[:, (0, 2, 1)]
     finally:
         obj_eval.to_mesh_clear()
+
+    return verts_world, tris
+
+
+def evaluated_world_triangles(obj_eval):
+    """Triangles du maillage evalue de `obj_eval`, en espace MONDE,
+    `(n_tri, 3, 3)` float64 (triangle, sommet, xyz), orientation
+    corrigee pour la chiralite (voir `evaluated_world_mesh`). N'a
+    aujourd'hui aucun appelant dans l'extension elle-meme : utilisee par
+    `tests/test_sampling_triangles.py` pour verifier `evaluated_world_mesh`
+    sous une forme plus directement comparable (triangles deja indexes,
+    plutot que sommets + indices). Conservee comme utilitaire public au-dessus
+    de `evaluated_world_mesh` (source de verite unique de l'extraction, voir
+    sa docstring) pour tout appelant futur qui prefererait cette forme.
+    """
+    verts_world, tris = evaluated_world_mesh(obj_eval)
+    if tris.shape[0] == 0:
+        return np.empty((0, 3, 3), dtype=np.float64)
+    return verts_world[tris]
+
+
+def _world_bvh_from_evaluated(obj_eval):
+    """Construit un `BVHTree` en espace MONDE a partir du maillage evalue
+    de `obj_eval` : `BVHTree.FromObject` construit son arbre en espace
+    LOCAL (sans appliquer `matrix_world`), ce qui desaccorde geometrie et
+    rayons des que l'objet est deplace/tourne/mis a l'echelle (voir
+    docstring du module). On reutilise donc `evaluated_world_mesh`, qui a
+    deja transforme les sommets par `matrix_world`, pour construire l'arbre
+    via `BVHTree.FromPolygons`."""
+    verts_world, tris = evaluated_world_mesh(obj_eval)
+    if verts_world.shape[0] == 0 or tris.shape[0] == 0:
+        return None
 
     return BVHTree.FromPolygons(
         [Vector(v) for v in verts_world], tris.tolist(), all_triangles=True

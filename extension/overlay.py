@@ -21,6 +21,15 @@ l'objet (comme avant M5, ou l'ecart etait nul par construction) ne
 montrerait pas. L'objet Blender de l'artiste n'est jamais redimensionne :
 seul le TRACE change.
 
+Un COLLIDER est toujours dessine comme sa boite ORIENTEE (les 8 coins de
+`obj.bound_box` transformes par `matrix_world`, relies sans repasser par un
+min/max par axe) et non comme un AABB monde : contrairement a un emetteur
+BOUNDS, la geometrie REELLEMENT transmise au coeur pour un collider est son
+maillage evalue tel quel (voir `sampling.py` / `ops.py::_update_colliders`),
+rotation comprise -- une boite alignee sur les axes du monde ne suivrait pas
+la rotation de l'objet et induirait l'artiste en erreur sur la forme de
+l'obstacle qu'il a place.
+
 Shader retenu : `POLYLINE_UNIFORM_COLOR`, confirme present en Blender 5.2 via
 `gpu.init(); gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')` (les shaders
 `2D_*`/`3D_*` legacy sont retires depuis 4.0). Attribut de sommet attendu :
@@ -47,6 +56,9 @@ _LINE_WIDTH = 1.5
 _COLOR_WATER = (0.2, 0.5, 1.0, 1.0)
 _COLOR_ELASTIC = (1.0, 0.55, 0.1, 1.0)
 _COLOR_DOMAIN = (0.9, 0.9, 0.9, 1.0)
+# Rouge, distinct des couleurs materiau (bleu eau / orange gelee) et du gris
+# du domaine : les colliders sont des obstacles, pas de la matiere simulee.
+_COLOR_COLLIDER = (0.9, 0.15, 0.15, 1.0)
 
 # Alpha applique a la boite d'un emetteur selon son mode d'emission.
 # `BLOCK` (matiere emise d'un coup) reste pleinement opaque ; `INFLOW`
@@ -110,6 +122,27 @@ def _object_world_bounds(obj):
     return (min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs))
 
 
+def _object_world_oriented_box_points(obj):
+    """Points (paires consecutives, mode 'LINES') des 12 aretes de la boite
+    ORIENTEE de `obj` : les 8 coins de `obj.bound_box` transformes par
+    `matrix_world`, relies directement par `_BOX_EDGE_CORNER_INDICES` --
+    SANS repasser par un min/max par axe. `obj.bound_box` est deja range
+    dans l'ordre attendu par `_BOX_EDGE_CORNER_INDICES` (celui d'un produit
+    cartesien {min,max}^3 local, voir la docstring de `_box_corners`), donc
+    le transformer directement par `matrix_world` preserve cet ordre et la
+    rotation de l'objet ; un passage par min/max (comme `_object_world_bounds`)
+    reconstruit au contraire une boite alignee sur les axes du monde et
+    perd la rotation par construction -- c'est exactement le bug que cette
+    fonction corrige pour les colliders (voir docstring de module)."""
+    mat = obj.matrix_world
+    corners = [mat @ mathutils.Vector(c) for c in obj.bound_box]
+    points = []
+    for i, j in _BOX_EDGE_CORNER_INDICES:
+        points.append((corners[i].x, corners[i].y, corners[i].z))
+        points.append((corners[j].x, corners[j].y, corners[j].z))
+    return points
+
+
 def _domain_usable_world_bounds(scene):
     """Bbox MONDE `(min_corner, max_corner)` de la zone UTILE du domaine
     (le pave solveur reduit de sa marge de stencil sur chaque face), ou
@@ -151,6 +184,12 @@ def _domain_usable_world_bounds(scene):
 
 def _draw_box(shader, min_corner, max_corner, color):
     points = _box_line_points(min_corner, max_corner)
+    batch = batch_for_shader(shader, "LINES", {"pos": points})
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+
+def _draw_lines(shader, points, color):
     batch = batch_for_shader(shader, "LINES", {"pos": points})
     shader.uniform_float("color", color)
     batch.draw(shader)
@@ -199,6 +238,18 @@ def _draw():
                     else _ALPHA_BLOCK
                 )
                 _draw_box(shader, min_corner, max_corner, (r, g, b, alpha))
+            elif role == "COLLIDER":
+                # Boite ORIENTEE (pas un AABB monde) : un collider est
+                # l'obstacle REEL simule (voir sampling.py/ops.py, qui
+                # extraient sa geometrie evaluee telle quelle, rotation
+                # comprise), donc son contour doit suivre sa rotation --
+                # sinon l'artiste voit un contour qui ne correspond pas a
+                # son objet des qu'il le tourne. Couleur distincte de celle
+                # des emetteurs (voir _COLOR_COLLIDER) pour que l'artiste
+                # distingue au premier coup d'oeil obstacle et matiere
+                # simulee.
+                points = _object_world_oriented_box_points(obj)
+                _draw_lines(shader, points, _COLOR_COLLIDER)
             elif role == "DOMAIN":
                 # Dessine la zone UTILE REELLEMENT simulee (pave solveur
                 # moins la marge de stencil, voir `_domain_usable_world_bounds`
