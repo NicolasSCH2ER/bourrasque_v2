@@ -1,4 +1,4 @@
-/* mlsmpm.cu — solveur MLS-MPM 3D (Hu et al. 2018), B-splines quadratiques.
+/* mlsmpm.cu -- solveur MLS-MPM 3D (Hu et al. 2018), B-splines quadratiques.
  *
  * REFERENCE : scripts/ref_mlsmpm.py est la specification executable de ce
  * fichier. Chaque kernel est la transcription d'un bloc de Sim.substep().
@@ -244,6 +244,39 @@ __device__ inline float3 closest_pt_triangle(float3 p, float3 a, float3 b,
 #define BQ_BUCKET_MAX_TOTAL_BUCKETS \
     ((int64_t)BQ_BUCKET_MAX_AXIS_RES * BQ_BUCKET_MAX_AXIS_RES * BQ_BUCKET_MAX_AXIS_RES)
 
+/* Demi-epaisseur de la couche de contact, en multiples de dx.
+ *
+ * 1.5 dx est le rayon du stencil B-spline quadratique : la couche couvre donc
+ * exactement l'ensemble des noeuds qu'une particule au contact peut influencer.
+ * Un seul plan de noeuds contraints ne suffit PAS a arreter le fluide -- le
+ * transfert grille-particule etant une moyenne ponderee sur 3 noeuds par axe,
+ * la particule ne fait que ralentir puis s'infiltre. C'est la meme echelle que
+ * c_p.bound = 3 cellules, utilisee par les parois du domaine.
+ *
+ * Mesure a l'appui, sur un contenant ferme dont on fait varier l'epaisseur de
+ * paroi (fuite du fluide hors du contenant apres 5 s) :
+ *   h = 0.5 dx -> 24.7 % de fuite   |   h = 1.5 dx -> 0.1 %
+ * Et aucun epaississement apparent mesurable sur un collider epais : le fluide
+ * s'arrete a la surface exacte dans les deux cas, parce que les noeuds
+ * exterieurs y sont en contact unilateral (cf. normal_corroborated) et ne
+ * bloquent donc que l'entree. */
+#define BQ_CONTACT_BAND_MULT 1.5f
+
+/* Distance minimale, en multiples de dx, a laquelle la contrainte de position de
+ * k_g2p maintient une particule de la surface d'un collider. La condition aux
+ * limites de k_grid_update agit sur les vitesses de grille : elle est molle par
+ * nature (le transfert grille-particule moyenne les noeuds contraints avec les
+ * noeuds libres). Cette contrainte-ci agit sur les positions et est dure ; c'est
+ * elle qui garantit qu'aucune particule ne franchit une paroi, quelle que soit
+ * son epaisseur devant dx. */
+#define BQ_CONTACT_PUSH_MULT 0.5f
+
+/* Decalage d'echantillonnage du champ de collider, en multiples de dx, destine a
+ * lever les coincidences exactes noeud/surface (cf. k_sdf_unsigned). Assez grand
+ * pour que le carre de la distance reste tres au-dessus du seuil de degenerescence
+ * en float32, assez petit pour etre physiquement insignifiant (15 um a dx = 15 mm). */
+#define BQ_SDF_NODE_EPS 1e-3f
+
 struct BucketGridHost {
     float3 origin;
     float  h;
@@ -454,7 +487,7 @@ __global__ void k_p2g(const float3* __restrict__ x,
         stress.m[0] = stress.m[4] = stress.m[8] = -pr;
     }
 
-    /* affine = (-dt vol 4/dx^2) sigma + m C  — cf. reference NumPy */
+    /* affine = (-dt vol 4/dx^2) sigma + m C  -- cf. reference NumPy */
     float coeff = -c_p.dt * c_p.p_vol * 4.f * c_p.inv_dx * c_p.inv_dx;
     mat3 affine = coeff * stress + m.p_mass * C;
 
@@ -483,12 +516,14 @@ __global__ void k_p2g(const float3* __restrict__ x,
 }
 
 /* Initialise (ou reinitialise) le champ de distance a "pas de collider" :
- * grande valeur positive partout, vitesse/friction nulles. */
-__global__ void k_fill_sdf(float* sdf, float4* cvel, int ncell) {
+ * grande valeur positive partout, vitesse/friction nulles, couche de contact
+ * (normale nulle, distance non signee 1e6) vide elle aussi. */
+__global__ void k_fill_sdf(float* sdf, float4* cvel, float4* cnrm, int ncell) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= ncell) return;
     sdf[id] = 1e6f;
     cvel[id] = make_float4(0.f, 0.f, 0.f, 0.f);
+    cnrm[id] = make_float4(0.f, 0.f, 0.f, 1e6f);
 }
 
 /* Index de bucket (non borne : peut deborder de [0,res) si p est hors de la
@@ -520,6 +555,7 @@ __device__ inline int3 bucket_index(float3 p, float3 origin, float h) {
  * le resultat : on s'arrete. C'est cette troncature spatiale -- impossible
  * avec le winding number global -- qui remplace le parcours exhaustif. */
 __global__ void k_sdf_unsigned(float* __restrict__ sdf, float4* __restrict__ cvel,
+                               float4* __restrict__ cnrm,
                                uint8_t* __restrict__ state,
                                const float3* __restrict__ tri,
                                const float3* __restrict__ trivel,
@@ -535,13 +571,31 @@ __global__ void k_sdf_unsigned(float* __restrict__ sdf, float4* __restrict__ cve
     int i = id / (res.y * res.z);
     int j = (id / res.z) % res.y;
     int k = id % res.z;
-    float3 p = make_float3((i + 0.5f) * c_p.dx, (j + 0.5f) * c_p.dx,
-                           (k + 0.5f) * c_p.dx);
+    /* Echantillonnage AUX NOEUDS (i*dx), et non au centre de cellule : c'est
+     * k_grid_update qui consomme ce champ, indexe exactement comme la grille
+     * MPM, dont les noeuds sont en i*dx -- convention etablie par k_p2g
+     * (dpos = (i - fx)*dx), par les parois du domaine (i < bound <=> paroi en
+     * bound*dx) et par le clamp de k_g2p. Un echantillonnage au centre de
+     * cellule decalerait le champ de contact d'un demi-pas par axe (0.87 dx en
+     * diagonale) par rapport aux noeuds qui l'utilisent, et rendrait la bande
+     * de contact anisotrope : plus large d'un cote de la paroi que de l'autre.
+     *
+     * Decalage infinitesimal BQ_SDF_NODE_EPS : une geometrie posee sur des
+     * multiples exacts de dx (cas courant -- un artiste aligne ses objets sur
+     * la grille, et nos propres scenes de test le font) place des noeuds PILE
+     * sur une face. La direction depuis le point le plus proche est alors
+     * indeterminee (dlen2 nul), aucune graine de signe n'est posee, et un
+     * solide entier peut se retrouver non signe. Le decalage brise cette
+     * coincidence : le noeud tombe a 0.1 % de dx de la face, ce qui suffit a
+     * orienter le test de signe sans deplacer le champ de facon perceptible. */
+    const float e = BQ_SDF_NODE_EPS * c_p.dx;
+    float3 p = make_float3(i * c_p.dx + e, j * c_p.dx + e, k * c_p.dx + e);
     bool active = !(p.x < aabb_lo.x || p.x > aabb_hi.x || p.y < aabb_lo.y ||
                     p.y > aabb_hi.y || p.z < aabb_lo.z || p.z > aabb_hi.z);
     if (!active) {
         sdf[id] = 1e6f;
         cvel[id] = make_float4(0.f, 0.f, 0.f, 0.f);
+        cnrm[id] = make_float4(0.f, 0.f, 0.f, 1e6f);
         state[id] = BQ_SDF_STATE_UNKNOWN; /* resolu par propagation, cf. note plus haut */
         return;
     }
@@ -593,6 +647,7 @@ __global__ void k_sdf_unsigned(float* __restrict__ sdf, float4* __restrict__ cve
 
     float3 best_vel = make_float3(0.f, 0.f, 0.f);
     float best_fric = 0.f;
+    float3 nu = make_float3(0.f, 0.f, 0.f); /* normale de la couche de contact */
     int8_t sign_local = 0; /* 0 = pas de test local fiable, repli sur la propagation */
     if (best_t >= 0) {
         float3 va = trivel[3 * best_t + 0], vb = trivel[3 * best_t + 1],
@@ -628,10 +683,27 @@ __global__ void k_sdf_unsigned(float* __restrict__ sdf, float4* __restrict__ cve
             float dot = diff.x * nrm.x + diff.y * nrm.y + diff.z * nrm.z;
             sign_local = (dot >= 0.f) ? 1 : -1;
         }
+
+        /* Normale de la couche de contact : direction depuis le point le plus
+         * proche sur le triangle vers la cellule -- exacte que ce point soit
+         * sur une face, une arete ou un sommet (contrairement a la normale de
+         * face, fausse pres des aretes/sommets). diff et dlen2 sont deja
+         * calcules ci-dessus pour le test de signe local, reutilises ici. */
+        if (dlen2 > 1e-20f) {
+            float dinv = 1.f / sqrtf(dlen2);
+            nu = make_float3(diff.x * dinv, diff.y * dinv, diff.z * dinv);
+        } else if (nlen2 > 1e-20f) {
+            /* cellule pile sur la surface : direction indeterminee, repli sur
+             * la normale du triangle. */
+            float ninv = 1.f / sqrtf(nlen2);
+            nu = make_float3(nrm.x * ninv, nrm.y * ninv, nrm.z * ninv);
+        }
     }
 
     sdf[id] = sqrtf(best_d2); /* non signee pour l'instant, cf. k_sdf_finalize_sign */
     cvel[id] = make_float4(best_vel.x, best_vel.y, best_vel.z, best_fric);
+    cnrm[id] = (best_t >= 0) ? make_float4(nu.x, nu.y, nu.z, sqrtf(best_d2))
+                              : make_float4(0.f, 0.f, 0.f, 1e6f);
 
     /* Amorce (graine) uniquement dans la bande, et seulement si le test local
      * a pu trancher. Hors bande, ou test local degenere : UNKNOWN, resolu
@@ -664,11 +736,13 @@ __global__ void k_sdf_unsigned(float* __restrict__ sdf, float4* __restrict__ cve
  * defaut 2) est resolue EXTERIOR en priorite -- regle de securite : ne
  * jamais fabriquer de solide non justifie.
  *
- * Limite connue et acceptable (grille reguliere) : une paroi plus fine
- * qu'une cellule ne bloque pas la propagation -- l'interieur "fuit" au
- * travers et l'obstacle devient localement transparent au solveur. Un
- * obstacle plus fin que dx n'est de toute facon pas resolu par la grille
- * MPM elle-meme ; ce n'est pas une regression introduite par ce lot. */
+ * Limite persistante (grille reguliere) : une paroi plus fine qu'une
+ * cellule ne bloque toujours pas la propagation -- l'interieur "fuit" au
+ * travers et le signe de sdf devient localement aveugle a l'obstacle.
+ * Cependant l'etancheite du contact ne repose plus sur le signe seul : la
+ * couche de contact de k_grid_update (BQ_CONTACT_BAND_MULT, distance non
+ * signee cnrm.w) prend le relais dans ce cas et bloque le fluide meme la ou
+ * aucune cellule n'est marquee solide. */
 __global__ void k_sdf_propagate_sign(uint8_t* __restrict__ state,
                                      int ncell, int* changed) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
@@ -717,15 +791,58 @@ __global__ void k_sdf_propagate_sign(uint8_t* __restrict__ state,
  * solide est une simulation perdue. D'ou le test : seul INTERIOR nege le
  * signe, tout le reste (EXTERIOR et UNKNOWN) reste positif. */
 __global__ void k_sdf_finalize_sign(float* __restrict__ sdf,
+                                    float4* __restrict__ cnrm,
                                     const uint8_t* __restrict__ state,
                                     int ncell) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= ncell) return;
-    if (state[id] == BQ_SDF_STATE_INTERIOR) sdf[id] = -sdf[id];
+    if (state[id] == BQ_SDF_STATE_INTERIOR) {
+        sdf[id] = -sdf[id];
+        /* cnrm.xyz doit rester la normale SORTANTE du solide quel que soit le
+         * cote ou se trouve la cellule : ici la cellule est du cote interieur,
+         * la normale calculee en k_sdf_unsigned pointait donc vers l'interieur
+         * -- on l'inverse. w (distance non signee) est inchange. */
+        float4 cn = cnrm[id];
+        cnrm[id] = make_float4(-cn.x, -cn.y, -cn.z, cn.w);
+    }
+}
+
+/* La normale du collider en (i,j,k) est-elle CORROBOREE par du solide derriere
+ * elle ? On regarde la cellule voisine dans la direction -n, c'est-a-dire du
+ * cote ou la normale pretend que se trouve le solide.
+ *
+ * Corroboree : la normale est fiable, l'obstacle est resolu par la grille de ce
+ * cote-la. Non corroboree : la normale peut pointer du mauvais cote, et deux
+ * geometries y menent :
+ *   - paroi plus fine que dx : aucun centre de cellule dedans, le champ signe
+ *     est integralement aveugle ;
+ *   - paroi d'environ 1 dx : la cellule est solide mais equidistante des deux
+ *     faces, le point le plus proche est donc arbitraire. Tester la seule
+ *     presence de solide au voisinage n'attrape pas ce cas (la cellule est
+ *     elle-meme solide) -- d'ou la corroboration DIRECTIONNELLE.
+ *
+ * Bornage par indices et non par offset lineaire : un pas de +/-1 sur k
+ * franchirait sinon la frontiere d'axe et lirait la ligne voisine. Voisin hors
+ * grille : non corrobore, les appelants retiennent alors le comportement sur. */
+__device__ inline bool normal_corroborated(const float* __restrict__ sdf,
+                                           int3 res, int i, int j, int k,
+                                           float3 n) {
+    int di = 0, dj = 0, dk = 0;
+    if (fabsf(n.x) >= fabsf(n.y) && fabsf(n.x) >= fabsf(n.z))
+        di = (n.x > 0.f) ? -1 : 1;
+    else if (fabsf(n.y) >= fabsf(n.z))
+        dj = (n.y > 0.f) ? -1 : 1;
+    else
+        dk = (n.z > 0.f) ? -1 : 1;
+    int bi = i + di, bj = j + dj, bk = k + dk;
+    return bi >= 0 && bi < res.x && bj >= 0 && bj < res.y &&
+           bk >= 0 && bk < res.z &&
+           sdf[(bi * res.y + bj) * res.z + bk] < 0.f;
 }
 
 __global__ void k_grid_update(float4* grid, const float* __restrict__ sdf,
-                              const float4* __restrict__ cvel, int ncell) {
+                              const float4* __restrict__ cvel,
+                              const float4* __restrict__ cnrm, int ncell) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= ncell) return;
     float4 g = grid[id];
@@ -740,39 +857,40 @@ __global__ void k_grid_update(float4* grid, const float* __restrict__ sdf,
     int k = id % res.z;
 
     /* condition aux limites du collider : friction de Coulomb (Stomakhin et
-     * al. 2013) sur la composante normale entrante, seulement si le champ
-     * de distance signale l'interieur du solide. */
+     * al. 2013) sur la composante normale, appliquee soit quand le champ de
+     * distance signale l'interieur du solide, soit quand la cellule est dans
+     * la couche de contact (distance non signee cnrm.w < h) -- cette derniere
+     * rattrape les parois plus fines que dx, invisibles au signe seul. */
     float phi = sdf[id];
-    if (phi < 0.f) {
-        int im = i > 0 ? i - 1 : i, ip = i < res.x - 1 ? i + 1 : i;
-        int jm = j > 0 ? j - 1 : j, jp = j < res.y - 1 ? j + 1 : j;
-        int km = k > 0 ? k - 1 : k, kp = k < res.z - 1 ? k + 1 : k;
-        float gx = 0.f, gy = 0.f, gz = 0.f;
-        if (ip != im)
-            gx = (sdf[(ip * res.y + j) * res.z + k] -
-                  sdf[(im * res.y + j) * res.z + k]) / ((ip - im) * c_p.dx);
-        if (jp != jm)
-            gy = (sdf[(i * res.y + jp) * res.z + k] -
-                  sdf[(i * res.y + jm) * res.z + k]) / ((jp - jm) * c_p.dx);
-        if (kp != km)
-            gz = (sdf[(i * res.y + j) * res.z + kp] -
-                  sdf[(i * res.y + j) * res.z + km]) / ((kp - km) * c_p.dx);
-        float glen = sqrtf(gx * gx + gy * gy + gz * gz);
-        if (glen > 1e-8f) {
-            float3 n = make_float3(gx / glen, gy / glen, gz / glen);
+    float4 cn = cnrm[id];
+    float h = BQ_CONTACT_BAND_MULT * c_p.dx;
+    bool solid_here = (phi < 0.f);
+    if (solid_here || cn.w < h) {
+        float3 n = make_float3(cn.x, cn.y, cn.z);
+        if (n.x != 0.f || n.y != 0.f || n.z != 0.f) {
+            /* Normale corroboree : contact UNILATERAL, le fluide qui s'eloigne
+             * de l'obstacle n'y colle pas. Non corroboree : contact
+             * BIDIRECTIONNEL, un noeud unique devant bloquer le fluide des deux
+             * cotes d'une paroi que la grille ne resout pas (cf.
+             * normal_corroborated). */
+            bool bidir = !normal_corroborated(sdf, res, i, j, k, n);
             float4 cv = cvel[id];
             float3 vc = make_float3(cv.x, cv.y, cv.z);
             float fr = cv.w;
             float3 vrel = make_float3(v.x - vc.x, v.y - vc.y, v.z - vc.z);
             float vn = vrel.x * n.x + vrel.y * n.y + vrel.z * n.z;
-            if (vn < 0.f) { /* le fluide entre dans le solide */
+            if (vn < 0.f || bidir) {
                 float3 vt = make_float3(vrel.x - vn * n.x, vrel.y - vn * n.y,
                                         vrel.z - vn * n.z);
                 float vt_norm = sqrtf(vt.x * vt.x + vt.y * vt.y + vt.z * vt.z);
-                if (vt_norm <= -fr * vn) {
+                /* friction de Coulomb (Stomakhin et al. 2013), ecrite avec |vn| :
+                 * strictement equivalente a la forme -fr*vn dans le cas vn < 0, et
+                 * valable aussi pour le sens sortant du mode bidirectionnel. */
+                float vn_abs = fabsf(vn);
+                if (vt_norm <= fr * vn_abs) {
                     vt = make_float3(0.f, 0.f, 0.f);
                 } else if (vt_norm > 1e-8f) {
-                    float scale = 1.f + fr * vn / vt_norm;
+                    float scale = 1.f - fr * vn_abs / vt_norm;
                     vt.x *= scale; vt.y *= scale; vt.z *= scale;
                 }
                 v = make_float3(vc.x + vt.x, vc.y + vt.y, vc.z + vt.z);
@@ -797,7 +915,8 @@ __global__ void k_g2p(float3* __restrict__ x,
                       float* __restrict__ Jw,
                       const uint8_t* __restrict__ mat,
                       const float4* __restrict__ grid,
-                      const float* __restrict__ sdf, int n) {
+                      const float* __restrict__ sdf,
+                      const float4* __restrict__ cnrm, int n) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n) return;
 
@@ -852,44 +971,104 @@ __global__ void k_g2p(float3* __restrict__ x,
      * retrouve dans le solide (phi < 0), on la repousse exactement a la
      * surface le long du gradient du champ de distance : xnew -= phi * n.
      *
-     * Lecture de phi a la cellule la plus proche, sans interpolation
-     * trilineaire : coherent avec k_grid_update, qui traite deja le champ
-     * comme cellule-centre sans interpolation pour sa propre condition aux
-     * limites -- meme convention de part et d'autre du contact. Moins
-     * couteux aussi : ce test tourne par particule et par substep (bien
-     * plus souvent que k_grid_update, qui tourne par cellule) ; une
-     * interpolation trilineaire aurait demande 8 lectures de sdf pour la
-     * valeur puis jusqu'a 24 de plus pour un gradient trilineaire coherent,
-     * contre 1 + au plus 6 ici. En l'absence de collider, sdf vaut 1e6
-     * partout (k_fill_sdf) : le test phi < 0 echoue immediatement, chemin
-     * quasi gratuit (une lecture deja en cache, aucun calcul de gradient). */
+     * Lecture de phi et de la normale a la cellule la plus proche, sans
+     * interpolation trilineaire : coherent avec k_grid_update, qui traite
+     * deja le champ indexe par NOEUD pour sa propre condition aux limites --
+     * d'ou la lecture au noeud le plus proche ici, floorf(x*inv_dx + 0.5),
+     * et non a la cellule contenant la particule : meme convention de part et
+     * d'autre du contact, sans quoi le mecanisme mou (vitesses de grille) et
+     * le mecanisme dur (positions) travailleraient sur deux champs decales
+     * d'un demi-pas. Moins couteux aussi : ce test tourne par particule et par
+     * substep (bien plus souvent que k_grid_update, qui tourne par
+     * cellule). La normale geometrique exacte est precalculee dans cnrm
+     * (direction depuis le point le plus proche du collider vers le
+     * noeud, cf. k_sdf_unsigned) : une simple lecture, plus de gradient
+     * par differences finies a recalculer ici. En l'absence de collider,
+     * sdf vaut 1e6 partout (k_fill_sdf) : le test phi < 0 echoue
+     * immediatement, chemin quasi gratuit. */
     int3 res = c_p.res;
-    int ci = min(max((int)floorf(xnew.x * c_p.inv_dx), 0), res.x - 1);
-    int cj = min(max((int)floorf(xnew.y * c_p.inv_dx), 0), res.y - 1);
-    int ck = min(max((int)floorf(xnew.z * c_p.inv_dx), 0), res.z - 1);
-    float phi = sdf[(ci * res.y + cj) * res.z + ck];
-    if (phi < 0.f) {
-        int im = ci > 0 ? ci - 1 : ci, ip = ci < res.x - 1 ? ci + 1 : ci;
-        int jm = cj > 0 ? cj - 1 : cj, jp = cj < res.y - 1 ? cj + 1 : cj;
-        int km = ck > 0 ? ck - 1 : ck, kp = ck < res.z - 1 ? ck + 1 : ck;
-        float gx = 0.f, gy = 0.f, gz = 0.f;
-        if (ip != im)
-            gx = (sdf[(ip * res.y + cj) * res.z + ck] -
-                  sdf[(im * res.y + cj) * res.z + ck]) / ((ip - im) * c_p.dx);
-        if (jp != jm)
-            gy = (sdf[(ci * res.y + jp) * res.z + ck] -
-                  sdf[(ci * res.y + jm) * res.z + ck]) / ((jp - jm) * c_p.dx);
-        if (kp != km)
-            gz = (sdf[(ci * res.y + cj) * res.z + kp] -
-                  sdf[(ci * res.y + cj) * res.z + km]) / ((kp - km) * c_p.dx);
-        float glen = sqrtf(gx * gx + gy * gy + gz * gz);
-        /* gradient degenere (norme nulle) : ne rien faire plutot que de
-         * deplacer la particule dans une direction arbitraire. */
-        if (glen > 1e-8f) {
-            float3 nrm = make_float3(gx / glen, gy / glen, gz / glen);
-            xnew.x -= phi * nrm.x;
-            xnew.y -= phi * nrm.y;
-            xnew.z -= phi * nrm.z;
+    int ci = min(max((int)floorf(xnew.x * c_p.inv_dx + 0.5f), 0), res.x - 1);
+    int cj = min(max((int)floorf(xnew.y * c_p.inv_dx + 0.5f), 0), res.y - 1);
+    int ck = min(max((int)floorf(xnew.z * c_p.inv_dx + 0.5f), 0), res.z - 1);
+    int idx_new = (ci * res.y + cj) * res.z + ck;
+    float phi = sdf[idx_new];
+
+    /* Contrainte de position, du COTE d'ou vient la particule.
+     *
+     * Le signe du champ de distance ne peut pas servir ici : une paroi plus fine
+     * que dx n'a pas d'interieur discretise, et une paroi d'environ 1 dx a des
+     * cellules equidistantes de ses deux faces dont la normale est arbitraire.
+     * On se passe donc du signe : la normale lue a la position PRECEDENTE de la
+     * particule (cn_old) designe le cote de la paroi ou elle se trouvait, et on
+     * la maintient de ce cote-la.
+     *
+     * Detection de franchissement sans signe : les normales des cellules situees
+     * de part et d'autre d'une paroi pointent en sens opposes, donc un produit
+     * scalaire negatif entre la normale du cote d'origine et celle de la cellule
+     * d'arrivee signale que la particule a change de cote. Elle est alors
+     * ramenee de l'autre cote, a la distance de securite.
+     *
+     * La CFL bornant le deplacement d'un substep a environ dx, une particule qui
+     * arrive dans une paroi venait forcement d'au plus dx de celle-ci, donc d'une
+     * cellule ou cnrm est renseigne : le cote d'origine est toujours disponible.
+     * Garde-fou geometrique : sur une surface courbe ou pres d'une arete, deux
+     * cellules d'un MEME cote peuvent avoir des normales divergentes ; on
+     * n'interprete donc un produit scalaire negatif comme un franchissement que
+     * dans la bande de contact, et le deplacement est borne a dx pour ne jamais
+     * teleporter une particule. */
+    float push = BQ_CONTACT_PUSH_MULT * c_p.dx;
+    int oi = min(max((int)floorf(xp.x * c_p.inv_dx + 0.5f), 0), res.x - 1);
+    int oj = min(max((int)floorf(xp.y * c_p.inv_dx + 0.5f), 0), res.y - 1);
+    int ok_ = min(max((int)floorf(xp.z * c_p.inv_dx + 0.5f), 0), res.z - 1);
+    float4 cn_old = cnrm[(oi * res.y + oj) * res.z + ok_];
+    float4 cn_new = cnrm[idx_new];
+    float3 n_side = make_float3(cn_old.x, cn_old.y, cn_old.z);
+    float3 n_new = make_float3(cn_new.x, cn_new.y, cn_new.z);
+    bool ok_side = (n_side.x != 0.f || n_side.y != 0.f || n_side.z != 0.f);
+    bool ok_new = (n_new.x != 0.f || n_new.y != 0.f || n_new.z != 0.f);
+    bool traite = false;
+    if (ok_side && ok_new && cn_new.w < BQ_CONTACT_BAND_MULT * c_p.dx) {
+        float dot_side = n_new.x * n_side.x + n_new.y * n_side.y +
+                         n_new.z * n_side.z;
+        bool franchi = (dot_side < 0.f);
+        if (franchi || cn_new.w < push) {
+            float depl = franchi ? (push + cn_new.w) : (push - cn_new.w);
+            depl = fminf(depl, c_p.dx);
+            xnew.x += depl * n_side.x;
+            xnew.y += depl * n_side.y;
+            xnew.z += depl * n_side.z;
+            traite = true;
+        }
+    }
+
+    if (!traite && phi < 0.f) {
+        float4 cn = cnrm[idx_new];
+        float3 n = make_float3(cn.x, cn.y, cn.z);
+        /* Ne projeter que sur une normale DEGENEREE-libre et CORROBOREE. Une
+         * normale non corroboree peut pointer du mauvais cote de la paroi (cas
+         * d'une paroi d'environ 1 dx, cellule equidistante de ses deux faces) :
+         * la projection deviendrait alors un mecanisme de fuite, poussant
+         * activement la particule au travers de l'obstacle -- mesure : 4.9 % de
+         * fuite sur un contenant a paroi de 1 dx, contre 0.1 % sans cette
+         * projection. Dans le doute on ne deplace rien : la condition aux
+         * limites bidirectionnelle de k_grid_update tient deja ce cas. */
+        if ((n.x != 0.f || n.y != 0.f || n.z != 0.f) &&
+            normal_corroborated(sdf, res, ci, cj, ck, n)) {
+            /* Deplacement plafonne a dx, comme la contrainte de bande ci-dessus.
+             * |phi| est petit tant que le signe du champ est juste, mais il
+             * existe un mode d'echec ou il ne l'est pas : un collider dont les
+             * normales de faces sont inversees (Solidify, extrusion, faces
+             * retournees -- erreur de modelisation banale) trompe TOUTES les
+             * graines de signe de k_sdf_unsigned. L'exterieur devient alors
+             * INTERIOR, phi vaut plusieurs dizaines de centimetres, et une
+             * projection non bornee teleporterait tout le fluide d'un coup. La
+             * regle de securite de k_sdf_finalize_sign ne protege que les
+             * cellules UNKNOWN, pas les graines fausses : ce plafond est la
+             * seule garde sur ce chemin. */
+            float depl_p = fminf(-phi, c_p.dx);
+            xnew.x += depl_p * n.x;
+            xnew.y += depl_p * n.y;
+            xnew.z += depl_p * n.z;
         }
     }
 
@@ -932,6 +1111,11 @@ struct BqSim {
     /* colliders : champ de distance signee + vitesse/friction, taille ncell */
     float*  d_sdf = nullptr;
     float4* d_cvel = nullptr;
+    /* couche de contact : xyz = normale unitaire SORTANTE du solide, w =
+     * distance NON SIGNEE au collider (cf. k_sdf_unsigned, k_sdf_finalize_sign,
+     * k_grid_update). Rattrape les parois plus fines que dx, invisibles au
+     * champ signe sdf seul -- taille ncell. */
+    float4* d_cnrm = nullptr;
     /* geometrie triangulaire brute, reallouee seulement quand n_tri augmente */
     float3* d_tri = nullptr;
     float3* d_trivel = nullptr;
@@ -1025,6 +1209,7 @@ BQ_API BqSim* bq_create(const BqConfig* cfg) {
         cudaMalloc(&s->d_grid, ncell * sizeof(float4)) != cudaSuccess ||
         cudaMalloc(&s->d_sdf, ncell * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&s->d_cvel, ncell * sizeof(float4)) != cudaSuccess ||
+        cudaMalloc(&s->d_cnrm, ncell * sizeof(float4)) != cudaSuccess ||
         cudaMalloc(&s->d_ext, ncell * sizeof(uint8_t)) != cudaSuccess ||
         cudaMalloc(&s->d_changed, sizeof(int)) != cudaSuccess) {
         snprintf(g_error, sizeof(g_error), "cudaMalloc: memoire insuffisante");
@@ -1033,7 +1218,7 @@ BQ_API BqSim* bq_create(const BqConfig* cfg) {
     }
     /* pas de collider au depart : sdf grand partout, vitesse/friction nulles */
     dim3 bp(256), gc((ncell + 255) / 256);
-    k_fill_sdf<<<gc, bp>>>(s->d_sdf, s->d_cvel, ncell);
+    k_fill_sdf<<<gc, bp>>>(s->d_sdf, s->d_cvel, s->d_cnrm, ncell);
     if (cudaDeviceSynchronize() != cudaSuccess) {
         snprintf(g_error, sizeof(g_error), "k_fill_sdf: echec init");
         bq_destroy(s);
@@ -1047,7 +1232,7 @@ BQ_API void bq_destroy(BqSim* s) {
     cudaFree(s->d_x);   cudaFree(s->d_v);   cudaFree(s->d_C);
     cudaFree(s->d_F);   cudaFree(s->d_J);   cudaFree(s->d_mat);
     cudaFree(s->d_grid);
-    cudaFree(s->d_sdf); cudaFree(s->d_cvel);
+    cudaFree(s->d_sdf); cudaFree(s->d_cvel); cudaFree(s->d_cnrm);
     cudaFree(s->d_tri); cudaFree(s->d_trivel); cudaFree(s->d_trifric);
     cudaFree(s->d_bucket_off); cudaFree(s->d_bucket_tri);
     cudaFree(s->d_ext); cudaFree(s->d_changed);
@@ -1234,7 +1419,7 @@ BQ_API int bq_set_colliders(BqSim* s, const float* tri, const float* tri_vel,
     }
     if (n_tri == 0) {
         s->n_tri = 0;
-        k_fill_sdf<<<gc, bp>>>(s->d_sdf, s->d_cvel, ncell);
+        k_fill_sdf<<<gc, bp>>>(s->d_sdf, s->d_cvel, s->d_cnrm, ncell);
         BQ_CUDA_CHECK(cudaGetLastError());
         BQ_CUDA_CHECK(cudaDeviceSynchronize());
         return 0;
@@ -1324,7 +1509,7 @@ BQ_API int bq_set_colliders(BqSim* s, const float* tri, const float* tri_vel,
      *    de buckets. Amorce aussi l'etat de signe (d_ext) : graines EXTERIOR
      *    / INTERIOR dans la bande proche de la surface, UNKNOWN partout
      *    ailleurs (cf. k_sdf_unsigned). */
-    k_sdf_unsigned<<<gc, bp>>>(s->d_sdf, s->d_cvel, s->d_ext,
+    k_sdf_unsigned<<<gc, bp>>>(s->d_sdf, s->d_cvel, s->d_cnrm, s->d_ext,
                                s->d_tri, s->d_trivel,
                                s->d_trifric, s->d_bucket_off, s->d_bucket_tri,
                                bg.origin, bg.h, bg.res, lo, hi, ncell);
@@ -1375,7 +1560,7 @@ BQ_API int bq_set_colliders(BqSim* s, const float* tri, const float* tri_vel,
     /* 3. applique le signe : negatif la ou l'etat resolu est INTERIOR,
      * positif partout ailleurs (EXTERIOR ou UNKNOWN, cf. regle de securite
      * dans k_sdf_finalize_sign). */
-    k_sdf_finalize_sign<<<gc, bp>>>(s->d_sdf, s->d_ext, ncell);
+    k_sdf_finalize_sign<<<gc, bp>>>(s->d_sdf, s->d_cnrm, s->d_ext, ncell);
     BQ_CUDA_CHECK(cudaGetLastError());
     BQ_CUDA_CHECK(cudaDeviceSynchronize());
     return 0;
@@ -1391,9 +1576,9 @@ BQ_API int bq_step(BqSim* s, float frame_dt) {
         k_clear_grid<<<gc, bp>>>(s->d_grid, ncell);
         k_p2g<<<gp, bp>>>(s->d_x, s->d_v, s->d_C, s->d_F, s->d_J, s->d_mat,
                           s->d_grid, s->n);
-        k_grid_update<<<gc, bp>>>(s->d_grid, s->d_sdf, s->d_cvel, ncell);
+        k_grid_update<<<gc, bp>>>(s->d_grid, s->d_sdf, s->d_cvel, s->d_cnrm, ncell);
         k_g2p<<<gp, bp>>>(s->d_x, s->d_v, s->d_C, s->d_J, s->d_mat,
-                          s->d_grid, s->d_sdf, s->n);
+                          s->d_grid, s->d_sdf, s->d_cnrm, s->n);
     }
     BQ_CUDA_CHECK(cudaGetLastError());
     BQ_CUDA_CHECK(cudaDeviceSynchronize());

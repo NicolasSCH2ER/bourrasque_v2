@@ -493,7 +493,9 @@ class Sim:
     def read_sdf(self, out=None):
         """Renvoie le champ de distance signee courant, ndarray float32 de
         forme `(grid_res[0], grid_res[1], grid_res[2])` (espace SOLVEUR),
-        rempli in-place si `out` est fourni.
+        rempli in-place si `out` est fourni. Echantillonne AUX NOEUDS de la
+        grille (`i*dx` sur chaque axe, meme convention que `k_grid_update`),
+        pas au centre des cellules.
 
         Diagnostic et validation (voir `bq_read_sdf`, `bourrasque.h`) :
         permet de verifier depuis Python qu'un collider produit bien un

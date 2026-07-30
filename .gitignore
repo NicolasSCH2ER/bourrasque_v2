@@ -20,3 +20,8 @@ bourrasque_cache/
 # Python
 __pycache__/
 *.pyc
+
+# Artefacts de compilation ponctuels (test_abi.obj a ete suivi par erreur)
+*.obj
+*.exp
+*.pdb

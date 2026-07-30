@@ -12,8 +12,8 @@ pas tourner sans lui.
 Pour une sphere de centre `c` et de rayon `r`, le champ de distance signee
 EXACT vaut `||x - c|| - r` en tout point `x` : negatif a l'interieur,
 positif a l'exterieur, nul sur la surface. On compare ce champ analytique,
-evalue au centre de chaque cellule du solveur (`(i+0.5)*dx`, meme
-convention que `core/src/mlsmpm.cu::k_sdf_unsigned`), au champ que
+evalue aux noeuds de la grille du solveur (`i*dx`, meme convention que
+`core/src/mlsmpm.cu::k_sdf_unsigned`), au champ que
 `Sim.read_sdf` renvoie apres avoir transmis une icosphere triangulee au
 coeur via `Sim.set_colliders`.
 
@@ -28,11 +28,13 @@ en deduit :
     exclue EXPLICITEMENT du test de signe, jamais silencieusement — voir
     l'assertion sur `n_ambiguous` qui borne sa taille et la rend visible ;
   - une tolerance de magnitude dans la bande proche de la surface, qui
-    ajoute a la fleche un terme `0.5*dx` (le champ du coeur est une
-    distance a un maillage, discretisee sur la grille, pas une formule
-    continue).
+    prend un multiple de sureté de la fleche (l'ecart facette/sphere,
+    dominant) et y ajoute une marge `2e-3*dx` pour le decalage
+    `BQ_SDF_NODE_EPS` (1e-3*dx) que le coeur applique au point
+    d'echantillonnage pour eviter qu'un noeud tombe exactement sur une
+    face (voir `core/src/mlsmpm.cu::k_sdf_unsigned`).
 
-Le signe est verifie sur TOUTES les cellules SAUF celles de la bande
+Le signe est verifie sur TOUS les noeuds SAUF ceux de la bande
 ambigue (dont la taille est elle-meme bornee et rapportee) ; la magnitude
 est verifiee sur la bande proche de la surface (`|distance analytique| <
 3*dx`), conformement a la spec.
@@ -182,7 +184,7 @@ def test_sphere_sdf_sign_and_magnitude():
         f"fleche estimee {sagitta:.6f} (dx={dx:.5f})"
     )
     # La fleche doit rester tres petite devant dx pour que la bande ambigue
-    # (voir plus bas) ne concerne qu'une poignee de cellules ; sinon ce
+    # (voir plus bas) ne concerne qu'une poignee de noeuds ; sinon ce
     # test ne serait pas discriminant. Verifie l'hypothese plutot que de la
     # supposer silencieusement.
     assert sagitta < 0.05 * dx, (
@@ -210,21 +212,21 @@ def test_sphere_sdf_sign_and_magnitude():
 
     assert sdf.shape == (grid_res, grid_res, grid_res), sdf.shape
 
-    # Champ analytique, evalue au centre de chaque cellule : (i+0.5)*dx sur
-    # chaque axe, meme convention que k_sdf_unsigned. `read_sdf` renvoie un
+    # Champ analytique, evalue aux noeuds de la grille : i*dx sur chaque
+    # axe, meme convention que k_sdf_unsigned. `read_sdf` renvoie un
     # tableau (res0,res1,res2) dont l'indexation [i,j,k] correspond a
-    # l'identifiant de cellule id=(i*res.y+j)*res.z+k du coeur (ordre C,
+    # l'identifiant de noeud id=(i*res.y+j)*res.z+k du coeur (ordre C,
     # dernier axe le plus rapide) : `indexing="ij"` reproduit exactement
     # cette disposition.
     idx = np.arange(grid_res)
-    coord = (idx + 0.5) * dx
+    coord = idx * dx
     gx, gy, gz = np.meshgrid(coord, coord, coord, indexing="ij")
     dist_to_center = np.sqrt(
         (gx - center[0]) ** 2 + (gy - center[1]) ** 2 + (gz - center[2]) ** 2
     )
     analytic = dist_to_center - radius
 
-    # Bande ambigue autour de la surface EXACTE : une cellule dont la
+    # Bande ambigue autour de la surface EXACTE : un noeud dont la
     # distance analytique tombe sous cette marge peut, a cause de la
     # facettisation (polyedre, pas une sphere exacte), se retrouver du
     # "mauvais" cote de la surface ideale sans que ce soit un defaut du
@@ -236,10 +238,10 @@ def test_sphere_sdf_sign_and_magnitude():
     n_total = int(analytic.size)
     print(
         f"  bande ambigue (|distance| < {sign_margin:.6f}) : "
-        f"{n_ambiguous}/{n_total} cellules"
+        f"{n_ambiguous}/{n_total} noeuds"
     )
     assert n_ambiguous < 0.05 * n_total, (
-        f"trop de cellules dans la bande ambigue ({n_ambiguous}/{n_total}) : "
+        f"trop de noeuds dans la bande ambigue ({n_ambiguous}/{n_total}) : "
         "la triangulation ou la resolution de grille choisie rend ce test "
         "peu discriminant, revoir `subdivisions`/`grid_res`"
     )
@@ -256,24 +258,37 @@ def test_sphere_sdf_sign_and_magnitude():
             for ix in bad_idx
         ]
         raise AssertionError(
-            f"{n_mismatch} cellule(s) hors bande ambigue avec un signe "
+            f"{n_mismatch} noeud(s) hors bande ambigue avec un signe "
             f"incorrect (premieres : {details})"
         )
 
     # Magnitude dans la bande proche de la surface (spec : "la magnitude
-    # dans la bande proche de la surface").
+    # dans la bande proche de la surface"). La tolerance couvre deux sources
+    # d'ecart reelles, pas une marge arbitraire :
+    #  - la fleche (sagitta) de la triangulation, terme dominant, avec un
+    #    facteur de surete 2x (mesure : l'ecart observe depasse la fleche
+    #    brute d'environ 50%, cf. rapport) ;
+    #  - `2e-3*dx`, une marge pour le decalage `BQ_SDF_NODE_EPS = 1e-3*dx`
+    #    que le coeur applique au point d'echantillonnage (voir
+    #    `k_sdf_unsigned`), qui n'est PAS modelise par le champ analytique
+    #    de ce test.
+    # Le terme `0.5*dx` d'avant le passage a l'echantillonnage aux noeuds
+    # n'a plus lieu d'etre : il compensait un decalage d'un demi-pas entre
+    # les points analytiques (centre de cellule) et les points du coeur
+    # (centre de cellule) qui n'existe plus maintenant que les deux cotes
+    # de la comparaison utilisent i*dx.
     near_band = np.abs(analytic) < 3.0 * dx
-    tol = sagitta + 0.5 * dx
+    tol = 2.0 * sagitta + 2e-3 * dx
     diff = np.abs(sdf.astype(np.float64)[near_band] - analytic[near_band])
     max_diff = float(diff.max()) if diff.size else 0.0
     print(
         f"  bande proche (|distance| < {3.0 * dx:.5f}) : {int(near_band.sum())} "
-        f"cellules, ecart max {max_diff:.6f} (tolerance {tol:.6f})"
+        f"noeuds, ecart max {max_diff:.6f} (tolerance {tol:.6f})"
     )
     assert max_diff < tol, (
         f"ecart de magnitude trop grand dans la bande proche de la surface : "
-        f"{max_diff:.6f} (tolerance {tol:.6f} = fleche {sagitta:.6f} + "
-        f"0.5*dx {0.5 * dx:.6f})"
+        f"{max_diff:.6f} (tolerance {tol:.6f} = 2*fleche {2.0 * sagitta:.6f} + "
+        f"2e-3*dx {2e-3 * dx:.6f})"
     )
 
 
