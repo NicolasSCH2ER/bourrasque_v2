@@ -25,3 +25,6 @@ __pycache__/
 *.obj
 *.exp
 *.pdb
+
+# Exemple flip fluids
+flip_fluids_addon/
