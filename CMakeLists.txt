@@ -1,18 +1,32 @@
 # Bourrasque — core MLS-MPM CUDA
 #
-# Build (Windows, VS2026 Build Tools, CUDA >= 13.0 pour sm_120 / RTX 50xx) :
-#   cmake -B build -G "Visual Studio 18 2026" -A x64
+# Build (Windows, VS2022 Build Tools, CUDA >= 12.8) :
+#   cmake -B build -G "Visual Studio 17 2022" -A x64
 #   cmake --build build --config Release
 #
-# VS2022 + CUDA 12.8 reste supporté : -G "Visual Studio 17 2022"
-# Autre GPU : -DCMAKE_CUDA_ARCHITECTURES=native
+# VS2026 + CUDA 13.x reste supporté : -G "Visual Studio 18 2026"
+#
+# CUDA >= 12.8 est la borne du poste Blackwell (sm_120). Sur le poste Ampere
+# (sm_86), toute version >= 11.1 conviendrait ; on garde la même pour n'avoir
+# qu'une chaîne à connaître.
 cmake_minimum_required(VERSION 3.24)
 
 # Doit précéder project() : la détection du compilateur CUDA renseigne elle-même
 # CMAKE_CUDA_ARCHITECTURES avec le défaut de nvcc (sm_75), ce qui rendrait un
 # garde placé après project() inopérant.
+#
+# `native` : CMake interroge le GPU présent et ne compile que pour lui. C'est le bon
+# défaut tant que le développement alterne entre plusieurs machines — chacune produit
+# le binaire qui lui convient, sans réglage à maintenir ni architecture compilée pour
+# rien. Le développement se fait aujourd'hui sur RTX 3060 (sm_86) et RTX 50xx (sm_120).
+#
+# Contrepartie, à connaître : la DLL obtenue ne s'exécute QUE sur la machine qui l'a
+# compilée. Ne jamais transporter `extension/bin/bourrasque.dll` ni un paquet de
+# `dist/` d'un poste à l'autre — recompiler sur place. Pour un binaire portable
+# (distribution, ou paquet unique pour les deux postes), donner la liste explicitement :
+#   -DCMAKE_CUDA_ARCHITECTURES="86;120"   (sm_120 exige CUDA >= 12.8)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 120)   # Blackwell (RTX 50xx)
+    set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 
 project(bourrasque LANGUAGES CXX CUDA)
