@@ -26,5 +26,8 @@ __pycache__/
 *.exp
 *.pdb
 
-# Exemple flip fluids
+# Exemple flip fluids / nexus
 flip_fluids_addon/
+insydium_nexus/
+/Fluid-Sim-main
+/graphify-out

@@ -53,9 +53,13 @@ __all__ = ("register", "unregister")
 
 _LINE_WIDTH = 1.5
 
-_COLOR_WATER = (0.2, 0.5, 1.0, 1.0)
-_COLOR_ELASTIC = (1.0, 0.55, 0.1, 1.0)
 _COLOR_DOMAIN = (0.9, 0.9, 0.9, 1.0)
+# Repli pour un emetteur dont `material_name` est vide ou pendant (materiau
+# supprime sous ses pieds) : gris neutre, distinct des couleurs materiau
+# (definies par `viewport_color` sur chaque `BqMaterialProps`) et du gris du
+# domaine, pour ne pas se confondre avec la boite domaine tout en restant
+# neutre (aucun materiau n'a de sens a suggerer ici).
+_COLOR_MATERIAL_FALLBACK = (0.6, 0.6, 0.6, 1.0)
 # Rouge, distinct des couleurs materiau (bleu eau / orange gelee) et du gris
 # du domaine : les colliders sont des obstacles, pas de la matiere simulee.
 _COLOR_COLLIDER = (0.9, 0.15, 0.15, 1.0)
@@ -110,6 +114,23 @@ def _box_line_points(min_corner, max_corner):
         points.append(corners[i])
         points.append(corners[j])
     return points
+
+
+def _emitter_viewport_color(obj, scene):
+    """Couleur d'identification de l'emetteur `obj`, resolue depuis le
+    materiau qu'il reference (`obj.bourrasque.material_name` ->
+    `BqMaterialProps.viewport_color` de la bibliotheque de `scene`).
+
+    Ce code tourne dans un handler de dessin (`_draw`, appele plusieurs fois
+    par seconde) : il ne doit JAMAIS lever, une reference pendante ou vide
+    retombe silencieusement sur `_COLOR_MATERIAL_FALLBACK`."""
+    name = obj.bourrasque.material_name
+    if not name:
+        return _COLOR_MATERIAL_FALLBACK
+    material = scene.bourrasque.materials.get(name)
+    if material is None:
+        return _COLOR_MATERIAL_FALLBACK
+    return tuple(material.viewport_color)
 
 
 def _object_world_bounds(obj):
@@ -227,11 +248,7 @@ def _draw():
                     # volume qui ne sera pas rempli.
                     continue
                 min_corner, max_corner = _object_world_bounds(obj)
-                r, g, b, _a = (
-                    _COLOR_WATER
-                    if obj.bourrasque.model == "WATER"
-                    else _COLOR_ELASTIC
-                )
+                r, g, b, _a = _emitter_viewport_color(obj, scene)
                 alpha = (
                     _ALPHA_INFLOW
                     if obj.bourrasque.emit_mode == "INFLOW"

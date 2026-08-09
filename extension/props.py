@@ -9,11 +9,14 @@ La logique de transformation pure (sans dependance bpy) vit dans
 """
 
 import math
+import pathlib
 
 import bpy
 import mathutils
 from bpy.props import (
     BoolProperty,
+    BoolVectorProperty,
+    CollectionProperty,
     EnumProperty,
     FloatProperty,
     FloatVectorProperty,
@@ -23,12 +26,17 @@ from bpy.props import (
 )
 from bpy.types import Object, PropertyGroup, Scene
 
+from . import lib
+from .materials import unique_name
 from .transform import solver_to_world, world_to_solver, world_to_solver_dir
 
 __all__ = (
+    "BqMaterialProps",
     "BqObjectProps",
     "BqSceneProps",
     "iter_elements",
+    "material_usage",
+    "used_material_slot_count",
     "domain_transform",
     "domain_resolution",
     "domain_usable_bounds",
@@ -40,6 +48,15 @@ __all__ = (
     "estimate_particle_count",
     "estimate_inflow_count",
     "collider_triangle_count",
+    "mesh_layout",
+    "mesh_resolution_state",
+    "mesh_particle_spacing",
+    "mesh_effective_radii",
+    "mesh_vram_estimate_bytes",
+    "mesh_vram_warning_threshold_bytes",
+    "mesh_cache_path",
+    "whitewater_cache_path",
+    "whitewater_config_from_scene",
     "classes",
     "register",
     "unregister",
@@ -70,8 +87,181 @@ def _on_preset_update(self, context):
     # CUSTOM : ne touche a rien.
 
 
+# Modele constitutif que chaque preset IMPLIQUE (derive de `_PRESET_WATER` /
+# `_PRESET_JELLY` ci-dessus, source de verite de ces valeurs).
+_PRESET_IMPLIED_MODEL = {
+    "WATER": _PRESET_WATER["model"],
+    "JELLY": _PRESET_JELLY["model"],
+}
+
+
+def _on_model_update(self, context):
+    """Callback `update` de `model` : bascule `preset` sur « Personnalisé »
+    des que le modele choisi ne correspond plus a celui qu'implique le preset
+    courant.
+
+    Sans ce garde-fou, `preset` et `model` derivent silencieusement l'un de
+    l'autre : c'est exactement ce qui s'est produit dans l'ancienne UI, ou un
+    materiau pouvait porter `preset == "WATER"` et `model == "ELASTIC"`. La
+    migration M16 baptisait alors « Eau » un materiau elastique. Le libelle a
+    ete rendu robuste en aval (`materials._label_for_emitter`), mais la CAUSE
+    est ici : deux champs qui se contredisent sans que rien ne le signale.
+    Aucune valeur physique n'est touchee — seule l'etiquette `preset` est
+    remise a une valeur honnete."""
+    implied = _PRESET_IMPLIED_MODEL.get(self.preset)
+    if implied is not None and implied != self.model:
+        self.preset = "CUSTOM"
+
+
 def _poll_domain_object(self, obj):
     return obj.type == "MESH"
+
+
+def _on_material_name_update(self, context):
+    """Callback `update` de `BqMaterialProps.name` : force l'unicite du nom
+    au sein de la bibliotheque de la scene, puis propage le renommage a tous
+    les emetteurs qui referencaient l'ancien nom (voir docstring de
+    `BqMaterialProps.name_prev` pour pourquoi ce champ existe).
+
+    Piege a eviter (et evite ici) : reassigner `self.name` depuis ce meme
+    callback re-declenche ce callback (recursion). Le motif retenu est de
+    ne reecrire `self.name` QUE si l'unicite l'exige reellement (la valeur
+    calculee differe de la valeur courante) et de sortir aussitot : l'appel
+    recursif voit alors une valeur deja unique, ne reecrit plus rien, et
+    c'est LUI qui effectue la propagation et la mise a jour de `name_prev`
+    (avec le VRAI `name_prev`, capture avant toute reecriture). Sans ce
+    `return` immediat, l'appel exterieur continuerait avec un `self.name`
+    perime (celui d'avant le suffixage) et propagerait le mauvais nom.
+    """
+    scene = self.id_data
+    if not isinstance(scene, Scene):
+        # `id_data` est l'ID proprietaire de la donnee RNA (ici la Scene qui
+        # possede `scene.bourrasque.materials`) ; ce garde-fou n'est la que
+        # pour rester defensif si ce PropertyGroup venait un jour a etre
+        # instancie hors de ce contexte precis.
+        return
+
+    existing = [
+        m.name
+        for m in scene.bourrasque.materials
+        if m.as_pointer() != self.as_pointer()
+    ]
+    unique = unique_name(self.name, existing)
+    if unique != self.name:
+        self.name = unique
+        return
+
+    old_name = self.name_prev
+    if old_name and old_name != self.name:
+        for obj in scene.objects:
+            if obj.bourrasque.material_name == old_name:
+                obj.bourrasque.material_name = self.name
+    self.name_prev = self.name
+
+
+class BqMaterialProps(PropertyGroup):
+    """Un materiau nomme de la bibliotheque de la scene (`BqSceneProps.materials`).
+
+    Regroupe les parametres physiques auparavant recopies sur chaque objet
+    emetteur (voir la section DEPRECIEE de `BqObjectProps` ci-dessous) : les
+    emetteurs referencent desormais un materiau de cette bibliotheque par son
+    nom (`BqObjectProps.material_name`) plutot que de porter leurs propres
+    valeurs.
+    """
+
+    name: StringProperty(
+        name="Nom",
+        description="Nom du materiau, unique au sein de la scene",
+        default="Matériau",
+        update=_on_material_name_update,
+    )
+
+    # Memorise le nom precedent pour que `_on_material_name_update` sache
+    # quels emetteurs (dont `material_name == name_prev`) doivent suivre le
+    # renommage : Blender ne fournit PAS l'ancienne valeur d'une propriete
+    # dans son callback `update`, seule la nouvelle est visible via `self`.
+    # Cache de l'UI (HIDDEN) : ce n'est pas un reglage, uniquement un etat
+    # interne de suivi.
+    name_prev: StringProperty(
+        name="Nom precedent",
+        options={"HIDDEN"},
+        default="",
+    )
+
+    model: EnumProperty(
+        name="Modele",
+        items=(
+            ("ELASTIC", "Élastique", "Modele corotationnel (E, nu)"),
+            ("WATER", "Eau", "EOS de Tait (bulk, gamma)"),
+        ),
+        default="WATER",
+        update=_on_model_update,
+    )
+
+    rho: FloatProperty(
+        name="Densite",
+        description="Densite du materiau (kg/m^3)",
+        default=1000.0,
+        min=1e-6,
+        unit="NONE",
+    )
+
+    young: FloatProperty(
+        name="Module de Young",
+        description="Module de Young E (modele elastique)",
+        default=5.0e4,
+        min=1e-6,
+    )
+
+    poisson: FloatProperty(
+        name="Coefficient de Poisson",
+        description="Coefficient de Poisson nu (modele elastique)",
+        default=0.2,
+        min=0.0,
+        max=0.49,
+    )
+
+    bulk: FloatProperty(
+        name="Module de compressibilite",
+        description="Module de compressibilite k (modele eau)",
+        default=4.0e4,
+        min=1e-6,
+    )
+
+    gamma: FloatProperty(
+        name="Exposant de Tait",
+        description="Exposant de Tait (modele eau)",
+        default=3.0,
+        min=1.0,
+        max=7.0,
+    )
+
+    preset: EnumProperty(
+        name="Preset",
+        items=(
+            ("WATER", "Eau", "Preset eau (modele Tait)"),
+            ("JELLY", "Gelée", "Preset gelee (modele elastique)"),
+            ("CUSTOM", "Personnalisé", "Parametres personnalises"),
+        ),
+        default="WATER",
+        update=_on_preset_update,
+    )
+
+    # Couleur d'identification du materiau dans les listes UI (bibliotheque,
+    # `prop_search` des emetteurs) et dans l'overlay des emetteurs du
+    # viewport (`overlay.py`). Ne colore PAS le nuage de particules : ce
+    # pipeline-la n'existe pas. `color_by_material` sur `BqSceneProps` n'est
+    # lu nulle part dans la codebase — c'est un reglage annonce mais jamais
+    # implemente, ne pas le presenter comme actif.
+    viewport_color: FloatVectorProperty(
+        name="Couleur",
+        description="Couleur d'identification de ce materiau dans les listes de l'interface",
+        subtype="COLOR",
+        size=4,
+        min=0.0,
+        max=1.0,
+        default=(0.1, 0.4, 0.9, 1.0),
+    )
 
 
 class BqObjectProps(PropertyGroup):
@@ -91,6 +281,26 @@ class BqObjectProps(PropertyGroup):
         ),
         default="NONE",
     )
+
+    material_name: StringProperty(
+        name="Materiau",
+        description=(
+            "Nom du materiau de la bibliotheque de la scene utilise par cet "
+            "emetteur (voir `BqSceneProps.materials`) ; edite via "
+            "`layout.prop_search` cote UI"
+        ),
+        default="",
+    )
+
+    # -- DEPRECIE (jalon bibliotheque de materiaux) ----------------------
+    #
+    # Les champs materiau ci-dessous vivaient auparavant directement sur
+    # l'objet emetteur ; ils sont REMPLACES par `material_name` ci-dessus,
+    # qui reference un `BqMaterialProps` de `BqSceneProps.materials`. On ne
+    # les supprime PAS : ils restent la seule source de verite pour migrer
+    # les .blend existants vers la bibliotheque (operateur de migration,
+    # ecrit ailleurs, qui les lit puis les vide/ignore). `ui.py` ne les
+    # affiche plus.
 
     model: EnumProperty(
         name="Modele",
@@ -138,6 +348,19 @@ class BqObjectProps(PropertyGroup):
         min=1.0,
         max=7.0,
     )
+
+    preset: EnumProperty(
+        name="Preset",
+        items=(
+            ("WATER", "Eau", "Preset eau (modele Tait)"),
+            ("JELLY", "Gelée", "Preset gelee (modele elastique)"),
+            ("CUSTOM", "Personnalisé", "Parametres personnalises"),
+        ),
+        default="WATER",
+        update=_on_preset_update,
+    )
+
+    # -- Fin section depreciee --------------------------------------------
 
     initial_velocity: FloatVectorProperty(
         name="Vitesse initiale",
@@ -208,17 +431,6 @@ class BqObjectProps(PropertyGroup):
         default="BOUNDS",
     )
 
-    preset: EnumProperty(
-        name="Preset",
-        items=(
-            ("WATER", "Eau", "Preset eau (modele Tait)"),
-            ("JELLY", "Gelée", "Preset gelee (modele elastique)"),
-            ("CUSTOM", "Personnalisé", "Parametres personnalises"),
-        ),
-        default="WATER",
-        update=_on_preset_update,
-    )
-
     friction: FloatProperty(
         name="Friction",
         description=(
@@ -230,9 +442,91 @@ class BqObjectProps(PropertyGroup):
         max=1.0,
     )
 
+    # -- Colliders dynamiques (jalon M17, phase A) ------------------------
+
+    dynamic: BoolProperty(
+        name="Dynamique",
+        description="Poussé par le fluide (corps rigide libre, 6 degrés de liberté)",
+        default=False,
+    )
+
+    density: FloatProperty(
+        name="Densité",
+        description=(
+            "Densité du corps (kg/m³) : gouverne s'il flotte ou coule face "
+            "au fluide environnant"
+        ),
+        default=500.0,
+        min=0.0001,
+        soft_max=5000.0,
+    )
+
+    use_gravity: BoolProperty(
+        name="Gravité",
+        description="Ce corps dynamique subit la gravité",
+        default=True,
+    )
+
+    added_mass: FloatProperty(
+        name="Masse ajoutée",
+        description=(
+            "Amortit un corps très léger devant la masse de fluide en "
+            "contact pour éviter la divergence du couplage explicite, au "
+            "prix d'une perte de quantité de mouvement (mesuré : ~21 % de "
+            "dérive à 1.0, contre 10⁻⁶ à 0.0). Ce n'est pas un réglage de "
+            "confort mais une soupape : à laisser à 0 sauf si le corps "
+            "diverge visiblement"
+        ),
+        default=0.0,
+        min=0.0,
+        max=1.0,
+    )
+
+    lock_location: BoolVectorProperty(
+        name="Verrouiller position",
+        description="Bloque la translation de ce corps dynamique sur les axes monde cochés",
+        size=3,
+        default=(False, False, False),
+    )
+
+    lock_rotation: BoolVectorProperty(
+        name="Verrouiller rotation",
+        description="Bloque la rotation de ce corps dynamique autour des axes monde cochés",
+        size=3,
+        default=(False, False, False),
+    )
+
+    restitution: FloatProperty(
+        name="Restitution",
+        description="Élasticité du contact corps à corps (0 = aucun rebond, 1 = rebond parfait)",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+    )
+
 
 class BqSceneProps(PropertyGroup):
     """Reglages du solveur et de la simulation, stockes par scene."""
+
+    # -- Bibliotheque de materiaux (jalon bibliotheque de materiaux) -----
+    #
+    # Materiaux nommes, references par les emetteurs via
+    # `BqObjectProps.material_name` plutot que recopies sur chaque objet
+    # (voir la section DEPRECIEE de `BqObjectProps`). `BqMaterialProps` doit
+    # etre enregistre AVANT `BqSceneProps` (voir `classes` en bas de ce
+    # fichier), Blender exigeant qu'un PropertyGroup reference existe deja
+    # au moment de l'enregistrement du PropertyGroup qui le contient.
+
+    materials: CollectionProperty(
+        name="Materiaux",
+        description="Bibliotheque de materiaux nommes de la scene",
+        type=BqMaterialProps,
+    )
+
+    active_material_index: IntProperty(
+        name="Index du materiau actif",
+        default=0,
+    )
 
     domain_object: PointerProperty(
         name="Domaine",
@@ -334,6 +628,342 @@ class BqSceneProps(PropertyGroup):
         default=0,
     )
 
+    # -- Maillage de surface (jalon M7) --------------------------------
+    #
+    # La resolution du maillage est INDEPENDANTE de la resolution de
+    # simulation (`grid_res` ci-dessus) — decision D3 du plan M7 : l'artiste
+    # peut vouloir un maillage plus fin (ou plus grossier) que la grille du
+    # solveur. Meme convention de reglage que `grid_res` (un entier unique,
+    # applique au plus grand axe du domaine) pour rester coherent avec la
+    # facon dont la resolution de simulation est deja exposee.
+
+    mesh_resolution: IntProperty(
+        name="Resolution du maillage",
+        description=(
+            "Resolution du champ de reconstruction de surface, appliquee "
+            "au plus grand axe du domaine (independante de la resolution "
+            "de simulation) ; la resolution des deux autres axes en "
+            "decoule par arrondi. 0 = automatique (une cellule de "
+            "maillage par espacement inter-particules, plafonnee pour "
+            "rester sous l'empreinte memoire recommandee — voir le "
+            "panneau ci-dessous). Voir l'empreinte memoire estimee "
+            "ci-dessous avant d'augmenter cette valeur"
+        ),
+        default=0,
+        min=0,
+        soft_max=320,
+        max=1024,
+    )
+
+    mesh_influence_factor: FloatProperty(
+        name="Facteur de rayon d'influence",
+        description=(
+            "Rayon d'influence R de la reconstruction Zhu-Bridson, exprime "
+            "comme un multiple de l'espacement inter-particules de la "
+            "scene : au-dela de cette distance, une particule n'a plus "
+            "d'effet sur la surface reconstruite. Monter lisse davantage et "
+            "sert les eclaboussures, ou la densite locale est plus faible ; "
+            "descendre gagne du detail mais rapproche du plancher"
+        ),
+        default=3.0,
+        # Borne basse relevee a 2.5 (ancienne valeur : 1.0). Premiere mesure,
+        # sans jitter -- nappe au repos de 430 592 particules, composantes
+        # connexes du maillage :
+        #   facteur 0.8 -> 88 composantes, 1.0 -> 2, 1.5 et au-dela -> 1
+        # Ce plancher tenait sur un artefact du cas de test : le reseau
+        # d'emission est PARFAITEMENT regulier, ce qui aligne par coincidence
+        # de nombreux voisins exactement a la distance R et masque l'absence
+        # de vraie marge. Le jitter positionnel ajoute au mailleur pour
+        # eliminer le motif de vaguelettes visible sur une nappe au repos
+        # (cf. mesher.cu, k_zhu_bridson_field) casse cette regularite -- et
+        # revele le probleme plutot qu'il ne le cree : re-mesure avec jitter,
+        #   facteur 1.0 -> 55 composantes, 1.5 -> 19, 2.0 -> 6, 2.75+ -> 1
+        # (cf. valide_lissage_jitter.py, scratchpad de la session qui a
+        # introduit le jitter). Le plancher est donc remonte a 2.5 : proche
+        # de la ou la connexite redevient franche, avec un peu de marge sous
+        # le defaut (3.0) pour laisser un peu de detail accessible sans
+        # rouvrir la fragmentation. Ne pas redescendre sans re-mesurer les
+        # deux ensemble (facteur ET amplitude de jitter).
+        min=2.5,
+        soft_max=6.0,
+    )
+
+    mesh_particle_factor: FloatProperty(
+        name="Facteur de rayon de particule",
+        description=(
+            "Rayon de particule r utilise par la reconstruction "
+            "Zhu-Bridson, exprime comme un multiple de l'espacement "
+            "inter-particules de la scene"
+        ),
+        default=1.0,
+        min=0.1,
+        soft_max=3.0,
+    )
+
+    mesh_collider_offset_factor: FloatProperty(
+        name="Facteur de decalage collider",
+        description=(
+            "Decalage applique au rognage de la surface contre les "
+            "colliders, exprime comme un multiple de l'espacement "
+            "inter-particules de la scene : compense le fait que la "
+            "surface reconstruite deborde toujours d'environ un demi-rayon "
+            "de noyau au-dela des particules. 0 place deja la surface "
+            "exactement sur le plan du collider"
+        ),
+        default=0.0,
+        soft_min=-2.0,
+        soft_max=2.0,
+    )
+
+    mesh_smoothing_iters: IntProperty(
+        name="Iterations de lissage",
+        description=(
+            "Nombre d'iterations de lissage Taubin (lambda|mu) du champ, "
+            "pour attenuer les artefacts de Zhu-Bridson dans les zones "
+            "concaves sans faire retrecir la surface au fil des passes "
+            "(contrairement a un lissage laplacien pur) — un lissage trop "
+            "fort efface quand meme le detail voulu"
+        ),
+        default=0,
+        min=0,
+        soft_max=30,
+    )
+
+    mesh_min_component_tris: IntProperty(
+        name="Triangles min. par composante",
+        description=(
+            "Supprime les fragments de maillage deconnectes du corps "
+            "principal du fluide en dessous de ce nombre de triangles : "
+            "la reconstruction locale peut produire jusqu'a plus d'un "
+            "millier de ces ilots microscopiques sur une scene "
+            "d'eclaboussure, du bruit visuel plutot que du fluide utile. "
+            "La composante principale du fluide n'est jamais supprimee, "
+            "quel que soit le reglage. 0 desactive le filtrage"
+        ),
+        default=50,
+        min=0,
+        soft_max=200,
+    )
+
+    is_baking_mesh: BoolProperty(
+        name="Bake de maillage en cours",
+        default=False,
+    )
+
+    bake_mesh_progress: FloatProperty(
+        name="Progression du bake de maillage",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+    )
+
+    baked_mesh_frames: IntProperty(
+        name="Frames de maillage bakees",
+        default=0,
+    )
+
+    # -- Whitewater (jalon M8) ------------------------------------------
+    #
+    # Miroir des champs de `lib.BqWhitewaterConfig` (voir bourrasque.h,
+    # section whitewater), a DEUX exceptions pres, actees par
+    # docs/plan-milestone-8.md (D2) : `influence_radius` n'est PAS un
+    # reglage ici, il reutilise `mesh_effective_radii(scene)` (le rayon deja
+    # calcule pour le maillage) ; `gravity_y` n'est pas un reglage ici non
+    # plus, il reutilise `scene.bourrasque.gravity` (la gravite de la
+    # simulation principale). Voir `whitewater_config_from_scene` plus bas,
+    # qui assemble ces deux exceptions avec les reglages ci-dessous.
+    #
+    # Valeurs par defaut : celles de `bq_whitewater_default_config`
+    # (core/src/whitewater.cu). Ce sont des POINTS DE DEPART, PAS des
+    # valeurs calibrees (cf. docs/plan-milestone-8.md, risque 1) : aucune
+    # description ci-dessous ne pretend le contraire.
+
+    ww_max_particles: IntProperty(
+        name="Particules secondaires max",
+        description=(
+            "Capacite active maximale de particules secondaires (spray, "
+            "foam, bulles), garde-fou VRAM : au-dela, les nouvelles "
+            "candidates sont refusees plutot que d'ecraser des particules "
+            "existantes ou de faire deborder la memoire"
+        ),
+        default=200000,
+        min=1,
+    )
+
+    ww_ta_min: FloatProperty(
+        name="Air piégé — seuil bas",
+        description=(
+            "Borne basse de normalisation du potentiel d'air piégé (les "
+            "particules fluides dont les voisines s'ecartent fortement en "
+            "vitesse, signe de bulles d'air entrainees) : en dessous, le "
+            "potentiel est traite comme nul"
+        ),
+        default=2.0,
+    )
+    ww_ta_max: FloatProperty(
+        name="Air piégé — seuil haut",
+        description=(
+            "Borne haute de normalisation du potentiel d'air piégé : "
+            "au-dela, le potentiel est traite comme maximal (1)"
+        ),
+        default=8.0,
+    )
+    ww_ta_weight: FloatProperty(
+        name="Air piégé — poids",
+        description="Poids du potentiel d'air piégé dans le potentiel de génération combiné",
+        default=1.0,
+        min=0.0,
+    )
+
+    ww_wc_min: FloatProperty(
+        name="Crête de vague — seuil bas",
+        description=(
+            "Borne basse de normalisation du potentiel de crête de vague "
+            "(convexité locale de la surface combinée à une vitesse "
+            "sortante) : en dessous, le potentiel est traite comme nul"
+        ),
+        default=1.0,
+    )
+    ww_wc_max: FloatProperty(
+        name="Crête de vague — seuil haut",
+        description=(
+            "Borne haute de normalisation du potentiel de crête de vague : "
+            "au-dela, le potentiel est traite comme maximal (1)"
+        ),
+        default=5.0,
+    )
+    ww_wc_weight: FloatProperty(
+        name="Crête de vague — poids",
+        description="Poids du potentiel de crête de vague dans le potentiel de génération combiné",
+        default=1.0,
+        min=0.0,
+    )
+
+    ww_ke_min: FloatProperty(
+        name="Énergie cinétique — seuil bas",
+        description=(
+            "Borne basse de normalisation du potentiel d'énergie "
+            "cinétique de la particule fluide : en dessous, le potentiel "
+            "est traite comme nul"
+        ),
+        default=1.0,
+    )
+    ww_ke_max: FloatProperty(
+        name="Énergie cinétique — seuil haut",
+        description=(
+            "Borne haute de normalisation du potentiel d'énergie "
+            "cinétique : au-dela, le potentiel est traite comme maximal (1)"
+        ),
+        default=10.0,
+    )
+    ww_ke_weight: FloatProperty(
+        name="Énergie cinétique — poids",
+        description="Poids du potentiel d'énergie cinétique dans le potentiel de génération combiné",
+        default=1.0,
+        min=0.0,
+    )
+
+    ww_spawn_rate: FloatProperty(
+        name="Taux de génération",
+        description=(
+            "Particules secondaires generees par seconde quand le "
+            "potentiel de génération combiné vaut 1 (maximal)"
+        ),
+        default=50.0,
+        min=0.0,
+    )
+
+    ww_life_spray: FloatProperty(
+        name="Durée de vie — embruns",
+        description="Durée de vie moyenne (secondes) d'une particule de régime embrun (spray)",
+        default=1.0,
+        min=0.0,
+    )
+    ww_life_foam: FloatProperty(
+        name="Durée de vie — écume",
+        description="Durée de vie moyenne (secondes) d'une particule de régime écume (foam)",
+        default=2.0,
+        min=0.0,
+    )
+    ww_life_bubble: FloatProperty(
+        name="Durée de vie — bulles",
+        description="Durée de vie moyenne (secondes) d'une particule de régime bulle (bubble)",
+        default=1.5,
+        min=0.0,
+    )
+
+    ww_drag_spray: FloatProperty(
+        name="Traînée — embruns",
+        description=(
+            "Coefficient de traînée quadratique appliqué à l'advection "
+            "balistique des embruns (spray), insensible à la vitesse du "
+            "fluide"
+        ),
+        default=0.1,
+        min=0.0,
+    )
+    ww_drag_foam: FloatProperty(
+        name="Traînée — écume/bulles",
+        description=(
+            "Coefficient de relaxation vers la vitesse ambiante du fluide, "
+            "appliqué à l'écume (foam) et aux bulles (bubble)"
+        ),
+        default=3.0,
+        min=0.0,
+    )
+
+    ww_buoyancy_bubble: FloatProperty(
+        name="Flottabilité — bulles",
+        description=(
+            "Accélération verticale supplémentaire appliquée aux bulles "
+            "(bubble), au-delà de la vitesse ambiante du fluide"
+        ),
+        default=2.0,
+    )
+
+    ww_size_mult: FloatProperty(
+        name="Multiplicateur de taille (affichage)",
+        description=(
+            "Multiplicateur PUREMENT COSMÉTIQUE appliqué à la taille des "
+            "particules secondaires affichées (attribut bq_size). N'affecte "
+            "ni la génération ni la physique (le rayon d'influence utilisé "
+            "par le solveur reste inchangé) ; le cache .bqw n'est jamais "
+            "modifié, seul l'affichage l'est"
+        ),
+        default=1.0,
+        min=0.1,
+        max=3.0,
+    )
+
+    is_baking_whitewater: BoolProperty(
+        name="Bake de whitewater en cours",
+        default=False,
+    )
+
+    bake_whitewater_progress: FloatProperty(
+        name="Progression du bake de whitewater",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+    )
+
+    baked_whitewater_frames: IntProperty(
+        name="Frames de whitewater bakees",
+        default=0,
+    )
+
+    baked_whitewater_max_refused: IntProperty(
+        name="Candidates refusées (max observé)",
+        description=(
+            "Maximum, sur toute la durée du dernier bake whitewater, du "
+            "nombre de particules secondaires qui auraient dû être "
+            "générées mais ont été refusées faute de capacité (voir "
+            "« Particules secondaires max ») — diagnostic, pas une erreur"
+        ),
+        default=0,
+        min=0,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Fonctions utilitaires (module-level : source de verite unique pour l'UI et
@@ -362,6 +992,77 @@ def iter_elements(scene):
     emitters.sort(key=lambda o: o.name)
     colliders.sort(key=lambda o: o.name)
     return domain + emitters + colliders
+
+
+def material_usage(scene):
+    """Recense l'usage de la bibliotheque de materiaux de `scene` par ses
+    emetteurs, en un seul passage sur `scene.objects` (O(nb objets), aucun
+    `to_mesh()` : appelable sans cout depuis un `draw()` de panneau, redessine
+    plusieurs fois par seconde).
+
+    Renvoie un tuple `(usage, dangling)` plutot qu'un dict a cle magique,
+    pour que les deux cas (materiau connu vs. reference orpheline) restent
+    distinguables sans comparaison de chaine cote appelant :
+
+    - `usage` : `{nom_materiau: [objets emetteurs]}`, UNE entree par materiau
+      de `scene.bourrasque.materials` (y compris les materiaux sans aucun
+      emetteur, avec une liste vide — utile pour que `ui.py` puisse afficher
+      « inutilise » sans requete separee).
+    - `dangling` : liste des objets emetteurs dont `material_name` est soit
+      vide (aucun materiau assigne), soit ne correspond a AUCUN materiau de
+      la bibliotheque (reference pendante, par exemple apres suppression du
+      materiau referencé) — ces deux cas sont traites ensemble, `ui.py`
+      distingue au besoin en relisant `obj.bourrasque.material_name`.
+    """
+    usage = {mat.name: [] for mat in scene.bourrasque.materials}
+    dangling = []
+    for obj in scene.objects:
+        if obj.bourrasque.role != "EMITTER":
+            continue
+        name = obj.bourrasque.material_name
+        bucket = usage.get(name) if name else None
+        if bucket is None:
+            dangling.append(obj)
+        else:
+            bucket.append(obj)
+    return usage, dangling
+
+
+def used_material_slot_count(scene):
+    """Nombre d'emplacements materiau que le bake consommera reellement pour
+    `scene`, a comparer a `lib.BQ_MAX_MATERIALS`.
+
+    Compte les materiaux utilises **dedupliques par `materials.material_key`**,
+    EXACTEMENT comme `BQ_OT_bake._validate` — et non le nombre de NOMS
+    distincts utilises. La difference est observable : deux materiaux nommes
+    differemment mais physiquement identiques occupent deux lignes dans la
+    bibliotheque et un seul emplacement solveur. Compter les noms faisait
+    afficher a l'UI un depassement de capacite alors que le bake passait
+    (ecart 2 de la revue d'architecture M16).
+
+    Source de verite unique pour l'avertissement de capacite : `ui.py` doit
+    appeler cette fonction plutot que recompter de son cote.
+    """
+    from . import materials as _materials
+
+    usage, _dangling = material_usage(scene)
+    keys = set()
+    for mat in scene.bourrasque.materials:
+        if not usage.get(mat.name):
+            continue  # materiau inutilise : n'occupe aucun emplacement
+        keys.add(
+            _materials.material_key(
+                {
+                    "model": mat.model,
+                    "rho": mat.rho,
+                    "young": mat.young,
+                    "poisson": mat.poisson,
+                    "bulk": mat.bulk,
+                    "gamma": mat.gamma,
+                }
+            )
+        )
+    return len(keys)
 
 
 # Demi-largeur du stencil B-spline quadratique du MLS-MPM (`p.bound` dans
@@ -529,6 +1230,280 @@ def domain_usable_bounds(scene):
     lo = (marge, marge, marge)
     hi = tuple(size[a] - marge for a in range(3))
     return (lo, hi)
+
+
+# ---------------------------------------------------------------------------
+# Maillage de surface (jalon M7)
+# ---------------------------------------------------------------------------
+#
+# Empreinte VRAM RETENUE POUR LE GARDE-FOU UI : 36 octets par cellule du
+# champ de maillage (docs/plan-milestone-7.md, decision D2, correction du
+# 2026-08-02 apres implementation) — le champ Zhu-Bridson lui-meme (4
+# octets/cellule, en gather) PLUS les tampons du marching cubes (32
+# octets/cellule de plus, drapeaux et sommes prefixes sur les aretes et les
+# cubes), qui dominent l'empreinte totale. C'est un CALCUL PUR (pas d'appel
+# a `bq_mesher_vram_estimate`, qui ne compte que le champ seul, cf. sa
+# docstring dans bourrasque.h) : l'UI doit pouvoir avertir l'artiste avant
+# meme que la DLL native soit chargeable, avant tout bake.
+_MESH_BYTES_PER_CELL = 36
+_MESH_VRAM_WARNING_BYTES = 2 * 1024 * 1024 * 1024  # 2 Go (cf. plan M7, R1)
+
+# Plafond de la resolution AUTOMATIQUE du maillage (`mesh_resolution == 0`,
+# ergonomie M7.1) : distinct de `_MESH_VRAM_WARNING_BYTES` ci-dessus, qui
+# reste un simple AVERTISSEMENT visuel applicable a un reglage EXPLICITE
+# (jamais plafonne en silence, voir docstring de `mesh_resolution_state`).
+# Ce plafond-ci, lui, borne activement la valeur choisie automatiquement,
+# pour qu'un domaine large ne fasse pas exploser l'empreinte VRAM sans
+# qu'aucun reglage n'ait ete touche.
+_MESH_AUTO_VRAM_CAP_BYTES = int(1.5 * 1024 * 1024 * 1024)  # 1,5 Go
+
+
+def _mesh_layout_for_setting(size, mesh_res_setting):
+    """Coeur pur de `mesh_layout` : `res`/`cell_size` pour un reglage de
+    resolution DEJA RESOLU (entier positif, plus de sens « 0 = auto » ici
+    — voir `mesh_resolution_state`). Factorise pour etre reutilisee par le
+    plafonnement VRAM de la resolution automatique (`_cap_auto_mesh_resolution`),
+    qui doit evaluer plusieurs reglages candidats sans passer par `_domain_layout`
+    a chaque fois.
+    """
+    max_extent = max(size)
+    if max_extent <= 0 or mesh_res_setting <= 0:
+        return (tuple(1 for _ in range(3)), 0.0)
+
+    cell_size = max_extent / mesh_res_setting
+    res = tuple(max(1, math.ceil(size[a] / cell_size)) for a in range(3))
+    return (res, cell_size)
+
+
+def _mesh_bytes_for_setting(size, mesh_res_setting):
+    """Empreinte VRAM (octets) du champ de maillage pour un reglage de
+    resolution donne, meme formule que `mesh_vram_estimate_bytes`."""
+    res, _cell_size = _mesh_layout_for_setting(size, mesh_res_setting)
+    return res[0] * res[1] * res[2] * _MESH_BYTES_PER_CELL
+
+
+def _cap_auto_mesh_resolution(size, auto_setting):
+    """Reduit `auto_setting` (reglage de resolution automatique, avant
+    plafonnement) jusqu'a ce que son empreinte VRAM tienne sous
+    `_MESH_AUTO_VRAM_CAP_BYTES`, sans jamais renvoyer moins de 1.
+
+    L'empreinte croit approximativement au CUBE du reglage (le nombre de
+    cellules du champ est un produit sur les 3 axes) : une estimation
+    directe par racine cubique donne un point de depart proche de la
+    solution, affine ensuite par decrement pas a pas (le `ceil` par axe de
+    `_mesh_layout_for_setting` interdit une formule fermee exacte).
+    """
+    if auto_setting <= 1:
+        return max(1, auto_setting)
+
+    n_bytes = _mesh_bytes_for_setting(size, auto_setting)
+    if n_bytes <= _MESH_AUTO_VRAM_CAP_BYTES:
+        return auto_setting
+
+    factor = (_MESH_AUTO_VRAM_CAP_BYTES / n_bytes) ** (1.0 / 3.0)
+    setting = max(1, int(math.floor(auto_setting * factor)))
+    n_bytes = _mesh_bytes_for_setting(size, setting)
+    while n_bytes > _MESH_AUTO_VRAM_CAP_BYTES and setting > 1:
+        setting -= 1
+        n_bytes = _mesh_bytes_for_setting(size, setting)
+    return setting
+
+
+def mesh_resolution_state(scene):
+    """Renvoie `(setting, is_auto, was_capped)` : `setting` est le reglage
+    de resolution EFFECTIVEMENT utilise par `mesh_layout` (deja resolu si
+    `scene.bourrasque.mesh_resolution == 0`, voir ci-dessous), `is_auto`
+    indique si ce reglage vient du mode automatique, `was_capped` si le
+    plafond VRAM (`_MESH_AUTO_VRAM_CAP_BYTES`) a du le reduire par rapport
+    a la valeur automatique brute.
+
+    `mesh_resolution == 0` signifie AUTOMATIQUE (ergonomie M7.1, defaut) :
+    la resolution naturelle est celle qui donne UNE CELLULE DE MAILLAGE PAR
+    ESPACEMENT INTER-PARTICULES, c'est-a-dire `grid_res * ppc_axis` (meme
+    convention « applique au plus grand axe » que `grid_res` lui-meme, voir
+    `_domain_layout`) — plafonnee pour que l'empreinte VRAM estimee
+    (`_MESH_BYTES_PER_CELL` par cellule) reste sous 1,5 Go.
+
+    Un reglage EXPLICITE (non nul) n'est JAMAIS plafonne ici : c'est un
+    choix assume de l'artiste, seul l'avertissement visuel de `ui.py`
+    (`mesh_vram_estimate_bytes` / `mesh_vram_warning_threshold_bytes`,
+    seuil 2 Go) continue de s'appliquer.
+
+    Renvoie `None` si aucun domaine n'est defini.
+    """
+    layout = _domain_layout(scene)
+    if layout is None:
+        return None
+    _origin, size, _res, _dx = layout
+
+    props = scene.bourrasque
+    setting = props.mesh_resolution
+    if setting > 0:
+        return (setting, False, False)
+
+    auto_setting = max(1, props.grid_res * props.ppc_axis)
+    capped_setting = _cap_auto_mesh_resolution(size, auto_setting)
+    return (capped_setting, True, capped_setting < auto_setting)
+
+
+def mesh_layout(scene):
+    """Renvoie `(res, cell_size)` pour le champ de maillage de `scene` —
+    `res` le triplet `(res_x, res_y, res_z)` de cellules par axe, `cell_size`
+    la taille de cellule du champ (uniforme sur les trois axes).
+
+    INDEPENDANT de `domain_resolution` (grille de simulation) — decision D3
+    du plan M7 : `scene.bourrasque.mesh_resolution` est un reglage a part,
+    applique au plus grand axe du pave SOLVEUR (meme convention que
+    `grid_res`, voir `_domain_layout`) pour dimensionner le champ du
+    mailleur, RESOLU en une valeur automatique plafonnee si son reglage
+    vaut 0 (voir `mesh_resolution_state`, ergonomie M7.1). Le champ couvre
+    exactement le meme pave solveur que la simulation (`origin`/`size` de
+    `domain_transform`), puisque c'est dans cet espace que vivent les
+    positions du `.bqd` relu par le mailleur ; aucune marge de stencil
+    MLS-MPM n'est necessaire ici (le mailleur n'a pas de contrainte de
+    stencil de transfert grille<->particule).
+
+    Renvoie `None` si aucun domaine n'est defini. Tous les appelants
+    existants (avant l'ajout du mode automatique) profitent de la
+    resolution sans changement : la signature de cette fonction n'a pas
+    change.
+    """
+    layout = _domain_layout(scene)
+    if layout is None:
+        return None
+    _origin, size, _res, _dx = layout
+
+    state = mesh_resolution_state(scene)
+    mesh_res_setting = state[0]
+    return _mesh_layout_for_setting(size, mesh_res_setting)
+
+
+def mesh_particle_spacing(scene):
+    """Espacement inter-particules effectif de `scene` : `dx / ppc_axis`,
+    la MEME formule que celle deja utilisee pour l'emission
+    (`estimate_particle_count`, `estimate_inflow_count`) et pour la
+    resolution automatique du maillage ci-dessus — source de verite unique,
+    ne pas la reimplementer ailleurs.
+
+    Renvoie `None` si aucun domaine n'est defini.
+    """
+    resolution = domain_resolution(scene)
+    if resolution is None:
+        return None
+    _res, dx = resolution
+    ppc_axis = scene.bourrasque.ppc_axis
+    if ppc_axis <= 0:
+        return None
+    return dx / ppc_axis
+
+
+def mesh_effective_radii(scene):
+    """Renvoie `(influence_radius, particle_radius, collider_offset)`, les
+    valeurs ABSOLUES (unites solveur) effectivement transmises au mailleur
+    — chaque facteur reglable par l'artiste (`mesh_influence_factor`,
+    `mesh_particle_factor`, `mesh_collider_offset_factor`, voir Travail 1
+    de l'ergonomie M7.1) multiplie par `mesh_particle_spacing(scene)`.
+
+    C'est cette fonction, et NON les facteurs bruts de `scene.bourrasque`,
+    que `ops.py` doit lire pour remplir `bq_mesher_config` et
+    `meshcache.MeshProductionParams` : le format `.bqm` continue de stocker
+    des valeurs absolues (voir `meshcache.py`), pour que
+    `meshcache.diff_params` invalide correctement le cache quand un
+    FACTEUR change (la valeur absolue qui en decoule change aussi).
+
+    Renvoie `None` si aucun domaine n'est defini.
+    """
+    spacing = mesh_particle_spacing(scene)
+    if spacing is None:
+        return None
+    props = scene.bourrasque
+    influence_radius = props.mesh_influence_factor * spacing
+    particle_radius = props.mesh_particle_factor * spacing
+    collider_offset = props.mesh_collider_offset_factor * spacing
+    return (influence_radius, particle_radius, collider_offset)
+
+
+def mesh_vram_estimate_bytes(scene):
+    """Empreinte VRAM estimee (octets) du champ de maillage pour les
+    reglages courants de `scene`, garde-fou UI (voir `_MESH_BYTES_PER_CELL`)
+    — a afficher et a comparer a `_MESH_VRAM_WARNING_BYTES` AVANT tout bake,
+    pas decouverte par un echec d'allocation CUDA. Renvoie 0 si aucun
+    domaine n'est defini.
+    """
+    layout = mesh_layout(scene)
+    if layout is None:
+        return 0
+    res, _cell_size = layout
+    n_cells = res[0] * res[1] * res[2]
+    return n_cells * _MESH_BYTES_PER_CELL
+
+
+def mesh_vram_warning_threshold_bytes():
+    """Seuil (octets) au-dela duquel `ui.py` avertit visiblement l'artiste
+    (voir `_MESH_VRAM_WARNING_BYTES`)."""
+    return _MESH_VRAM_WARNING_BYTES
+
+
+def mesh_cache_path(cache_dir, name):
+    """Construit le chemin `.bqm` pour une simulation `name`, meme
+    convention que `cache.cache_paths` (meme dossier, meme nom de base,
+    extension `.bqm`). Fonction PURE, aucun effet de bord sur le disque —
+    meme discipline que `cache.cache_paths`, appelable sur le chemin chaud
+    du scrub de timeline (`display.py`)."""
+    return pathlib.Path(cache_dir) / f"{name}.bqm"
+
+
+def whitewater_cache_path(cache_dir, name):
+    """Construit le chemin `.bqw` pour une simulation `name`, meme
+    convention que `cache_paths`/`mesh_cache_path` (meme dossier, meme nom
+    de base, extension `.bqw`). Fonction PURE, aucun effet de bord sur le
+    disque."""
+    return pathlib.Path(cache_dir) / f"{name}.bqw"
+
+
+def whitewater_config_from_scene(scene):
+    """Construit un `lib.BqWhitewaterConfig` depuis les reglages whitewater
+    de `scene.bourrasque` (voir la section « Whitewater » de `BqSceneProps`
+    ci-dessus), meme motif que la construction inline de `BqMesherConfig`
+    pour le maillage (voir `ops.BQ_OT_bake_mesh.invoke`).
+
+    `influence_radius` et `gravity_y` NE SONT PAS lus sur des reglages
+    whitewater dedies (il n'en existe pas, voir docs/plan-milestone-8.md,
+    D2/D6 et la docstring de `BqSceneProps`) : `influence_radius` reutilise
+    `mesh_effective_radii(scene)` (le rayon deja calcule pour le maillage),
+    `gravity_y` reutilise `scene.bourrasque.gravity` (la gravite de la
+    simulation principale).
+
+    Renvoie `None` si aucun domaine n'est defini (`mesh_effective_radii`
+    renvoie alors `None`).
+    """
+    radii = mesh_effective_radii(scene)
+    if radii is None:
+        return None
+    influence_radius, _particle_radius, _collider_offset = radii
+
+    props = scene.bourrasque
+    cfg = lib.default_whitewater_config()
+    cfg.max_particles = props.ww_max_particles
+    cfg.influence_radius = influence_radius
+    cfg.gravity_y = props.gravity
+    cfg.ta_min = props.ww_ta_min
+    cfg.ta_max = props.ww_ta_max
+    cfg.ta_weight = props.ww_ta_weight
+    cfg.wc_min = props.ww_wc_min
+    cfg.wc_max = props.ww_wc_max
+    cfg.wc_weight = props.ww_wc_weight
+    cfg.ke_min = props.ww_ke_min
+    cfg.ke_max = props.ww_ke_max
+    cfg.ke_weight = props.ww_ke_weight
+    cfg.spawn_rate = props.ww_spawn_rate
+    cfg.life_spray = props.ww_life_spray
+    cfg.life_foam = props.ww_life_foam
+    cfg.life_bubble = props.ww_life_bubble
+    cfg.drag_spray = props.ww_drag_spray
+    cfg.drag_foam = props.ww_drag_foam
+    cfg.buoyancy_bubble = props.ww_buoyancy_bubble
+    return cfg
 
 
 def emitter_bounds_solver(obj, origin, size):
@@ -951,6 +1926,7 @@ def estimate_particle_count(scene):
 # ---------------------------------------------------------------------------
 
 classes = (
+    BqMaterialProps,
     BqObjectProps,
     BqSceneProps,
 )

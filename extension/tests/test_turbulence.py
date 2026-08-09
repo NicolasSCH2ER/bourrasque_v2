@@ -69,6 +69,8 @@ def _install_bpy_stub():
 
     for name in (
         "BoolProperty",
+        "BoolVectorProperty",
+        "CollectionProperty",
         "EnumProperty",
         "FloatProperty",
         "FloatVectorProperty",

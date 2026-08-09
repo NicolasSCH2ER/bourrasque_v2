@@ -2,18 +2,46 @@
 
 C'est la surface que voit l'artiste, dans la barre laterale du viewport 3D
 (categorie « Bourrasque »). Ce module ne fait QUE de la presentation : il lit
-`scene.bourrasque` / `obj.bourrasque` (voir props.py) et invoque les sept
+`scene.bourrasque` / `obj.bourrasque` (voir props.py) et invoque les
 operateurs de ops.py (bq.add_domain, bq.add_emitter, bq.add_collider,
-bq.remove_element, bq.bake, bq.cancel_bake, bq.free_cache). Aucun appel a la
-DLL, aucune logique de simulation ici : voir lib.py et ops.py.
+bq.remove_element, bq.material_add, bq.material_remove,
+bq.material_duplicate, bq.migrate_materials, bq.bake, bq.cancel_bake,
+bq.free_cache, bq.bake_mesh, bq.bake_all, bq.free_mesh_cache,
+bq.bake_whitewater, bq.free_whitewater_cache, bq.setup_fluid_display,
+bq.setup_whitewater_display, bq.setup_whitewater_display_volume). Aucun appel
+a la DLL, aucune logique de simulation ici : voir lib.py et ops.py.
+
+Regle absolue (voir chaque `draw()` ci-dessous) : un `draw()` ne modifie
+JAMAIS de donnees Blender. Il detecte un etat et affiche des boutons ; ce
+sont les OPERATEURS qui ecrivent. Ecrire depuis un `draw()` casse l'undo et
+peut faire planter Blender (redessin en cascade).
+
+Arborescence des panneaux (categorie « Bourrasque », tous de premier niveau
+sauf mention contraire — voir `classes` en bas de fichier pour l'ordre
+d'enregistrement, qui determine l'ordre d'affichage) :
+
+    BQ_PT_dashboard   « Tableau de bord »   vue d'ensemble + actions globales
+    BQ_PT_domain      « Domaine »
+    BQ_PT_elements    « Éléments »          liste + ajout/retrait
+      BQ_PT_emitter   « Émetteur »          sous-panneau, poll role==EMITTER
+      BQ_PT_collider  « Collider »          sous-panneau, poll role==COLLIDER
+    BQ_PT_materials   « Matériaux »         bibliotheque de materiaux
+    BQ_PT_simulation  « Simulation »
+    BQ_PT_output      « Sortie »            conteneur
+      BQ_PT_bake      « Particules »
+      BQ_PT_mesh      « Maillage »
+      BQ_PT_whitewater « Whitewater »
+      BQ_PT_display   « Affichage »
 """
 
 import math
+import os
 
 import bpy
 import mathutils
 from bpy.types import Panel, UIList
 
+from . import cache, lib, meshcache, whitewatercache
 from .props import (
     collider_triangle_count,
     domain_resolution,
@@ -21,6 +49,16 @@ from .props import (
     emitter_overflow,
     estimate_particle_count,
     iter_elements,
+    material_usage,
+    used_material_slot_count,
+    mesh_cache_path,
+    mesh_effective_radii,
+    mesh_layout,
+    mesh_particle_spacing,
+    mesh_resolution_state,
+    mesh_vram_estimate_bytes,
+    mesh_vram_warning_threshold_bytes,
+    whitewater_cache_path,
 )
 
 # Le champ de distance du coeur est calcule par grille de buckets + propa-
@@ -63,10 +101,159 @@ def _thousands(n):
     return f"{n:,}".replace(",", " ")
 
 
-def _material_label(obj_props):
-    """Libellé français du preset materiau d'un emetteur (« Eau », etc.)."""
-    enum_items = obj_props.bl_rna.properties["preset"].enum_items
-    return enum_items[obj_props.preset].name
+def _format_bytes(n):
+    """Formate un nombre d'octets en unite lisible (Ko/Mo/Go), pour
+    l'empreinte memoire estimee du maillage et la taille du cache `.bqm`."""
+    value = float(n)
+    for unit in ("octets", "Ko", "Mo", "Go"):
+        if value < 1024.0 or unit == "Go":
+            if unit == "octets":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} Go"
+
+
+# Libelles francais des champs de `meshcache.MeshProductionParams`, pour
+# nommer EXPLICITEMENT le parametre qui rend le cache `.bqm` caduc (voir
+# `meshcache.diff_params`, docs/plan-milestone-7.md, decision D1) plutot que
+# de se contenter d'un « cache invalide » generique.
+_MESH_PARAM_LABELS = {
+    "mesh_res": "résolution du maillage",
+    "cell_size": "taille de cellule",
+    "influence_radius": "rayon d'influence",
+    "particle_radius": "rayon de particule",
+    "collider_offset": "décalage collider",
+    "smoothing_iters": "itérations de lissage",
+    "min_component_tris": "seuil de triangles minimum par composante",
+    "src_frames": "nombre de frames du cache de particules (.bqd)",
+    "src_n_max": "nombre de particules du cache de particules (.bqd)",
+}
+
+
+def _read_bqd_source_counts(cache_dir, scene_name):
+    """Lit `(frames, n_max)` du `.bqd` source, LECTURE LEGERE (header + table
+    d'index seulement) — helper partage par `_current_mesh_params` et
+    `_current_whitewater_params`. Renvoie `(-1, -1)` si le fichier est absent
+    ou illisible : des sentinelles qui forcent `diff_params` a signaler un
+    ecart plutot que de supposer une source inchangee.
+    """
+    bqd_path, _mat_path = cache.cache_paths(cache_dir, scene_name)
+    if not os.path.isfile(bqd_path):
+        return (-1, -1)
+    try:
+        reader = cache.CacheReader(bqd_path)
+        try:
+            return (reader.frame_count, reader.n_particles)
+        finally:
+            reader.close()
+    except (OSError, ValueError):
+        return (-1, -1)
+
+
+def _current_mesh_params(scene, res, cell_size):
+    """Construit les `MeshProductionParams` COURANTS (reglages de `scene` +
+    resolution/cellule effectives) pour les comparer, via
+    `meshcache.diff_params`, aux parametres stockes dans le `.bqm` existant
+    — voir `BQ_PT_mesh.draw`.
+    """
+    props = scene.bourrasque
+    cache_dir = bpy.path.abspath(props.cache_dir)
+    src_frames, src_n_max = _read_bqd_source_counts(cache_dir, scene.name)
+
+    # Comparaison au format ABSOLU stocke dans le `.bqm` (voir
+    # `meshcache.MeshProductionParams`) : les reglages artiste sont des
+    # FACTEURS (ergonomie M7.1), `mesh_effective_radii` les convertit en
+    # valeurs absolues courantes, source de verite unique — voir props.py.
+    influence_radius, particle_radius, collider_offset = mesh_effective_radii(scene)
+
+    return meshcache.MeshProductionParams(
+        mesh_res=tuple(res),
+        cell_size=cell_size,
+        influence_radius=influence_radius,
+        particle_radius=particle_radius,
+        collider_offset=collider_offset,
+        smoothing_iters=props.mesh_smoothing_iters,
+        min_component_tris=props.mesh_min_component_tris,
+        src_frames=src_frames,
+        src_n_max=src_n_max,
+    )
+
+
+# Libelles francais des champs de `whitewatercache.WhitewaterProductionParams`,
+# meme role que `_MESH_PARAM_LABELS` (voir docs/plan-milestone-8.md, D7 —
+# meme raisonnement que D1 de M7 : nommer le parametre qui rend le cache
+# `.bqw` caduc plutot que d'afficher un « cache invalide » generique).
+_WHITEWATER_PARAM_LABELS = {
+    "influence_radius": "rayon d'influence",
+    "spawn_rate": "taux de génération",
+    "ta_min": "air piégé — seuil bas",
+    "ta_max": "air piégé — seuil haut",
+    "ta_weight": "air piégé — poids",
+    "wc_min": "crête de vague — seuil bas",
+    "wc_max": "crête de vague — seuil haut",
+    "wc_weight": "crête de vague — poids",
+    "ke_min": "énergie cinétique — seuil bas",
+    "ke_max": "énergie cinétique — seuil haut",
+    "ke_weight": "énergie cinétique — poids",
+    "life_spray": "durée de vie — embruns",
+    "life_foam": "durée de vie — écume",
+    "life_bubble": "durée de vie — bulles",
+    "drag_spray": "traînée — embruns",
+    "drag_foam": "traînée — écume/bulles",
+    "buoyancy_bubble": "flottabilité — bulles",
+    "src_frames": "nombre de frames du cache de particules (.bqd)",
+    "src_n_max": "nombre de particules du cache de particules (.bqd)",
+}
+
+
+def _current_whitewater_params(scene):
+    """Construit les `WhitewaterProductionParams` COURANTS (reglages de
+    `scene` + rayon d'influence effectif du maillage, cf. D2 du plan M8)
+    pour les comparer, via `whitewatercache.diff_params`, aux parametres
+    stockes dans le `.bqw` existant — meme motif que `_current_mesh_params`
+    pour le `.bqm`.
+
+    Renvoie `None` si aucun domaine n'est defini (le rayon d'influence
+    effectif, `mesh_effective_radii(scene)`, n'a alors pas de sens).
+    """
+    radii = mesh_effective_radii(scene)
+    if radii is None:
+        return None
+    influence_radius, _particle_radius, _collider_offset = radii
+
+    props = scene.bourrasque
+    cache_dir = bpy.path.abspath(props.cache_dir)
+    src_frames, src_n_max = _read_bqd_source_counts(cache_dir, scene.name)
+
+    return whitewatercache.WhitewaterProductionParams(
+        influence_radius=influence_radius,
+        spawn_rate=props.ww_spawn_rate,
+        ta_min=props.ww_ta_min,
+        ta_max=props.ww_ta_max,
+        ta_weight=props.ww_ta_weight,
+        wc_min=props.ww_wc_min,
+        wc_max=props.ww_wc_max,
+        wc_weight=props.ww_wc_weight,
+        ke_min=props.ww_ke_min,
+        ke_max=props.ww_ke_max,
+        ke_weight=props.ww_ke_weight,
+        life_spray=props.ww_life_spray,
+        life_foam=props.ww_life_foam,
+        life_bubble=props.ww_life_bubble,
+        drag_spray=props.ww_drag_spray,
+        drag_foam=props.ww_drag_foam,
+        buoyancy_bubble=props.ww_buoyancy_bubble,
+        src_frames=src_frames,
+        src_n_max=src_n_max,
+    )
+
+
+def _material_model_label(mat_props):
+    """Libellé français du modèle physique d'un `BqMaterialProps` (« Eau »,
+    « Élastique »)."""
+    enum_items = mat_props.bl_rna.properties["model"].enum_items
+    return enum_items[mat_props.model].name
 
 
 def _is_vector_zero(vec, eps=1e-6):
@@ -147,25 +334,314 @@ class BQ_UL_elements(UIList):
         op.value = obj.name
 
         if obj_props.role == "EMITTER":
-            row.label(text=_material_label(obj_props))
+            row.label(text=obj_props.material_name or "(sans matériau)")
         elif obj_props.role == "COLLIDER":
             row.label(text=f"Friction {obj_props.friction:.2f}")
 
 
 # ---------------------------------------------------------------------------
-# Panneau racine
+# UIList de la bibliotheque de materiaux
+#
+# Meme motif que `BQ_UL_elements`, mais sur `scene.bourrasque.materials`
+# (une CollectionProperty NOMMEE, pas les objets de la scene) : chaque ligne
+# affiche la pastille de couleur, le nom EDITABLE EN PLACE (motif standard
+# des UIList Blender, `layout.prop(item, "name", text="", emboss=False)`) et
+# le nombre d'emetteurs qui l'utilisent (`material_usage`).
 # ---------------------------------------------------------------------------
 
 
-class BQ_PT_main(Panel):
-    bl_idname = "BQ_PT_main"
-    bl_label = "Bourrasque"
+class BQ_UL_materials(UIList):
+    def draw_item(
+        self, context, layout, data, item, icon, active_data, active_propname, index
+    ):
+        mat = item
+        usage, _dangling = material_usage(context.scene)
+        n_users = len(usage.get(mat.name, []))
+
+        row = layout.row(align=True)
+        row.prop(mat, "viewport_color", text="")
+        row.prop(mat, "name", text="", emboss=False)
+        if n_users == 0:
+            row.label(text="0", icon="ERROR")
+        else:
+            row.label(text=str(n_users))
+
+
+# ---------------------------------------------------------------------------
+# Tableau de bord
+#
+# Vue d'ensemble, lecture seule + actions globales. Compact et dense : lignes
+# `split`/`row`, pas `use_property_split` (ce n'est pas un formulaire).
+# Chaque helper `_draw_dashboard_*` prend `layout`/`scene`/`props` et NE
+# MODIFIE JAMAIS de donnees Blender — seuls les operateurs qu'il propose
+# ecrivent.
+# ---------------------------------------------------------------------------
+
+
+def _dashboard_row(layout, label, value):
+    split = layout.split(factor=0.5)
+    split.label(text=label)
+    split.label(text=value)
+
+
+def _draw_dashboard_domain(layout, scene, props):
+    domain = props.domain_object
+    box = layout.box()
+    box.label(text="Domaine", icon="MESH_CUBE")
+
+    if domain is None:
+        box.label(text="Aucun domaine défini.", icon="INFO")
+        box.operator("bq.add_domain", text="Créer un domaine", icon="ADD")
+        return False
+
+    extents = _domain_extents(domain)
+    resolution = domain_resolution(scene)
+    _dashboard_row(
+        box,
+        "Taille",
+        f"{extents[0]:.3f} × {extents[1]:.3f} × {extents[2]:.3f} m",
+    )
+    if resolution is not None:
+        res, dx = resolution
+        n_cells = res[0] * res[1] * res[2]
+        _dashboard_row(box, "dx", f"{dx:.4f} m")
+        _dashboard_row(
+            box, "Résolution effective", f"{res[0]} × {res[1]} × {res[2]}"
+        )
+        _dashboard_row(box, "Cellules", _thousands(n_cells))
+    return True
+
+
+def _draw_dashboard_materials(layout, scene, props):
+    box = layout.box()
+    box.label(text="Matériaux", icon="MATERIAL")
+
+    usage, dangling = material_usage(scene)
+    materials = props.materials
+    if not materials:
+        box.label(text="Bibliothèque de matériaux vide.", icon="INFO")
+    else:
+        for mat in materials:
+            n_users = len(usage.get(mat.name, []))
+            row = box.row(align=True)
+            row.prop(mat, "viewport_color", text="")
+            label = f"{mat.name} — {_material_model_label(mat)} — {n_users} émetteur(s)"
+            if n_users == 0:
+                row.label(text=label, icon="ERROR")
+            else:
+                row.label(text=label)
+
+    n_used = used_material_slot_count(scene)
+    if n_used > lib.BQ_MAX_MATERIALS:
+        box.label(
+            text=(
+                f"{n_used} matériaux utilisés > maximum {lib.BQ_MAX_MATERIALS} "
+                "supporté par le solveur."
+            ),
+            icon="ERROR",
+        )
+
+    if dangling:
+        warn = box.box()
+        warn.label(
+            text=f"{len(dangling)} émetteur(s) sans matériau valide :",
+            icon="ERROR",
+        )
+        for obj in dangling:
+            warn.label(text=f"— {obj.name}")
+        warn.operator(
+            "bq.migrate_materials", text="Réparer", icon="FILE_REFRESH"
+        )
+
+
+def _draw_dashboard_elements(layout, scene):
+    box = layout.box()
+    box.label(text="Éléments", icon="OUTLINER")
+
+    n_emitters = 0
+    n_colliders = 0
+    for obj in scene.objects:
+        role = obj.bourrasque.role
+        if role == "EMITTER":
+            n_emitters += 1
+        elif role == "COLLIDER":
+            n_colliders += 1
+
+    _dashboard_row(box, "Émetteurs", str(n_emitters))
+    _dashboard_row(box, "Colliders", str(n_colliders))
+    n_tri = collider_triangle_count(scene)
+    _dashboard_row(box, "Triangles colliders", _thousands(n_tri))
+
+
+def _draw_dashboard_particle_estimate(layout, scene, props):
+    box = layout.box()
+    box.label(text="Particules estimées", icon="PARTICLES")
+    count = estimate_particle_count(scene)
+    _dashboard_row(box, "Estimation", _thousands(count))
+    _dashboard_row(box, "Maximum", _thousands(props.max_particles))
+    if count > props.max_particles:
+        box.label(
+            text=f"Dépassement : {_thousands(count)} > {_thousands(props.max_particles)}",
+            icon="ERROR",
+        )
+
+
+def _cache_state_row(box, label, exists, is_stale, frames_text, size_text):
+    row = box.row(align=True)
+    if not exists:
+        row.label(text=label, icon="BLANK1")
+        row.label(text="Aucun cache")
+        return
+    if is_stale:
+        row.label(text=label, icon="ERROR")
+    else:
+        row.label(text=label, icon="CHECKMARK")
+    row.label(text=f"{frames_text}, {size_text}")
+
+
+def _draw_dashboard_caches(layout, scene, props, res, cell_size):
+    box = layout.box()
+    box.label(text="Caches", icon="FILE_CACHE")
+
+    cache_dir = bpy.path.abspath(props.cache_dir)
+    requested_frames = max(0, props.frame_end - props.frame_start + 1)
+
+    # -- Particules (.bqd) : pas de notion de parametres caducs (le format
+    # ne stocke pas les reglages de production), seulement une comparaison
+    # frames bakees / plage demandee.
+    bqd_path, _mat_path = cache.cache_paths(cache_dir, scene.name)
+    bqd_exists = os.path.isfile(bqd_path)
+    if bqd_exists:
+        size_bytes = os.path.getsize(bqd_path)
+        incomplete = props.baked_frames < requested_frames
+        _cache_state_row(
+            box,
+            "Particules (.bqd)",
+            True,
+            incomplete,
+            f"{props.baked_frames}/{requested_frames} frame(s)",
+            _format_bytes(size_bytes),
+        )
+    else:
+        _cache_state_row(box, "Particules (.bqd)", False, False, "", "")
+
+    # -- Maillage (.bqm)
+    bqm_path = mesh_cache_path(cache_dir, scene.name)
+    if os.path.isfile(bqm_path):
+        size_bytes = os.path.getsize(bqm_path)
+        try:
+            reader = meshcache.MeshCacheReader(bqm_path)
+            try:
+                frame_count = reader.frame_count
+                stored_params = reader.params
+            finally:
+                reader.close()
+            current_params = _current_mesh_params(scene, res, cell_size)
+            stale = bool(meshcache.diff_params(stored_params, current_params))
+            _cache_state_row(
+                box,
+                "Maillage (.bqm)",
+                True,
+                stale,
+                f"{frame_count} frame(s)",
+                _format_bytes(size_bytes),
+            )
+        except (OSError, ValueError) as exc:
+            box.label(text=f"Maillage (.bqm) illisible : {exc}", icon="ERROR")
+    else:
+        _cache_state_row(box, "Maillage (.bqm)", False, False, "", "")
+
+    # -- Whitewater (.bqw)
+    bqw_path = whitewater_cache_path(cache_dir, scene.name)
+    if os.path.isfile(bqw_path):
+        size_bytes = os.path.getsize(bqw_path)
+        try:
+            reader = whitewatercache.WhitewaterCacheReader(bqw_path)
+            try:
+                frame_count = reader.frame_count
+                stored_params = reader.params
+            finally:
+                reader.close()
+            current_params = _current_whitewater_params(scene)
+            stale = current_params is not None and bool(
+                whitewatercache.diff_params(stored_params, current_params)
+            )
+            _cache_state_row(
+                box,
+                "Whitewater (.bqw)",
+                True,
+                stale,
+                f"{frame_count} frame(s)",
+                _format_bytes(size_bytes),
+            )
+        except (OSError, ValueError) as exc:
+            box.label(text=f"Whitewater (.bqw) illisible : {exc}", icon="ERROR")
+    else:
+        _cache_state_row(box, "Whitewater (.bqw)", False, False, "", "")
+
+
+def _draw_dashboard_actions(layout, props):
+    box = layout.box()
+    box.label(text="Actions", icon="PLAY")
+
+    busy = props.is_baking or props.is_baking_mesh or props.is_baking_whitewater
+    if busy:
+        if props.is_baking:
+            progress, text = props.bake_progress, "Particules"
+        elif props.is_baking_mesh:
+            progress, text = props.bake_mesh_progress, "Maillage"
+        else:
+            progress, text = props.bake_whitewater_progress, "Whitewater"
+
+        if hasattr(box, "progress"):
+            box.progress(factor=progress, text=f"{text} : {progress * 100:.0f} %")
+        else:
+            row = box.row()
+            row.use_property_split = True
+            row.prop(props, "bake_progress", slider=True, text=text)
+        box.operator("bq.cancel_bake", text="Annuler le bake", icon="CANCEL")
+        return
+
+    row = box.row()
+    row.scale_y = 1.5
+    row.operator("bq.bake_all", text="Tout baker", icon="PLAY")
+
+    row = box.row(align=True)
+    row.operator("bq.free_cache", text="Vider particules", icon="TRASH")
+    row.operator("bq.free_mesh_cache", text="Vider maillage", icon="TRASH")
+    row.operator("bq.free_whitewater_cache", text="Vider whitewater", icon="TRASH")
+
+
+class BQ_PT_dashboard(Panel):
+    bl_idname = "BQ_PT_dashboard"
+    bl_label = "Tableau de bord"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Bourrasque"
+    # Pas de DEFAULT_CLOSED : c'est le panneau qu'on veut voir en premier,
+    # ouvert, a l'ouverture de la sidebar.
 
     def draw(self, context):
-        pass
+        layout = self.layout
+        scene = context.scene
+        props = scene.bourrasque
+
+        has_domain = _draw_dashboard_domain(layout, scene, props)
+        if not has_domain:
+            # Tout le reste du tableau de bord depend d'un domaine defini
+            # (resolution, estimation de particules, chemin des caches...).
+            return
+
+        _draw_dashboard_materials(layout, scene, props)
+        _draw_dashboard_elements(layout, scene)
+        _draw_dashboard_particle_estimate(layout, scene, props)
+
+        res_layout = mesh_layout(scene)
+        if res_layout is not None:
+            res, cell_size = res_layout
+            _draw_dashboard_caches(layout, scene, props, res, cell_size)
+
+        _draw_dashboard_actions(layout, props)
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +654,8 @@ class BQ_PT_domain(Panel):
     bl_label = "Domaine"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_parent_id = "BQ_PT_main"
+    bl_category = "Bourrasque"
+    bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
         layout = self.layout
@@ -238,7 +715,8 @@ class BQ_PT_elements(Panel):
     bl_label = "Éléments"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_parent_id = "BQ_PT_main"
+    bl_category = "Bourrasque"
+    bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
         layout = self.layout
@@ -285,16 +763,17 @@ class BQ_PT_elements(Panel):
 
 
 # ---------------------------------------------------------------------------
-# Materiau
+# Émetteur (sous-panneau d'Éléments)
 # ---------------------------------------------------------------------------
 
 
-class BQ_PT_material(Panel):
-    bl_idname = "BQ_PT_material"
-    bl_label = "Matériau"
+class BQ_PT_emitter(Panel):
+    bl_idname = "BQ_PT_emitter"
+    bl_label = "Émetteur"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_parent_id = "BQ_PT_main"
+    bl_category = "Bourrasque"
+    bl_parent_id = "BQ_PT_elements"
 
     @classmethod
     def poll(cls, context):
@@ -308,18 +787,21 @@ class BQ_PT_material(Panel):
         scene = context.scene
         layout.enabled = not scene.bourrasque.is_baking
 
-        obj_props = context.active_object.bourrasque
+        obj = context.active_object
+        obj_props = obj.bourrasque
 
-        layout.prop(obj_props, "preset")
-        layout.prop(obj_props, "model")
-        layout.prop(obj_props, "rho")
-
-        if obj_props.model == "ELASTIC":
-            layout.prop(obj_props, "young")
-            layout.prop(obj_props, "poisson")
-        elif obj_props.model == "WATER":
-            layout.prop(obj_props, "bulk")
-            layout.prop(obj_props, "gamma")
+        layout.prop_search(
+            obj_props, "material_name", scene.bourrasque, "materials", text="Matériau"
+        )
+        usage, dangling = material_usage(scene)
+        if obj_props.material_name not in usage or obj in dangling:
+            warn = layout.box()
+            warn.label(
+                text="Aucun matériau valide : le bake sera refusé.", icon="ERROR"
+            )
+            warn.operator(
+                "bq.migrate_materials", text="Réparer", icon="FILE_REFRESH"
+            )
 
         layout.prop(obj_props, "initial_velocity")
 
@@ -363,7 +845,7 @@ class BQ_PT_material(Panel):
                 check_mesh_closed = None
 
             if check_mesh_closed is not None:
-                is_closed, message = check_mesh_closed(context.active_object)
+                is_closed, message = check_mesh_closed(obj)
                 if not is_closed:
                     warn = layout.box()
                     warn.label(text=message, icon="ERROR")
@@ -371,7 +853,7 @@ class BQ_PT_material(Panel):
             # L'echantillonnage d'interieur n'est fait qu'une fois, au debut
             # du bake : un emetteur anime (transformation ou forme) donne un
             # resultat faux et silencieux. Hors perimetre de ce jalon.
-            if _is_object_animated(context.active_object):
+            if _is_object_animated(obj):
                 warn = layout.box()
                 warn.label(text="Émetteur animé en mode maillage :", icon="ERROR")
                 warn.label(
@@ -395,9 +877,7 @@ class BQ_PT_material(Panel):
         if transform is not None and resolution is not None:
             origin, size = transform
             _res, dx = resolution
-            overflow = emitter_overflow(
-                context.active_object, origin, size, dx
-            )
+            overflow = emitter_overflow(obj, origin, size, dx)
             if overflow is not None:
                 fully_outside, offending_axes, margin = overflow
                 warn = layout.box()
@@ -420,7 +900,7 @@ class BQ_PT_material(Panel):
 
 
 # ---------------------------------------------------------------------------
-# Collider
+# Collider (sous-panneau d'Éléments)
 # ---------------------------------------------------------------------------
 
 
@@ -429,7 +909,8 @@ class BQ_PT_collider(Panel):
     bl_label = "Collider"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_parent_id = "BQ_PT_main"
+    bl_category = "Bourrasque"
+    bl_parent_id = "BQ_PT_elements"
 
     @classmethod
     def poll(cls, context):
@@ -448,6 +929,73 @@ class BQ_PT_collider(Panel):
 
 
 # ---------------------------------------------------------------------------
+# Materiaux (bibliotheque de la scene)
+# ---------------------------------------------------------------------------
+
+
+class BQ_PT_materials(Panel):
+    bl_idname = "BQ_PT_materials"
+    bl_label = "Matériaux"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Bourrasque"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        props = scene.bourrasque
+        layout.enabled = not props.is_baking
+
+        row = layout.row()
+        row.template_list(
+            "BQ_UL_materials",
+            "",
+            props,
+            "materials",
+            props,
+            "active_material_index",
+            rows=4,
+        )
+
+        col = row.column(align=True)
+        col.operator("bq.material_add", text="", icon="ADD")
+        col.operator("bq.material_remove", text="", icon="REMOVE")
+        col.separator()
+        col.operator("bq.material_duplicate", text="", icon="DUPLICATE")
+
+        n_used = used_material_slot_count(scene)
+        if n_used > lib.BQ_MAX_MATERIALS:
+            layout.label(
+                text=(
+                    f"{n_used} matériaux utilisés > maximum "
+                    f"{lib.BQ_MAX_MATERIALS} supporté par le solveur."
+                ),
+                icon="ERROR",
+            )
+
+        if not (0 <= props.active_material_index < len(props.materials)):
+            return
+
+        mat = props.materials[props.active_material_index]
+
+        editor = layout.column()
+        editor.use_property_split = True
+        editor.prop(mat, "preset")
+        editor.prop(mat, "model")
+        editor.prop(mat, "rho")
+
+        if mat.model == "ELASTIC":
+            editor.prop(mat, "young")
+            editor.prop(mat, "poisson")
+        elif mat.model == "WATER":
+            editor.prop(mat, "bulk")
+            editor.prop(mat, "gamma")
+
+        editor.prop(mat, "viewport_color")
+
+
+# ---------------------------------------------------------------------------
 # Simulation
 # ---------------------------------------------------------------------------
 
@@ -457,7 +1005,8 @@ class BQ_PT_simulation(Panel):
     bl_label = "Simulation"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_parent_id = "BQ_PT_main"
+    bl_category = "Bourrasque"
+    bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
         layout = self.layout
@@ -495,16 +1044,34 @@ class BQ_PT_simulation(Panel):
 
 
 # ---------------------------------------------------------------------------
-# Bake
+# Sortie (conteneur)
+# ---------------------------------------------------------------------------
+
+
+class BQ_PT_output(Panel):
+    bl_idname = "BQ_PT_output"
+    bl_label = "Sortie"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Bourrasque"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Particules (sous-panneau de Sortie)
 # ---------------------------------------------------------------------------
 
 
 class BQ_PT_bake(Panel):
     bl_idname = "BQ_PT_bake"
-    bl_label = "Bake"
+    bl_label = "Particules"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_parent_id = "BQ_PT_main"
+    bl_category = "Bourrasque"
+    bl_parent_id = "BQ_PT_output"
 
     def draw(self, context):
         layout = self.layout
@@ -539,7 +1106,344 @@ class BQ_PT_bake(Panel):
 
 
 # ---------------------------------------------------------------------------
-# Affichage
+# Maillage (sous-panneau de Sortie)
+# ---------------------------------------------------------------------------
+
+
+class BQ_PT_mesh(Panel):
+    bl_idname = "BQ_PT_mesh"
+    bl_label = "Maillage"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Bourrasque"
+    bl_parent_id = "BQ_PT_output"
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        props = scene.bourrasque
+
+        busy = props.is_baking or props.is_baking_mesh
+
+        # -- Grandeurs calculees, en lecture seule (ergonomie M7.1) --------
+        #
+        # Affichees AVANT les reglages : c'est le lien entre le facteur que
+        # l'artiste regle ci-dessous et la distance/resolution reelle que
+        # cela represente. N'a de sens qu'avec un domaine defini.
+        res_layout = mesh_layout(scene)
+        if res_layout is None:
+            layout.label(text="Aucun domaine défini.", icon="INFO")
+            return
+
+        res, cell_size = res_layout
+        n_cells = res[0] * res[1] * res[2]
+        spacing = mesh_particle_spacing(scene)
+        resolution_state = mesh_resolution_state(scene)
+        influence_radius, particle_radius, collider_offset = mesh_effective_radii(
+            scene
+        )
+
+        info = layout.box()
+        if spacing is not None:
+            info.label(text=f"Espacement inter-particules : {spacing:.4f} m")
+        if resolution_state is not None:
+            _setting, is_auto, was_capped = resolution_state
+            res_text = (
+                f"Résolution du maillage : {res[0]} × {res[1]} × {res[2]} "
+                f"({_thousands(n_cells)} cellules)"
+            )
+            if is_auto:
+                res_text += " — automatique"
+                if was_capped:
+                    res_text += ", plafonnée (VRAM)"
+            info.label(text=res_text)
+        info.label(
+            text=(
+                f"Rayon d'influence effectif : {influence_radius:.4f} m — "
+                f"rayon de particule : {particle_radius:.4f} m — "
+                f"décalage collider : {collider_offset:.4f} m"
+            )
+        )
+
+        settings = layout.column()
+        settings.use_property_split = True
+        settings.enabled = not busy
+        settings.prop(props, "mesh_resolution")
+        settings.prop(props, "mesh_influence_factor")
+        settings.prop(props, "mesh_particle_factor")
+        settings.prop(props, "mesh_collider_offset_factor")
+        settings.prop(props, "mesh_smoothing_iters")
+        settings.prop(props, "mesh_min_component_tris")
+
+        # Empreinte memoire estimee AVANT tout bake (garde-fou VRAM, voir
+        # docs/plan-milestone-7.md D3/R1) : 36 octets par cellule du champ
+        # de maillage (champ Zhu-Bridson + tampons du marching cubes),
+        # calcule en pur Python (`mesh_vram_estimate_bytes`), sans dependre
+        # de la DLL native — l'artiste doit voir ce chiffre avant de lancer
+        # un bake, pas le decouvrir par un echec.
+        est_bytes = mesh_vram_estimate_bytes(scene)
+
+        box = layout.box()
+        box.label(text=f"Empreinte mémoire estimée : {_format_bytes(est_bytes)}")
+        if est_bytes > mesh_vram_warning_threshold_bytes():
+            box.label(
+                text=(
+                    "Empreinte mémoire très élevée (> "
+                    f"{_format_bytes(mesh_vram_warning_threshold_bytes())}) : "
+                    "risque d'échec du bake par manque de VRAM. Réduisez la "
+                    "résolution du maillage."
+                ),
+                icon="ERROR",
+            )
+
+        layout.separator()
+
+        if props.is_baking_mesh:
+            if hasattr(layout, "progress"):
+                layout.progress(
+                    factor=props.bake_mesh_progress,
+                    text=f"{props.bake_mesh_progress * 100:.0f} %",
+                )
+            else:
+                prog = layout.column()
+                prog.use_property_split = True
+                prog.prop(
+                    props, "bake_mesh_progress", slider=True, text="Progression"
+                )
+            layout.operator(
+                "bq.cancel_bake", text="Annuler le bake de maillage", icon="CANCEL"
+            )
+        else:
+            row = layout.row(align=True)
+            row.enabled = not props.is_baking
+            row.operator("bq.bake_mesh", text="Baker le maillage", icon="MOD_REMESH")
+            row.operator("bq.bake_all", text="Tout baker", icon="PLAY")
+
+        row = layout.row()
+        row.enabled = not busy
+        row.operator(
+            "bq.free_mesh_cache", text="Vider le cache de maillage", icon="TRASH"
+        )
+
+        layout.separator()
+        layout.label(
+            text="Affichage : matériau triplanaire de départ (sans UV), "
+            "pas un rendu final.",
+            icon="INFO",
+        )
+        layout.operator(
+            "bq.setup_fluid_display",
+            text="Configurer l'affichage du maillage",
+            icon="MATERIAL",
+        )
+
+        # -- Etat du cache .bqm --------------------------------------------
+        cache_dir = bpy.path.abspath(props.cache_dir)
+        bqm_path = mesh_cache_path(cache_dir, scene.name)
+
+        if not os.path.isfile(bqm_path):
+            layout.label(text="Aucun cache de maillage.")
+            return
+
+        size_bytes = os.path.getsize(bqm_path)
+        try:
+            reader = meshcache.MeshCacheReader(bqm_path)
+            try:
+                frame_count = reader.frame_count
+                stored_params = reader.params
+            finally:
+                reader.close()
+        except (OSError, ValueError) as exc:
+            layout.label(text=f"Cache de maillage illisible : {exc}", icon="ERROR")
+            return
+
+        info = layout.box()
+        info.label(
+            text=f"{frame_count} frame(s) en cache, {_format_bytes(size_bytes)}"
+        )
+
+        current_params = _current_mesh_params(scene, res, cell_size)
+        diffs = meshcache.diff_params(stored_params, current_params)
+        if diffs:
+            warn = layout.box()
+            warn.label(text="Cache de maillage caduc :", icon="ERROR")
+            for name in diffs:
+                label = _MESH_PARAM_LABELS.get(name, name)
+                warn.label(text=f"— {label} a changé")
+            warn.label(text="Rebakez le maillage pour le mettre à jour.")
+
+
+# ---------------------------------------------------------------------------
+# Whitewater (sous-panneau de Sortie)
+# ---------------------------------------------------------------------------
+
+
+class BQ_PT_whitewater(Panel):
+    bl_idname = "BQ_PT_whitewater"
+    bl_label = "Whitewater"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Bourrasque"
+    bl_parent_id = "BQ_PT_output"
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        props = scene.bourrasque
+
+        busy = props.is_baking or props.is_baking_mesh or props.is_baking_whitewater
+
+        layout.label(
+            text="Particules secondaires (écume, bulles, embruns) — "
+            "indépendant du maillage, ne lit que le cache de particules.",
+            icon="INFO",
+        )
+
+        settings = layout.column()
+        settings.use_property_split = True
+        settings.enabled = not busy
+        settings.prop(props, "ww_max_particles")
+
+        box = settings.box()
+        box.label(text="Air piégé")
+        box.prop(props, "ww_ta_min")
+        box.prop(props, "ww_ta_max")
+        box.prop(props, "ww_ta_weight")
+
+        box = settings.box()
+        box.label(text="Crête de vague")
+        box.prop(props, "ww_wc_min")
+        box.prop(props, "ww_wc_max")
+        box.prop(props, "ww_wc_weight")
+
+        box = settings.box()
+        box.label(text="Énergie cinétique")
+        box.prop(props, "ww_ke_min")
+        box.prop(props, "ww_ke_max")
+        box.prop(props, "ww_ke_weight")
+
+        settings.prop(props, "ww_spawn_rate")
+
+        box = settings.box()
+        box.label(text="Durée de vie")
+        box.prop(props, "ww_life_spray")
+        box.prop(props, "ww_life_foam")
+        box.prop(props, "ww_life_bubble")
+
+        box = settings.box()
+        box.label(text="Advection")
+        box.prop(props, "ww_drag_spray")
+        box.prop(props, "ww_drag_foam")
+        box.prop(props, "ww_buoyancy_bubble")
+
+        layout.separator()
+
+        if props.is_baking_whitewater:
+            if hasattr(layout, "progress"):
+                layout.progress(
+                    factor=props.bake_whitewater_progress,
+                    text=f"{props.bake_whitewater_progress * 100:.0f} %",
+                )
+            else:
+                prog = layout.column()
+                prog.use_property_split = True
+                prog.prop(
+                    props, "bake_whitewater_progress", slider=True,
+                    text="Progression",
+                )
+            layout.operator(
+                "bq.cancel_bake", text="Annuler le bake de whitewater",
+                icon="CANCEL",
+            )
+        else:
+            layout.operator(
+                "bq.bake_whitewater", text="Baker le whitewater", icon="PLAY"
+            )
+
+        row = layout.row()
+        row.enabled = not busy
+        row.operator(
+            "bq.free_whitewater_cache", text="Vider le cache de whitewater",
+            icon="TRASH",
+        )
+
+        layout.separator()
+        layout.label(
+            text="Affichage : point de départ éditable (instances + "
+            "matériaux), pas un rendu final.",
+            icon="INFO",
+        )
+        display_settings = layout.column()
+        display_settings.use_property_split = True
+        display_settings.prop(props, "ww_size_mult")
+        row = layout.row(align=True)
+        row.operator(
+            "bq.setup_whitewater_display",
+            text="Configurer l'affichage par particules",
+            icon="GEOMETRY_NODES",
+        )
+        row.operator(
+            "bq.setup_whitewater_display_volume",
+            text="Configurer l'affichage volumétrique",
+            icon="VOLUME_DATA",
+        )
+
+        if props.baked_whitewater_max_refused > 0:
+            warn = layout.box()
+            warn.label(
+                text=(
+                    "Capacité atteinte pendant le bake (jusqu'à "
+                    f"{_thousands(props.baked_whitewater_max_refused)} "
+                    "candidate(s) refusée(s) sur une frame) :"
+                ),
+                icon="ERROR",
+            )
+            warn.label(
+                text="augmentez « Particules secondaires max » pour ne pas "
+                "perdre de densité."
+            )
+
+        # -- Etat du cache .bqw --------------------------------------------
+        cache_dir = bpy.path.abspath(props.cache_dir)
+        bqw_path = whitewater_cache_path(cache_dir, scene.name)
+
+        if not os.path.isfile(bqw_path):
+            layout.label(text="Aucun cache de whitewater.")
+            return
+
+        size_bytes = os.path.getsize(bqw_path)
+        try:
+            reader = whitewatercache.WhitewaterCacheReader(bqw_path)
+            try:
+                frame_count = reader.frame_count
+                stored_params = reader.params
+            finally:
+                reader.close()
+        except (OSError, ValueError) as exc:
+            layout.label(
+                text=f"Cache de whitewater illisible : {exc}", icon="ERROR"
+            )
+            return
+
+        info = layout.box()
+        info.label(
+            text=f"{frame_count} frame(s) en cache, {_format_bytes(size_bytes)}"
+        )
+
+        current_params = _current_whitewater_params(scene)
+        if current_params is not None:
+            diffs = whitewatercache.diff_params(stored_params, current_params)
+            if diffs:
+                warn = layout.box()
+                warn.label(text="Cache de whitewater caduc :", icon="ERROR")
+                for name in diffs:
+                    label = _WHITEWATER_PARAM_LABELS.get(name, name)
+                    warn.label(text=f"— {label} a changé")
+                warn.label(text="Rebakez le whitewater pour le mettre à jour.")
+
+
+# ---------------------------------------------------------------------------
+# Affichage (sous-panneau de Sortie)
 # ---------------------------------------------------------------------------
 
 
@@ -548,7 +1452,8 @@ class BQ_PT_display(Panel):
     bl_label = "Affichage"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_parent_id = "BQ_PT_main"
+    bl_category = "Bourrasque"
+    bl_parent_id = "BQ_PT_output"
 
     def draw(self, context):
         layout = self.layout
@@ -571,13 +1476,18 @@ class BQ_PT_display(Panel):
 
 classes = (
     BQ_UL_elements,
-    BQ_PT_main,
+    BQ_UL_materials,
+    BQ_PT_dashboard,
     BQ_PT_domain,
     BQ_PT_elements,
-    BQ_PT_material,
+    BQ_PT_emitter,
     BQ_PT_collider,
+    BQ_PT_materials,
     BQ_PT_simulation,
+    BQ_PT_output,
     BQ_PT_bake,
+    BQ_PT_mesh,
+    BQ_PT_whitewater,
     BQ_PT_display,
 )
 

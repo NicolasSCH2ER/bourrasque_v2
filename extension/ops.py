@@ -10,22 +10,53 @@ sans jamais fuir de memoire GPU ni laisser un timer actif. Tous les chemins
 de sortie de la boucle modale (fin normale, annulation, exception) convergent
 vers `BQ_OT_bake._cleanup`, seul endroit qui ferme le `CacheWriter`, detruit
 la simulation et retire le timer.
+
+Le CALCUL de chaque bake (particules ou maillage, `BQ_OT_bake_mesh`) tourne
+dans un `threading.Thread(daemon=True)` (docs/plan-milestone-7.md, decision
+D10) : le tick modal ne fait plus qu'un sondage periodique d'un objet
+`_BakeProgress` partage (compteur de frames faites, drapeau de fin, message
+d'erreur eventuel, file de messages a reporter), jamais de calcul. C'est ce
+qui laisse Blender manipulable (viewport, ESC) pendant tout le bake, y
+compris une frame de maillage qui peut durer plusieurs secondes.
+
+REGLE NON NEGOCIABLE : AUCUN appel a `bpy` (lecture de scene, ecriture de
+propriete, `self.report`, `evaluated_depsgraph_get`...) ne doit se produire
+dans un thread de calcul — Blender n'est pas thread-safe, un tel appel hors
+du thread principal fait tomber le processus sans message exploitable. Le
+thread ne touche que : la `Sim`/le `Mesher` (appels ctypes, qui relachent le
+GIL — c'est ce qui rend le thread utile), l'ecriture de fichier cache, et
+l'objet `_BakeProgress` (compteurs/drapeaux simples, plus une `queue.Queue`
+pour les messages a reporter). Tout ce qui vient de la scene — y compris la
+geometrie EVALUEE des colliders animes, qui depend du depsgraph a chaque
+frame — est donc collecte AVANT le lancement du thread, sur le thread
+principal (voir `BQ_OT_bake.invoke`, pre-extraction dans
+`self._collider_frames`) : le thread ne consomme plus que des tableaux
+numpy deja extraits, jamais un objet bpy.
 """
 
 import math
 import os
+import queue
+import threading
 
 import bpy
 import numpy as np
 
-from . import cache, lib
+from . import cache, lib, materials, meshcache, whitewatercache
 from .props import (
+    _PRESET_WATER,
     domain_resolution,
     domain_transform,
     domain_usable_bounds,
     emitter_bounds_solver,
     emitter_overflow,
     estimate_particle_count,
+    material_usage,
+    mesh_cache_path,
+    mesh_effective_radii,
+    mesh_layout,
+    whitewater_cache_path,
+    whitewater_config_from_scene,
     world_to_solver_dir,
 )
 from .transform import world_to_solver_array, world_to_solver_dir_array
@@ -613,6 +644,42 @@ class BQ_OT_add_emitter(bpy.types.Operator):
             self.report({"INFO"}, f"« {obj.name} » est déjà un émetteur.")
             return {"FINISHED"}
         obj.bourrasque.role = "EMITTER"
+
+        # Un emetteur sans materiau VALIDE est une reference pendante des sa
+        # creation : une scene neuve ne doit jamais en presenter (voir
+        # `material_usage`/`ui.py`).
+        #
+        # Le test porte sur la VALIDITE, pas sur le simple fait que le champ
+        # soit non vide : un objet qui a deja ete emetteur, dont le role a ete
+        # retire puis le materiau supprime, conserve un `material_name` non
+        # vide mais PENDANT — le repasser emetteur le laisserait avec cette
+        # reference morte.
+        library = context.scene.bourrasque.materials
+        if obj.bourrasque.material_name not in {mat.name for mat in library}:
+            if len(library) == 0:
+                # Bibliotheque vide : on cree une entree « Eau » par defaut
+                # (memes valeurs que le preset WATER historique,
+                # `_PRESET_WATER`).
+                mat = library.add()
+                mat.model = _PRESET_WATER["model"]
+                mat.rho = _PRESET_WATER["rho"]
+                mat.bulk = _PRESET_WATER["bulk"]
+                mat.gamma = _PRESET_WATER["gamma"]
+                mat.preset = "WATER"
+                name = materials.unique_name("Eau", [])
+                mat.name_prev = name
+                mat.name = name
+                obj.bourrasque.material_name = name
+            else:
+                # Bibliotheque non vide : on prend le materiau ACTIF de la
+                # liste, pas `library[0]` — l'artiste qui vient de selectionner
+                # « Sable » dans le panneau Materiaux attend que son nouvel
+                # emetteur soit du sable, pas la premiere entree de la liste.
+                index = context.scene.bourrasque.active_material_index
+                if not (0 <= index < len(library)):
+                    index = 0
+                obj.bourrasque.material_name = library[index].name
+
         return {"FINISHED"}
 
 
@@ -695,12 +762,280 @@ class BQ_OT_remove_element(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
+# BQ_OT_material_add / _remove / _duplicate, BQ_OT_migrate_materials
+# ---------------------------------------------------------------------------
+
+
+class BQ_OT_material_add(bpy.types.Operator):
+    """Ajoute un materiau a la bibliotheque de materiaux de la scene."""
+
+    bl_idname = "bq.material_add"
+    bl_label = "Ajouter un matériau"
+    bl_description = "Ajoute un nouveau matériau à la bibliothèque de la scène"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        library = scene.bourrasque.materials
+
+        existing = [m.name for m in library]
+        name = materials.unique_name("Eau", existing)
+
+        mat = library.add()
+        # `name_prev` initialise a la MEME valeur que `name` avant meme la
+        # premiere affectation : sans ca, le callback `update` de `name`
+        # (props.py::_on_material_name_update) verrait un `name_prev` vide
+        # comme un "vrai" ancien nom lors du tout premier renommage venu de
+        # l'utilisateur et tenterait (a tort) de propager depuis une valeur
+        # perimee.
+        mat.name_prev = name
+        mat.name = name
+
+        scene.bourrasque.active_material_index = len(library) - 1
+        return {"FINISHED"}
+
+
+class BQ_OT_material_remove(bpy.types.Operator):
+    """Supprime le materiau actif de la bibliotheque de la scene."""
+
+    bl_idname = "bq.material_remove"
+    bl_label = "Supprimer le matériau"
+    bl_description = (
+        "Supprime le matériau actif ; les émetteurs qui le référencent "
+        "perdent leur assignation"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return len(context.scene.bourrasque.materials) > 0
+
+    def execute(self, context):
+        scene = context.scene
+        library = scene.bourrasque.materials
+        index = scene.bourrasque.active_material_index
+
+        if not (0 <= index < len(library)):
+            self.report({"ERROR"}, "Aucun matériau sélectionné.")
+            return {"CANCELLED"}
+
+        mat = library[index]
+
+        # AVANT la suppression : vide `material_name` sur tous les
+        # emetteurs qui referencent ce materiau, pour ne jamais laisser de
+        # reference pendante silencieuse.
+        usage, _dangling = material_usage(scene)
+        affected = usage.get(mat.name, [])
+        for obj in affected:
+            obj.bourrasque.material_name = ""
+
+        library.remove(index)
+        scene.bourrasque.active_material_index = max(
+            0, min(index, len(library) - 1)
+        )
+
+        if affected:
+            self.report(
+                {"INFO"},
+                f"Matériau supprimé ; {len(affected)} émetteur(s) ont perdu "
+                "leur matériau assigné.",
+            )
+        else:
+            self.report({"INFO"}, "Matériau supprimé.")
+        return {"FINISHED"}
+
+
+class BQ_OT_material_duplicate(bpy.types.Operator):
+    """Duplique le materiau actif de la bibliotheque de la scene."""
+
+    bl_idname = "bq.material_duplicate"
+    bl_label = "Dupliquer le matériau"
+    bl_description = "Duplique le matériau actif (mêmes réglages, nom distinct)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        index = scene.bourrasque.active_material_index
+        return 0 <= index < len(scene.bourrasque.materials)
+
+    def execute(self, context):
+        scene = context.scene
+        library = scene.bourrasque.materials
+        index = scene.bourrasque.active_material_index
+        source = library[index]
+
+        existing = [m.name for m in library]
+        name = materials.unique_name(source.name, existing)
+
+        dup = library.add()
+        # `preset` est affecte EN PREMIER : son callback `update`
+        # (props.py::_on_preset_update) reecrit model/rho/young/poisson
+        # d'apres le preset choisi si celui-ci n'est pas CUSTOM. Affecter
+        # ensuite explicitement TOUS les champs physiques depuis `source`
+        # garantit que la copie finale est exacte, quel que soit l'effet de
+        # bord de ce callback.
+        dup.preset = source.preset
+        dup.model = source.model
+        dup.rho = source.rho
+        dup.young = source.young
+        dup.poisson = source.poisson
+        dup.bulk = source.bulk
+        dup.gamma = source.gamma
+        dup.viewport_color = source.viewport_color[:]
+
+        dup.name_prev = name
+        dup.name = name
+
+        scene.bourrasque.active_material_index = len(library) - 1
+        return {"FINISHED"}
+
+
+class BQ_OT_migrate_materials(bpy.types.Operator):
+    """Construit/complete la bibliotheque de materiaux de la scene depuis
+    les reglages materiau herites (DEPRECIES, voir props.py) portes par
+    chaque emetteur, puis reassigne `material_name` en consequence.
+
+    Idempotent : un materiau de la bibliotheque dont la `material_key` (voir
+    materials.py) correspond deja a ce qu'un emetteur porte est REUTILISE,
+    jamais duplique — relancer cet operateur sur une scene deja migree ne
+    cree rien de nouveau et ne change aucune assignation.
+    """
+
+    bl_idname = "bq.migrate_materials"
+    bl_label = "Migrer les matériaux"
+    bl_description = (
+        "Construit la bibliothèque de matériaux de la scène à partir des "
+        "réglages hérités de chaque émetteur (opération idempotente)"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+
+        # N'agit QUE sur les emetteurs dont la reference est vide ou pendante.
+        #
+        # Ce filtre n'est pas une optimisation, c'est une garde contre une
+        # PERTE DE DONNEES (ecart 1 de la revue d'architecture M16, reproduit
+        # et mesure avant correction). L'UI expose cet operateur sous le
+        # libelle « Reparer », declenche des qu'UN SEUL emetteur est pendant —
+        # ce qui arrive aussi dans une scene entierement post-M16, par exemple
+        # apres un `bq.material_remove`. Sans ce filtre, l'operateur
+        # reassignait TOUS les emetteurs depuis leurs champs DEPRECIES, qui ne
+        # sont plus ecrits depuis M16 et valent donc les defauts identiques
+        # pour tout le monde : mesure sur une scene de 3 emetteurs assignes a
+        # la main (SiropCustom / Gelee / Eau), la suppression d'un seul
+        # materiau suivie d'un clic sur « Reparer » les effondrait tous les
+        # trois sur un unique « Eau.001 », detruisant deux assignations
+        # valides et creant un doublon. Un emetteur deja correctement assigne
+        # n'a par definition rien a migrer.
+        library_names = {mat.name for mat in scene.bourrasque.materials}
+        emitter_objs = [
+            obj
+            for obj in scene.objects
+            if obj.bourrasque.role == "EMITTER"
+            and obj.bourrasque.material_name not in library_names
+        ]
+        if not emitter_objs:
+            self.report(
+                {"INFO"},
+                "Tous les émetteurs ont déjà un matériau valide : rien à migrer.",
+            )
+            return {"FINISHED"}
+
+        emitter_dicts = [
+            {
+                "name": obj.name,
+                "model": obj.bourrasque.model,
+                "rho": obj.bourrasque.rho,
+                "young": obj.bourrasque.young,
+                "poisson": obj.bourrasque.poisson,
+                "bulk": obj.bourrasque.bulk,
+                "gamma": obj.bourrasque.gamma,
+                "preset": obj.bourrasque.preset,
+            }
+            for obj in emitter_objs
+        ]
+
+        planned_materials, assignment = materials.plan_migration(emitter_dicts)
+
+        library = scene.bourrasque.materials
+        by_key = {
+            materials.material_key(
+                {
+                    "model": mat.model,
+                    "rho": mat.rho,
+                    "young": mat.young,
+                    "poisson": mat.poisson,
+                    "bulk": mat.bulk,
+                    "gamma": mat.gamma,
+                }
+            ): mat.name
+            for mat in library
+        }
+
+        # Nom planifie par `plan_migration` -> nom REEL dans la
+        # bibliotheque (reutilise s'il existe deja, sinon nouvellement cree
+        # ci-dessous).
+        resolved_names = {}
+        created = 0
+        for planned in planned_materials:
+            key = materials.material_key(planned)
+            existing_name = by_key.get(key)
+            if existing_name is not None:
+                resolved_names[planned["name"]] = existing_name
+                continue
+
+            existing = [m.name for m in library]
+            name = materials.unique_name(planned["name"], existing)
+
+            mat = library.add()
+            mat.model = planned["model"]
+            mat.rho = planned["rho"]
+            mat.young = planned["young"]
+            mat.poisson = planned["poisson"]
+            mat.bulk = planned["bulk"]
+            mat.gamma = planned["gamma"]
+            mat.preset = "CUSTOM"
+            mat.name_prev = name
+            mat.name = name
+
+            by_key[key] = name
+            resolved_names[planned["name"]] = name
+            created += 1
+
+        assigned = 0
+        for obj in emitter_objs:
+            planned_name = assignment.get(obj.name)
+            if planned_name is None:
+                continue
+            obj.bourrasque.material_name = resolved_names.get(
+                planned_name, planned_name
+            )
+            assigned += 1
+
+        self.report(
+            {"INFO"},
+            f"{created} matériau(x) créé(s), {assigned} émetteur(s) assigné(s).",
+        )
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
 # BQ_OT_cancel_bake
 # ---------------------------------------------------------------------------
 
 
 class BQ_OT_cancel_bake(bpy.types.Operator):
-    """Positionne le drapeau d'annulation observe par le modal de bake."""
+    """Positionne le drapeau d'annulation observe par le modal de bake.
+
+    Sert aussi bien au bake de particules qu'au bake de maillage (voir
+    `BQ_OT_bake_mesh`) : les deux passes du bake modulaire (voir
+    docs/plan-milestone-7.md, D8) partagent ce meme bouton « Annuler »,
+    plutot que d'en dupliquer un par passe. `BQ_OT_bake_all` (qui enchaine
+    les deux) n'a besoin d'aucune logique d'annulation propre : ESC ou ce
+    bouton atteint directement l'operateur modal de la passe en cours, qui
+    gere deja sa propre annulation."""
 
     bl_idname = "bq.cancel_bake"
     bl_label = "Annuler"
@@ -708,10 +1043,17 @@ class BQ_OT_cancel_bake(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.scene.bourrasque.is_baking
+        props = context.scene.bourrasque
+        return props.is_baking or props.is_baking_mesh or props.is_baking_whitewater
 
     def execute(self, context):
-        BQ_OT_bake.cancel_requested = True
+        props = context.scene.bourrasque
+        if props.is_baking:
+            BQ_OT_bake.cancel_requested = True
+        if props.is_baking_mesh:
+            BQ_OT_bake_mesh.cancel_requested = True
+        if props.is_baking_whitewater:
+            BQ_OT_bake_whitewater.cancel_requested = True
         return {"FINISHED"}
 
 
@@ -737,6 +1079,14 @@ class BQ_OT_free_cache(bpy.types.Operator):
         cache_dir = bpy.path.abspath(scene.bourrasque.cache_dir)
         bqd_path, mat_path = cache.cache_paths(cache_dir, scene.name)
 
+        # Referme le CacheReader eventuellement garde ouvert par un scrub de
+        # la timeline AVANT de supprimer le fichier : sur Windows, un
+        # descripteur de fichier encore ouvert fait echouer os.remove
+        # (PermissionError, WinError 32) -- cf. display.close_particle_reader.
+        from . import display
+
+        display.close_particle_reader()
+
         removed_any = False
         for path in (bqd_path, mat_path):
             if os.path.isfile(path):
@@ -748,8 +1098,6 @@ class BQ_OT_free_cache(bpy.types.Operator):
         # Vide la geometrie affichee : sans ca, la derniere frame bakee
         # resterait affichee dans le viewport alors que le cache qui la
         # sous-tend vient d'etre supprime.
-        from . import display
-
         display.clear_particle_object()
 
         if removed_any:
@@ -757,6 +1105,798 @@ class BQ_OT_free_cache(bpy.types.Operator):
         else:
             self.report({"INFO"}, "Aucun cache à vider.")
         return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# BQ_OT_free_mesh_cache
+# ---------------------------------------------------------------------------
+
+
+class BQ_OT_free_mesh_cache(bpy.types.Operator):
+    """Supprime le cache de maillage (.bqm) de la scene, sur le modele exact
+    de `BQ_OT_free_cache` (voir sa docstring) — mais ne touche PAS au cache
+    de particules (.bqd/.mat) : les deux caches sont independants (bake
+    modulaire, voir docs/plan-milestone-7.md, D1/D8)."""
+
+    bl_idname = "bq.free_mesh_cache"
+    bl_label = "Vider le cache de maillage"
+    bl_description = "Supprime le cache de maillage (.bqm) sur le disque"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return not context.scene.bourrasque.is_baking_mesh
+
+    def execute(self, context):
+        scene = context.scene
+        cache_dir = bpy.path.abspath(scene.bourrasque.cache_dir)
+        bqm_path = mesh_cache_path(cache_dir, scene.name)
+
+        # Referme le CacheReader de maillage eventuellement garde ouvert
+        # AVANT de supprimer le fichier -- meme raison que
+        # BQ_OT_free_cache (voir sa docstring / display.close_mesh_reader).
+        from . import display
+
+        display.close_mesh_reader()
+
+        removed = False
+        if os.path.isfile(bqm_path):
+            os.remove(bqm_path)
+            removed = True
+
+        scene.bourrasque.baked_mesh_frames = 0
+
+        # Vide la geometrie de maillage affichee : sans ca, la derniere
+        # frame bakee resterait affichee alors que le cache qui la
+        # sous-tend vient d'etre supprime (meme discipline que
+        # BQ_OT_free_cache/display.clear_particle_object).
+        display.clear_mesh_object()
+
+        if removed:
+            self.report({"INFO"}, "Cache de maillage vidé.")
+        else:
+            self.report({"INFO"}, "Aucun cache de maillage à vider.")
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# BQ_OT_free_whitewater_cache
+# ---------------------------------------------------------------------------
+
+
+class BQ_OT_free_whitewater_cache(bpy.types.Operator):
+    """Supprime le cache whitewater (.bqw) de la scene, sur le modele exact
+    de `BQ_OT_free_mesh_cache` (voir sa docstring) — mais ne touche PAS aux
+    caches de particules (.bqd/.mat) ni de maillage (.bqm) : les trois
+    caches sont independants (bake modulaire, voir
+    docs/plan-milestone-8.md, D8)."""
+
+    bl_idname = "bq.free_whitewater_cache"
+    bl_label = "Vider le cache de whitewater"
+    bl_description = "Supprime le cache de whitewater (.bqw) sur le disque"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return not context.scene.bourrasque.is_baking_whitewater
+
+    def execute(self, context):
+        scene = context.scene
+        cache_dir = bpy.path.abspath(scene.bourrasque.cache_dir)
+        bqw_path = whitewater_cache_path(cache_dir, scene.name)
+
+        # Referme le CacheReader de whitewater eventuellement garde ouvert
+        # AVANT de supprimer le fichier -- meme raison que BQ_OT_free_cache
+        # (voir sa docstring / display.close_whitewater_reader). Sans cet
+        # appel, vider le cache echoue avec PermissionError (WinError 32) des
+        # qu'on a scrubbe la timeline au moins une fois depuis le bake.
+        from . import display
+
+        display.close_whitewater_reader()
+
+        removed = False
+        if os.path.isfile(bqw_path):
+            os.remove(bqw_path)
+            removed = True
+
+        scene.bourrasque.baked_whitewater_frames = 0
+        scene.bourrasque.baked_whitewater_max_refused = 0
+
+        # Vide la geometrie whitewater affichee : sans ca, la derniere
+        # frame bakee resterait affichee alors que le cache qui la
+        # sous-tend vient d'etre supprime (meme discipline que
+        # BQ_OT_free_cache/BQ_OT_free_mesh_cache).
+        display.clear_whitewater_object()
+
+        if removed:
+            self.report({"INFO"}, "Cache de whitewater vidé.")
+        else:
+            self.report({"INFO"}, "Aucun cache de whitewater à vider.")
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Asset d'affichage whitewater (Geometry Nodes + materiaux) — jalon 8bis
+# ---------------------------------------------------------------------------
+#
+# Decision produit : l'add-on ne genere JAMAIS de Geometry Nodes par code
+# Python a l'execution (fragile, l'API des noeuds change entre versions de
+# Blender). Il fournit a la place un ASSET tout fait, construit une fois
+# hors-ligne (voir le script de fabrication, non embarque dans l'extension)
+# et livre dans `assets/whitewater_display.blend` : un groupe de noeuds
+# `BQ Whitewater Display` et trois materiaux (`BQ_Spray`, `BQ_Foam`,
+# `BQ_Bubble`). Cet operateur se contente de l'APPENDRE (jamais de le lier :
+# l'artiste doit pouvoir modifier librement le resultat sans dependre du
+# fichier source) sur `Bourrasque_Whitewater`, sans jamais construire de
+# noeuds lui-meme. C'est un point de depart editable, pas un rendu final.
+
+_WHITEWATER_ASSET_NODE_GROUP = "BQ Whitewater Display"
+_WHITEWATER_ASSET_FILENAME = "whitewater_display.blend"
+
+
+def _whitewater_asset_path():
+    """Chemin du .blend d'asset, relatif au fichier de l'extension — meme
+    motif que `lib._DLL_PATH` pour `bourrasque.dll`."""
+    ext_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(ext_dir, "assets", _WHITEWATER_ASSET_FILENAME)
+
+
+class BourrasqueAssetError(Exception):
+    """Erreur locale a la resolution de l'asset whitewater — jamais
+    remontee telle quelle a `self.report` (voir discipline `str(exc)`)."""
+
+
+def _whitewater_display_modifier(obj):
+    """Renvoie le modificateur Geometry Nodes de `obj` qui utilise deja le
+    groupe de noeuds `BQ Whitewater Display`, ou `None` s'il n'y en a
+    aucun — c'est ce test qui rend `BQ_OT_setup_whitewater_display`
+    idempotent (jamais de modificateur en double)."""
+    for mod in obj.modifiers:
+        if mod.type != "NODES":
+            continue
+        node_group = mod.node_group
+        if node_group is not None and node_group.name == _WHITEWATER_ASSET_NODE_GROUP:
+            return mod
+    return None
+
+
+class BQ_OT_setup_whitewater_display(bpy.types.Operator):
+    """Ajoute a `Bourrasque_Whitewater` le modificateur Geometry Nodes de
+    depart (asset livre avec l'extension, voir docstring ci-dessus).
+    Idempotent : ne fait rien de plus si le modificateur est deja present."""
+
+    bl_idname = "bq.setup_whitewater_display"
+    bl_label = "Configurer l'affichage du whitewater"
+    bl_description = (
+        "Ajoute un modificateur Geometry Nodes de depart (instances + "
+        "materiaux editables) sur l'objet whitewater"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import display
+
+        scene = context.scene
+        obj = display.ensure_whitewater_object(scene)
+
+        existing = _whitewater_display_modifier(obj)
+        if existing is not None:
+            self.report(
+                {"INFO"}, "Affichage du whitewater déjà configuré."
+            )
+            return {"FINISHED"}
+
+        asset_path = _whitewater_asset_path()
+        if not os.path.isfile(asset_path):
+            self.report(
+                {"ERROR"}, f"Asset d'affichage introuvable : {asset_path}"
+            )
+            return {"CANCELLED"}
+
+        try:
+            with bpy.data.libraries.load(asset_path, link=False) as (
+                data_from,
+                data_to,
+            ):
+                if _WHITEWATER_ASSET_NODE_GROUP not in data_from.node_groups:
+                    raise BourrasqueAssetError(
+                        f"Groupe de noeuds « {_WHITEWATER_ASSET_NODE_GROUP} » "
+                        f"absent de {asset_path}"
+                    )
+                data_to.node_groups = [_WHITEWATER_ASSET_NODE_GROUP]
+                data_to.materials = list(data_from.materials)
+        except (OSError, BourrasqueAssetError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        node_group = bpy.data.node_groups.get(_WHITEWATER_ASSET_NODE_GROUP)
+        if node_group is None:
+            self.report(
+                {"ERROR"},
+                f"Échec de l'ajout du groupe de noeuds « "
+                f"{_WHITEWATER_ASSET_NODE_GROUP} »",
+            )
+            return {"CANCELLED"}
+
+        mod = obj.modifiers.new(name="BQ Whitewater Display", type="NODES")
+        mod.node_group = node_group
+
+        self.report({"INFO"}, "Affichage du whitewater configuré.")
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Asset d'affichage volumetrique du whitewater — alternative a l'affichage
+# par instances ci-dessus
+#
+# Ihmsen et al. 2012 ("Unified Spray, Foam and Bubbles for Particle-Based
+# Fluids") ne rend JAMAIS de geometrie de particule individuelle : le nuage
+# de particules diffuses est traite comme un VOLUME implicite (densite
+# constante dans un rayon autour de chaque particule, 0 ailleurs), rendu par
+# ray-marching avec ABSORPTION de radiance uniquement — le papier "neglige
+# les effets de diffusion". Cette alternative reproduit ce principe avec des
+# noeuds NATIFS Blender plutot qu'un rendu volumetrique custom :
+# `Points to Volume` (converti le nuage en volume fog, rayon par point) +
+# `Volume Absorption` (absorption pure, sans diffusion — contrairement a
+# `Principled Volume`).
+#
+# Meme politique produit que les deux assets precedents (voir leurs
+# docstrings de section) : jamais de construction de noeuds par code Python
+# a l'execution, un asset tout fait (`assets/whitewater_display.blend`, un
+# SECOND groupe de noeuds `BQ Whitewater Volume` a cote de `BQ Whitewater
+# Display` — meme fichier, cible le meme objet `Bourrasque_Whitewater`,
+# plutot qu'un fichier separe) est APPENDU (jamais lie) par cet operateur.
+#
+# Les deux affichages COEXISTENT (decision produit) : le rendu volumetrique
+# peut etre beaucoup plus couteux en rendu (Cycles marche a travers un
+# volume dense) que l'affichage par instances, et certains artistes voudront
+# garder ce dernier pour la performance viewport ou un style different. Cet
+# operateur n'enleve jamais le modificateur de l'autre affichage — un objet
+# peut porter les deux modificateurs Geometry Nodes simultanement (l'artiste
+# choisit lequel activer/desactiver dans la pile de modificateurs).
+
+_WHITEWATER_VOLUME_NODE_GROUP = "BQ Whitewater Volume"
+
+
+def _whitewater_volume_modifier(obj):
+    """Renvoie le modificateur Geometry Nodes de `obj` qui utilise deja le
+    groupe de noeuds `BQ Whitewater Volume`, ou `None` s'il n'y en a aucun —
+    meme role que `_whitewater_display_modifier` pour l'affichage par
+    instances (idempotence de `BQ_OT_setup_whitewater_display_volume`)."""
+    for mod in obj.modifiers:
+        if mod.type != "NODES":
+            continue
+        node_group = mod.node_group
+        if node_group is not None and node_group.name == _WHITEWATER_VOLUME_NODE_GROUP:
+            return mod
+    return None
+
+
+class BQ_OT_setup_whitewater_display_volume(bpy.types.Operator):
+    """Ajoute a `Bourrasque_Whitewater` le modificateur Geometry Nodes
+    volumetrique de depart (asset livre avec l'extension, voir docstring
+    ci-dessus). Idempotent : ne fait rien de plus si le modificateur est
+    deja present. Coexiste avec `BQ_OT_setup_whitewater_display` (affichage
+    par instances) — les deux peuvent etre configures sur le meme objet."""
+
+    bl_idname = "bq.setup_whitewater_display_volume"
+    bl_label = "Configurer l'affichage volumétrique du whitewater"
+    bl_description = (
+        "Ajoute un modificateur Geometry Nodes volumetrique (Points to "
+        "Volume + Volume Absorption, sans diffusion — Ihmsen et al. 2012) "
+        "sur l'objet whitewater"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import display
+
+        scene = context.scene
+        obj = display.ensure_whitewater_object(scene)
+
+        existing = _whitewater_volume_modifier(obj)
+        if existing is not None:
+            self.report(
+                {"INFO"}, "Affichage volumétrique du whitewater déjà configuré."
+            )
+            return {"FINISHED"}
+
+        asset_path = _whitewater_asset_path()
+        if not os.path.isfile(asset_path):
+            self.report(
+                {"ERROR"}, f"Asset d'affichage introuvable : {asset_path}"
+            )
+            return {"CANCELLED"}
+
+        try:
+            with bpy.data.libraries.load(asset_path, link=False) as (
+                data_from,
+                data_to,
+            ):
+                if _WHITEWATER_VOLUME_NODE_GROUP not in data_from.node_groups:
+                    raise BourrasqueAssetError(
+                        f"Groupe de noeuds « {_WHITEWATER_VOLUME_NODE_GROUP} » "
+                        f"absent de {asset_path}"
+                    )
+                data_to.node_groups = [_WHITEWATER_VOLUME_NODE_GROUP]
+                data_to.materials = list(data_from.materials)
+        except (OSError, BourrasqueAssetError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        node_group = bpy.data.node_groups.get(_WHITEWATER_VOLUME_NODE_GROUP)
+        if node_group is None:
+            self.report(
+                {"ERROR"},
+                f"Échec de l'ajout du groupe de noeuds « "
+                f"{_WHITEWATER_VOLUME_NODE_GROUP} »",
+            )
+            return {"CANCELLED"}
+
+        mod = obj.modifiers.new(name="BQ Whitewater Volume", type="NODES")
+        mod.node_group = node_group
+
+        self.report({"INFO"}, "Affichage volumétrique du whitewater configuré.")
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Asset d'affichage du maillage fluide (materiau triplanaire) — jalon 14 T3
+# ---------------------------------------------------------------------------
+#
+# Meme politique produit que l'asset whitewater ci-dessus (voir sa docstring
+# de section) : l'add-on ne genere JAMAIS de noeuds de shader par code
+# Python a l'execution. Il fournit a la place un ASSET tout fait, construit
+# une fois hors-ligne (voir le script de fabrication, non embarque dans
+# l'extension) et livre dans `assets/fluid_display.blend` : un materiau
+# `BQ_Fluid` a mapping TRIPLANAIRE (coordonnees Object du noeud Texture
+# Coordinate — pas Generated, qui est recalcule depuis la bounding box du
+# mesh a chaque frame et ferait "nager" la texture puisque cette bounding
+# box change de forme/taille a chaque pas de simulation, cf. docs/plan-
+# milestone-14.md D2). Necessaire car `Bourrasque_Mesh` est entierement
+# reconstruit (marching cubes) a chaque frame : aucun UV stable n'a de sens
+# ici. Cet operateur se contente d'APPENDRE le materiau (jamais de le lier)
+# sur `Bourrasque_Mesh`, sans jamais construire de noeuds lui-meme. C'est un
+# point de depart editable (texture Checker de demonstration), pas un rendu
+# final.
+
+_FLUID_ASSET_MATERIAL = "BQ_Fluid"
+_FLUID_ASSET_FILENAME = "fluid_display.blend"
+
+
+def _fluid_asset_path():
+    """Chemin du .blend d'asset, relatif au fichier de l'extension — meme
+    motif que `_whitewater_asset_path` / `lib._DLL_PATH`."""
+    ext_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(ext_dir, "assets", _FLUID_ASSET_FILENAME)
+
+
+def _fluid_display_material(obj):
+    """Renvoie le materiau `BQ_Fluid` deja assigne a un slot de `obj`, ou
+    `None` s'il n'y en a aucun — c'est ce test qui rend
+    `BQ_OT_setup_fluid_display` idempotent (jamais de slot en double)."""
+    for mat in obj.data.materials:
+        if mat is not None and mat.name == _FLUID_ASSET_MATERIAL:
+            return mat
+    return None
+
+
+class BQ_OT_setup_fluid_display(bpy.types.Operator):
+    """Assigne a `Bourrasque_Mesh` le materiau triplanaire de depart (asset
+    livre avec l'extension, voir docstring ci-dessus). Idempotent : ne fait
+    rien de plus si le materiau est deja assigne."""
+
+    bl_idname = "bq.setup_fluid_display"
+    bl_label = "Configurer l'affichage du maillage"
+    bl_description = (
+        "Assigne un materiau triplanaire de depart (sans UV, editable) sur "
+        "l'objet maillage fluide"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import display
+
+        scene = context.scene
+        obj = display.ensure_mesh_object(scene)
+
+        existing = _fluid_display_material(obj)
+        if existing is not None:
+            self.report({"INFO"}, "Affichage du maillage déjà configuré.")
+            return {"FINISHED"}
+
+        asset_path = _fluid_asset_path()
+        if not os.path.isfile(asset_path):
+            self.report(
+                {"ERROR"}, f"Asset d'affichage introuvable : {asset_path}"
+            )
+            return {"CANCELLED"}
+
+        try:
+            with bpy.data.libraries.load(asset_path, link=False) as (
+                data_from,
+                data_to,
+            ):
+                if _FLUID_ASSET_MATERIAL not in data_from.materials:
+                    raise BourrasqueAssetError(
+                        f"Materiau « {_FLUID_ASSET_MATERIAL} » "
+                        f"absent de {asset_path}"
+                    )
+                data_to.materials = [_FLUID_ASSET_MATERIAL]
+        except (OSError, BourrasqueAssetError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        material = bpy.data.materials.get(_FLUID_ASSET_MATERIAL)
+        if material is None:
+            self.report(
+                {"ERROR"},
+                f"Échec de l'ajout du materiau « {_FLUID_ASSET_MATERIAL} »",
+            )
+            return {"CANCELLED"}
+
+        obj.data.materials.append(material)
+
+        self.report({"INFO"}, "Affichage du maillage configuré.")
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Bake en thread (D10) — objet de progression partage, et fonctions PURES
+# (aucun bpy) reutilisees par le thread de calcul de BQ_OT_bake ET par les
+# methodes d'instance historiques (compatibilite des scripts de
+# tools/repro/*.py, qui les invoquent via `types.MethodType` sur un faux
+# operateur — voir leurs docstrings). Les methodes d'instance
+# (`BQ_OT_bake._emit_inflow_sites`, `BQ_OT_bake._update_colliders`) restent
+# donc en place, mais deleguent desormais a ces fonctions pures plutot que
+# de dupliquer leur logique.
+# ---------------------------------------------------------------------------
+
+
+class _BakeProgress:
+    """Etat partage entre un thread de calcul de bake et le tick modal qui
+    le sonde (docs/plan-milestone-7.md, D10).
+
+    Seul le THREAD DE CALCUL ecrit `frame_index`/`done`/`error` et empile
+    dans `reports` ; seul le TICK MODAL (thread principal) les lit et
+    draine `reports` pour transformer chaque message en un vrai
+    `self.report()` bpy — jamais l'inverse. Ces lectures/ecritures
+    d'attributs simples (int, bool, str) sont atomiques sous le GIL,
+    aucun verrou n'est necessaire pour elles ; `reports` est une
+    `queue.Queue`, deja thread-safe par construction.
+    """
+
+    __slots__ = ("frame_index", "done", "error", "reports", "max_refused")
+
+    def __init__(self):
+        self.frame_index = 0
+        self.done = False
+        self.error = None
+        self.reports = queue.Queue()
+        # Uniquement rempli par `_whitewater_bake_worker` (voir sa
+        # docstring) : maximum de `Whitewater.last_refused()` observe sur
+        # toute la duree du bake whitewater. Inerte (reste a 0) pour les
+        # bakes de particules/maillage, qui ne l'ecrivent jamais.
+        self.max_refused = 0
+
+
+def _emit_inflow_sites_impl(sim, inflow_states, usable_bounds, frame_index,
+                             frame_dt, saturated, report):
+    """Emet, pour chaque emetteur INFLOW, les sites de son nuage complet
+    (`state.sites`, FIXE, voir `_InflowState`) qui ne sont pas deja occupes
+    par une particule existante — ensemencement volumique avec test
+    d'occupation (voir docstring de module).
+
+    Fonction PURE (aucun bpy) : `sim` n'est sollicite que par ses appels
+    ctypes (`read_positions`/`emit_points_vel`), et `report` est un simple
+    callable `report(level, message)` — `self.report` bpy quand appele
+    depuis `BQ_OT_bake._emit_inflow_sites` (thread principal), ou un
+    depot dans une `queue.Queue` quand appele depuis le thread de calcul
+    (`_bake_worker`), jamais un appel bpy direct. C'est ce qui rend cette
+    fonction appelable indifferemment des deux contextes.
+
+    Pour chaque emetteur : filtre les particules courantes (lues UNE fois
+    pour tous les emetteurs, avant le `step` de cette frame) a celles
+    tombant dans la bbox du nuage de sites (filtre vectorise numpy, c'est
+    ce qui rend l'operation peu couteuse), convertit ces positions
+    retenues en indices de site du reseau (arrondi au site le plus
+    proche), et emet un point a chaque site du nuage dont l'indice
+    n'apparait pas parmi ces occupants — SOUS RESERVE du plafond de
+    conservation du nombre ci-dessous. Le volume de l'emetteur reste ainsi
+    sature en permanence : le fluide en sort a la vitesse `v` (constante,
+    celle de l'emetteur — les sites sont au niveau de l'emetteur, ou la
+    vitesse du fluide est `v`), les sites se liberent au rythme voulu, le
+    debit s'auto-regule sans accumulateur.
+
+    Plafond par CONSERVATION DU NOMBRE : le nombre de sites libres n'est
+    PAS a lui seul un plafond fiable des lors que le jitter positionnel ou
+    le bruit de turbulence sont actifs. Un bruit spatialement coherent
+    (`_CurlNoise`) deplace des BLOCS entiers de particules dans la meme
+    direction, ce qui cree simultanement des sites vides (le bloc s'en est
+    eloigne — reemis, on GAGNE des particules) et des sites occupes par
+    deux particules ou plus (deux particules arrondissent au meme site —
+    rien n'est retire, on ne PERD rien). Le bilan naif est donc
+    structurellement positif : sans correction, le debit derive vers le
+    haut avec la turbulence, alors que les deux reglages doivent rester
+    orthogonaux pour l'artiste. On calcule donc `deficit = max(0, n_sites
+    - n_occupants)` (le nombre de particules manquantes pour saturer
+    exactement le nuage) et on n'emet jamais plus de `deficit` particules :
+    si les sites libres sont plus nombreux que `deficit`, `deficit` d'entre
+    eux sont tires AU HASARD (jamais un prefixe, qui biaiserait
+    spatialement l'emission vers un coin de l'emetteur — les sites sont
+    ranges dans un ordre de reseau), via un generateur numpy DEDIE seede
+    par la meme convention que `_turbulence_rng`. A turbulence nulle,
+    aucune paire de particules n'arrondit au meme site : `deficit` egale
+    alors exactement le nombre de sites libres et le plafond ne mord
+    jamais (comportement inchange).
+
+    Un site peut tomber hors de la zone utile du domaine (pres d'une
+    paroi) : les points hors `usable_bounds` sont filtres avant l'appel,
+    comme pour un emetteur BLOCK.
+
+    Ne fait rien si la simulation est deja saturee (`saturated`). Sur le
+    premier depassement de `max_particles`, rapporte l'avertissement UNE
+    SEULE fois ; les emetteurs suivants (meme frame ou frames suivantes)
+    ne tentent plus d'emission.
+
+    Renvoie `(total, saturated)` : le nombre total de particules
+    effectivement emises pour cette frame, et le drapeau de saturation mis
+    a jour (a repasser en entree de l'appel suivant).
+    """
+    if not inflow_states or saturated:
+        return 0, saturated
+
+    usable = usable_bounds
+    # Lues UNE fois pour tous les emetteurs de cette frame : c'est l'etat
+    # de la simulation AVANT l'emission de cette frame (les sites qui
+    # viennent d'etre liberes par le mouvement des particules depuis la
+    # frame precedente).
+    positions = sim.read_positions()
+
+    total = 0
+    for state in inflow_states:
+        if saturated:
+            break
+
+        spacing = state.spacing
+        sites = state.sites
+        if sites.shape[0] == 0:
+            continue
+
+        lo = sites.min(axis=0) - spacing / 2.0
+        hi = sites.max(axis=0) + spacing / 2.0
+
+        if positions.shape[0] > 0:
+            in_bbox = np.all((positions >= lo) & (positions <= hi), axis=1)
+            occupants = positions[in_bbox]
+        else:
+            occupants = positions
+
+        site_idx = _site_indices(sites, spacing)
+        if occupants.shape[0] > 0:
+            occ_idx = _site_indices(occupants, spacing)
+            free_mask = ~np.isin(_void_rows(site_idx), _void_rows(occ_idx))
+        else:
+            free_mask = np.ones(sites.shape[0], dtype=bool)
+
+        n_sites = sites.shape[0]
+        n_occupants = occupants.shape[0]
+        deficit = max(0, n_sites - n_occupants)
+
+        free_idx = np.nonzero(free_mask)[0]
+        if free_idx.shape[0] > deficit:
+            select_rng = _turbulence_rng(
+                state.turbulence_seed, frame_index, state.emitter_index
+            )
+            free_idx = select_rng.choice(free_idx, size=deficit, replace=False)
+
+        pts = sites[free_idx]
+        if pts.shape[0] == 0:
+            continue
+
+        rng = _turbulence_rng(
+            state.turbulence_seed, frame_index, state.emitter_index
+        )
+        t = frame_index * frame_dt
+        pts, vels = _turbulent_emission(
+            pts, state.vel, state.turbulence, spacing, frame_dt,
+            rng, state.dx, t, state.noise,
+        )
+
+        if usable is not None:
+            ulo = np.asarray(usable[0], dtype=np.float64)
+            uhi = np.asarray(usable[1], dtype=np.float64)
+            tol = 1e-6 * state.dx
+            mask = np.all((pts >= ulo - tol) & (pts <= uhi + tol), axis=1)
+            pts = pts[mask]
+            vels = vels[mask]
+        if pts.shape[0] == 0:
+            continue
+
+        try:
+            total += sim.emit_points_vel(state.mat_id, pts, vels)
+        except lib.BourrasqueError as exc:
+            msg = str(exc)
+            if "capacite depassee" in msg:
+                saturated = True
+                report(
+                    {"WARNING"},
+                    "Capacité maximale de particules atteinte : "
+                    "l'émission continue (inflow) est arrêtée, la "
+                    "simulation se poursuit jusqu'à la fin du bake avec "
+                    "les particules déjà émises.",
+                )
+            else:
+                report(
+                    {"WARNING"},
+                    f"« {state.name} » : émission refusée par le "
+                    f"solveur pour cette frame ({msg}). L'inflow "
+                    "continue aux frames suivantes.",
+                )
+    return total, saturated
+
+
+def _collect_collider_frame(collider_states, depsgraph, origin, size,
+                             frame_dt, report):
+    """Triangles/vitesses/frictions concatenes de tous les colliders de
+    `collider_states`, EVALUES au `depsgraph` fourni — fonction PURE (aucun
+    bpy au-dela de `depsgraph`/`state.obj.evaluated_get`, deja resolus par
+    l'appelant) reutilisee par :
+
+    - `BQ_OT_bake._update_colliders` (thread principal, une frame a la
+      fois, pendant la boucle modale historique/les scripts de
+      tools/repro/*.py) ;
+    - `BQ_OT_bake.invoke` (thread principal aussi, mais en PRE-EXTRACTION :
+      TOUTES les frames du bake sont calculees ici, avant de lancer le
+      thread de calcul — voir docs/plan-milestone-7.md D10 et la docstring
+      de module. Les colliders animes exigent le depsgraph bpy a chaque
+      frame, qui ne peut donc jamais etre lu depuis le thread de calcul).
+
+    Positions : converties monde -> solveur via `world_to_solver_array`
+    (AVEC translation). Vitesse par sommet : difference finie MONDE
+    convertie via `world_to_solver_dir_array` (SANS translation) — ne
+    jamais confondre les deux, voir docstring de module sur les colliders
+    animes. Nulle a la premiere frame d'un collider, ou si son nombre de
+    sommets a change depuis la frame precedente (topologie non appariable,
+    voir `_ColliderState`). Mute `state.prev_verts_world`/
+    `state.warned_topology` EN PLACE (etat persistant entre deux appels
+    successifs, une frame apres l'autre).
+
+    `report` : callable `report(level, message)`, jamais un appel bpy
+    direct fait par cette fonction — voir `_emit_inflow_sites_impl` pour la
+    meme convention.
+
+    Renvoie `(tri_all, vel_all, fric_all)`, trois ndarray (potentiellement
+    vides) prets pour `Sim.set_colliders`.
+    """
+    from . import sampling
+
+    tri_chunks = []
+    vel_chunks = []
+    fric_chunks = []
+
+    for state in collider_states:
+        obj_eval = state.obj.evaluated_get(depsgraph)
+        verts_world, tris = sampling.evaluated_world_mesh(obj_eval)
+        n_tri = tris.shape[0]
+        if n_tri == 0:
+            state.prev_verts_world = verts_world
+            continue
+
+        prev = state.prev_verts_world
+        topology_ok = prev is not None and prev.shape[0] == verts_world.shape[0]
+        if prev is not None and not topology_ok and not state.warned_topology:
+            report(
+                {"WARNING"},
+                f"« {state.obj.name} » : le nombre de sommets a changé "
+                "d'une frame à l'autre (remesh, modificateur variable) "
+                "— vitesse nulle pour ce collider tant que sa "
+                "topologie n'est pas stable.",
+            )
+            state.warned_topology = True
+
+        if topology_ok:
+            vel_world = (verts_world - prev) / frame_dt
+        else:
+            vel_world = np.zeros_like(verts_world)
+
+        verts_solver = world_to_solver_array(verts_world, origin, size)
+        vel_solver = world_to_solver_dir_array(vel_world)
+
+        tri_chunks.append(verts_solver[tris].astype(np.float32))
+        vel_chunks.append(vel_solver[tris].astype(np.float32))
+        fric_chunks.append(np.full(n_tri, state.friction, dtype=np.float32))
+
+        state.prev_verts_world = verts_world
+
+    if tri_chunks:
+        tri_all = np.concatenate(tri_chunks, axis=0)
+        vel_all = np.concatenate(vel_chunks, axis=0)
+        fric_all = np.concatenate(fric_chunks, axis=0)
+    else:
+        tri_all = np.empty((0, 3, 3), dtype=np.float32)
+        vel_all = np.empty((0, 3, 3), dtype=np.float32)
+        fric_all = np.empty((0,), dtype=np.float32)
+
+    return tri_all, vel_all, fric_all
+
+
+def _static_collider_triangles(collider_objs, depsgraph, origin, size):
+    """Triangles concatenes de `collider_objs`, EVALUES au `depsgraph`
+    fourni, en espace solveur — variante STATIQUE (pas de vitesse, pas
+    d'etat persistant entre appels) de `_collect_collider_frame`, reservee
+    au rognage du mailleur (`BQ_OT_bake_mesh`, docs/plan-milestone-7.md
+    D5) : le champ de distance des colliders y est construit UNE FOIS,
+    a l'etat courant de la scene, jamais reevalue par frame. Reutilise les
+    memes briques (`sampling.evaluated_world_mesh`, `world_to_solver_array`)
+    que `_collect_collider_frame` plutot que de refaire l'extraction de
+    geometrie.
+
+    Renvoie `tri_all`, un ndarray `(n_tri, 3, 3)` float32 (potentiellement
+    vide).
+    """
+    from . import sampling
+
+    tri_chunks = []
+    for obj in collider_objs:
+        obj_eval = obj.evaluated_get(depsgraph)
+        verts_world, tris = sampling.evaluated_world_mesh(obj_eval)
+        if tris.shape[0] == 0:
+            continue
+        verts_solver = world_to_solver_array(verts_world, origin, size)
+        tri_chunks.append(verts_solver[tris].astype(np.float32))
+
+    if tri_chunks:
+        return np.concatenate(tri_chunks, axis=0)
+    return np.empty((0, 3, 3), dtype=np.float32)
+
+
+def _bake_worker(progress, cancel_event, sim, writer, frame_count, frame_dt,
+                  inflow_states, usable_bounds, collider_frames):
+    """Boucle de calcul du bake de particules — executee dans un
+    `threading.Thread(daemon=True)` (voir `BQ_OT_bake.invoke`,
+    docs/plan-milestone-7.md D10).
+
+    NE TOUCHE JAMAIS bpy (voir la garde en tete de module) : uniquement
+    `sim` (appels ctypes, qui relachent le GIL — c'est ce qui rend ce
+    thread utile), `writer` (ecriture de fichier), et `progress`/
+    `cancel_event` (objets Python simples). Les colliders animes ont deja
+    ete PRE-EXTRAITS sur le thread principal avant l'appel a cette
+    fonction (`collider_frames`, une liste de `(tri, vel, fric)` par
+    frame, ou `None` si aucun collider) : c'est l'unique moyen de leur
+    faire traverser la frontiere thread, leur extraction necessitant le
+    depsgraph bpy (non thread-safe).
+
+    Toute exception est capturee et deposee dans `progress.error` (une
+    chaine, jamais l'exception elle-meme — un traceback ou un objet
+    d'exception ne doit pas etre lu depuis le thread principal sans
+    precaution) ; `progress.done` est mis a vrai dans tous les cas
+    (`finally`), y compris une annulation ou une exception, pour que le
+    tick modal cesse d'attendre.
+    """
+    try:
+        saturated = False
+        pos_buffer = None
+        vel_buffer = None
+        for frame_index in range(frame_count):
+            if cancel_event.is_set():
+                return
+            if collider_frames is not None:
+                tri_all, vel_all, fric_all = collider_frames[frame_index]
+                sim.set_colliders(tri_all, vel_all, fric_all)
+            _total, saturated = _emit_inflow_sites_impl(
+                sim, inflow_states, usable_bounds, frame_index, frame_dt,
+                saturated, lambda level, msg: progress.reports.put((level, msg)),
+            )
+            sim.step(frame_dt)
+            pos_buffer = sim.read_positions(out=pos_buffer)
+            vel_buffer = sim.read_velocities(out=vel_buffer)
+            writer.append_frame(pos_buffer, vel_buffer)
+            progress.frame_index = frame_index + 1
+    except Exception as exc:  # noqa: BLE001 — remonte au tick modal, jamais bpy ici
+        progress.error = str(exc)
+    finally:
+        progress.done = True
 
 
 # ---------------------------------------------------------------------------
@@ -819,6 +1959,22 @@ class BQ_OT_bake(bpy.types.Operator):
     # Scene visee par ce bake, memorisee dans invoke() : voir sa docstring.
     # Ne jamais lire context.scene apres invoke() dans cet operateur.
     _scene = None
+
+    # -- D10 : le calcul tourne dans un thread, le modal ne fait que sonder
+    # -- (voir la garde en tete de module et BQ_OT_bake.invoke/modal) -----
+    # Geometrie des colliders animes, PRE-EXTRAITE frame par frame sur le
+    # thread principal avant le lancement du thread de calcul (liste de
+    # `(tri, vel, fric)`, longueur `_frame_count`), ou None si aucun
+    # collider n'est configure pour ce bake — voir _collect_collider_frame.
+    _collider_frames = None
+    # Objet de progression partage (`_BakeProgress`) : ecrit par le thread
+    # de calcul, lu par le tick modal.
+    _progress = None
+    # Signale au thread de calcul qu'il doit s'arreter entre deux frames
+    # (ESC ou bouton Annuler) — jamais une interruption forcee.
+    _cancel_event = None
+    # Le thread de calcul lui-meme.
+    _thread = None
 
     @classmethod
     def poll(cls, context):
@@ -925,44 +2081,77 @@ class BQ_OT_bake(bpy.types.Operator):
         config.ppc_axis = props.ppc_axis
         config.max_particles = props.max_particles
 
-        # Deduplique les materiaux : seuls ceux effectivement portes par un
+        # Seuls les materiaux EFFECTIVEMENT UTILISES par au moins un
         # emetteur sont enregistres, sinon le pas de temps (calcule sur le
         # max de TOUS les materiaux enregistres, cf. mlsmpm.cu:319) serait
-        # penalise par des materiaux inutilises mais plus raides.
-        material_keys = []  # liste de tuples -> index dans material_specs
-        material_specs = []  # liste de dict pour lib.Sim.add_material
-        emitter_specs = []  # (obj, material_index)
+        # penalise par des materiaux inutilises mais plus raides — voir
+        # `materials.collect_used_materials`, qui porte desormais cette
+        # regle (avant cette refonte, la deduplication se faisait ici meme,
+        # par tuple de valeurs lues sur chaque emetteur).
+        library = [
+            {
+                "name": mat.name,
+                "model": mat.model,
+                "rho": mat.rho,
+                "young": mat.young,
+                "poisson": mat.poisson,
+                "bulk": mat.bulk,
+                "gamma": mat.gamma,
+            }
+            for mat in props.materials
+        ]
+        assignments = [
+            (obj.name, obj.bourrasque.material_name) for obj in emitters
+        ]
+        specs, emitter_material_index, missing = materials.collect_used_materials(
+            library, assignments
+        )
 
-        for obj in emitters:
-            op = obj.bourrasque
-            if op.model == "ELASTIC":
-                model = lib.BQ_MODEL_ELASTIC
-                key = ("ELASTIC", op.rho, op.young, op.poisson)
-                kwargs = dict(model=model, rho=op.rho, E=op.young, nu=op.poisson)
-            else:
-                model = lib.BQ_MODEL_WATER
-                key = ("WATER", op.rho, op.bulk, op.gamma)
-                kwargs = dict(model=model, rho=op.rho, bulk=op.bulk, gamma=op.gamma)
-
-            if key in material_keys:
-                mat_index = material_keys.index(key)
-            else:
-                mat_index = len(material_specs)
-                material_keys.append(key)
-                material_specs.append(kwargs)
-
-            emitter_specs.append((obj, mat_index))
-
-        if len(material_specs) > lib.BQ_MAX_MATERIALS:
+        if missing:
+            names = "; ".join(
+                f"« {emitter_name} »" for emitter_name, _material_name in missing
+            )
             self.report(
                 {"ERROR"},
-                f"{len(material_specs)} matériaux distincts sont utilisés "
-                f"par les émetteurs, mais le solveur n'en accepte que "
-                f"{lib.BQ_MAX_MATERIALS} au maximum. Réutilisez les mêmes "
-                "réglages matériau sur plusieurs émetteurs (plutôt que "
-                "« Personnalisé » avec des valeurs légèrement différentes).",
+                "Émetteur(s) sans matériau assigné (référence manquante ou "
+                f"vide) : {names}. Assignez-leur un matériau de la "
+                "bibliothèque avant de baker.",
             )
             return None
+
+        if len(specs) > lib.BQ_MAX_MATERIALS:
+            self.report(
+                {"ERROR"},
+                f"{len(specs)} matériaux distincts sont utilisés par les "
+                f"émetteurs, mais le solveur n'en accepte que "
+                f"{lib.BQ_MAX_MATERIALS} au maximum. Assignez le même "
+                "matériau de la bibliothèque à plusieurs émetteurs plutôt "
+                "que d'en utiliser un distinct par émetteur.",
+            )
+            return None
+
+        material_specs = []
+        for material in specs:
+            if material["model"] == "ELASTIC":
+                kwargs = dict(
+                    model=lib.BQ_MODEL_ELASTIC,
+                    rho=material["rho"],
+                    E=material["young"],
+                    nu=material["poisson"],
+                )
+            else:
+                kwargs = dict(
+                    model=lib.BQ_MODEL_WATER,
+                    rho=material["rho"],
+                    bulk=material["bulk"],
+                    gamma=material["gamma"],
+                )
+            material_specs.append(kwargs)
+
+        emitter_specs = [
+            (obj, mat_index)
+            for obj, mat_index in zip(emitters, emitter_material_index)
+        ]
 
         return (config, origin, size, dx, material_specs, emitter_specs)
 
@@ -1199,13 +2388,52 @@ class BQ_OT_bake(bpy.types.Operator):
             cache_dir = bpy.path.abspath(props.cache_dir)
             bqd_path, _ = cache.cache_paths(cache_dir, scene.name)
             cache.ensure_cache_dir(cache_dir)
-            self._writer = cache.CacheWriter(bqd_path, self._sim.particle_count)
+            # velocity=True : le bake whitewater (independant du mesh, cf.
+            # docs/plan-milestone-8.md D2) a besoin du canal vitesse du .bqd
+            # pour classer/advecter les particules secondaires. L'ecrire
+            # systematiquement evite un pre-requis invisible que l'artiste
+            # decouvrirait au moment d'un bake_all, bien apres avoir deja
+            # attendu le bake de particules.
+            self._writer = cache.CacheWriter(
+                bqd_path, self._sim.particle_count, velocity=True
+            )
             # Le sidecar .mat est ecrit a la FIN du bake (voir _cleanup) :
             # les ids materiaux des particules ajoutees en cours de route
             # par un emetteur INFLOW ne sont connus qu'une fois la
             # derniere frame ecrite (voir cache.py, doc du sidecar .mat).
 
             self._frame_count = props.frame_end - props.frame_start + 1
+
+            # D10 : PRE-EXTRACTION de la geometrie des colliders animes,
+            # frame par frame, ICI sur le thread PRINCIPAL — le thread de
+            # calcul lance plus bas (voir _bake_worker) ne doit plus jamais
+            # toucher bpy/le depsgraph (voir la garde en tete de module).
+            # Reutilise _advance_scene_frame (avance self._frame_index puis
+            # self._scene, evalue self._depsgraph) et _collect_collider_frame
+            # (extraction pure) telles quelles, exactement comme le faisait
+            # l'ancienne boucle modale frame par frame.
+            self._collider_frames = None
+            if self._collider_states:
+                origin, size = self._domain_transform
+                frames = []
+                for idx in range(self._frame_count):
+                    self._frame_index = idx
+                    self._advance_scene_frame()
+                    frames.append(
+                        _collect_collider_frame(
+                            self._collider_states, self._depsgraph, origin,
+                            size, self._frame_dt, self.report,
+                        )
+                    )
+                self._collider_frames = frames
+                # La pre-extraction vient de parcourir tout l'intervalle du
+                # bake : remet la scene a la frame de depart plutot que de
+                # la laisser sur la derniere frame pre-extraite pendant
+                # toute la duree du calcul en arriere-plan (_cleanup la
+                # restaurera de toute facon a la fin, mais autant eviter cet
+                # etat transitoire trompeur affiche entre-temps).
+                scene.frame_set(self._start_frame)
+
             self._frame_index = 0
             self._pos_buffer = None
 
@@ -1214,13 +2442,36 @@ class BQ_OT_bake(bpy.types.Operator):
             props.bake_progress = 0.0
             props.baked_frames = 0
 
+            # Le calcul (emission d'inflow, step, lecture des positions,
+            # ecriture cache) part dans un thread daemon : voir la garde en
+            # tete de module et docs/plan-milestone-7.md D10. Le tick modal
+            # ne fait plus que sonder `self._progress` (voir `modal`).
+            self._progress = _BakeProgress()
+            self._cancel_event = threading.Event()
+            self._thread = threading.Thread(
+                target=_bake_worker,
+                args=(
+                    self._progress, self._cancel_event, self._sim,
+                    self._writer, self._frame_count, self._frame_dt,
+                    self._inflow_states, self._usable_bounds,
+                    self._collider_frames,
+                ),
+                daemon=True,
+            )
+
             wm = context.window_manager
-            self._timer = wm.event_timer_add(1e-6, window=context.window)
+            # Intervalle de sondage, PAS le pas de calcul (qui tourne dans
+            # le thread, a sa propre vitesse) : 50 ms est trois a quatre
+            # fois sous le seuil de reactivite ESC exige (V10, < 200 ms),
+            # sans imposer au thread principal un sondage inutilement
+            # frequent pendant tout le bake.
+            self._timer = wm.event_timer_add(0.05, window=context.window)
             if not wm.modal_handler_add(self):
                 raise RuntimeError(
                     "impossible d'installer le gestionnaire modal "
                     "(wm.modal_handler_add a renvoye faux)"
                 )
+            self._thread.start()
         except lib.BourrasqueError as exc:
             self._cleanup(context)
             self.report({"ERROR"}, str(exc))
@@ -1239,235 +2490,83 @@ class BQ_OT_bake(bpy.types.Operator):
         scene = self._scene
         props = scene.bourrasque
 
+        # ESC ou le bouton Annuler ne font plus que POSITIONNER le drapeau
+        # que le thread de calcul consulte entre deux frames (jamais une
+        # interruption forcee, voir docs/plan-milestone-7.md D10) : le
+        # nettoyage effectif attend que le thread ait reellement fini
+        # (`progress.done`, plus bas) — c'est ce qui garde le viewport
+        # manipulable et ESC reactif (< 200 ms, V10) sans jamais detruire
+        # `self._sim`/`self._writer` sous les pieds du thread qui les
+        # utilise encore.
         if event.type == "ESC" or BQ_OT_bake.cancel_requested:
-            self._cleanup(context)
-            self.report({"INFO"}, "Bake annulé.")
-            return {"CANCELLED"}
+            self._cancel_event.set()
 
         if event.type != "TIMER":
             return {"PASS_THROUGH"}
 
-        try:
-            self._advance_frame()
-        except Exception as exc:
-            self._cleanup(context)
-            self.report({"ERROR"}, f"Erreur pendant le bake : {exc}")
-            return {"CANCELLED"}
+        progress = self._progress
 
-        self._frame_index += 1
+        # Seul CE tick modal (thread principal) peut appeler self.report —
+        # les messages accumules par le thread de calcul (saturation,
+        # emission refusee...) transitent par `progress.reports`, jamais
+        # par un appel bpy direct depuis le thread (voir la garde en tete
+        # de module).
+        while True:
+            try:
+                level, msg = progress.reports.get_nowait()
+            except queue.Empty:
+                break
+            self.report(level, msg)
+
+        self._frame_index = progress.frame_index
         props.baked_frames = self._frame_index
         props.bake_progress = self._frame_index / max(1, self._frame_count)
         _tag_redraw(context)
 
-        if self._frame_index >= self._frame_count:
-            self._finish(context)
-            return {"FINISHED"}
+        if not progress.done:
+            return {"RUNNING_MODAL"}
 
-        return {"RUNNING_MODAL"}
+        # Le thread a fini (normalement, par annulation, ou par exception) :
+        # `progress.done` n'est mis a vrai qu'apres son dernier geste (voir
+        # `_bake_worker`), rejoindre est donc immediat.
+        self._thread.join()
+
+        if progress.error is not None:
+            self._cleanup(context)
+            self.report({"ERROR"}, f"Erreur pendant le bake : {progress.error}")
+            return {"CANCELLED"}
+
+        if self._cancel_event.is_set():
+            self._cleanup(context)
+            self.report({"INFO"}, "Bake annulé.")
+            return {"CANCELLED"}
+
+        self._finish(context)
+        return {"FINISHED"}
 
     # -- avance d'une frame — factorise pour rester appelable directement,
     # -- sans timer ni evenement bpy (voir script de validation du jalon) -
 
     def _emit_inflow_sites(self):
-        """Emet, pour chaque emetteur INFLOW, les sites de son nuage complet
-        (`state.sites`, FIXE, voir `_InflowState`) qui ne sont pas deja
-        occupes par une particule existante — ensemencement volumique avec
-        test d'occupation (voir docstring de module).
-
-        Pour chaque emetteur : filtre les particules courantes (lues UNE
-        fois pour tous les emetteurs, avant le `step` de cette frame) a
-        celles tombant dans la bbox du nuage de sites (filtre vectorise
-        numpy, c'est ce qui rend l'operation peu couteuse), convertit ces
-        positions retenues en indices de site du reseau (arrondi au site le
-        plus proche), et emet un point a chaque site du nuage dont l'indice
-        n'apparait pas parmi ces occupants — SOUS RESERVE du plafond de
-        conservation du nombre ci-dessous. Le volume de l'emetteur reste
-        ainsi sature en permanence : le fluide en sort a la vitesse `v`
-        (constante, celle de l'emetteur — les sites sont au niveau de
-        l'emetteur, ou la vitesse du fluide est `v`), les sites se liberent
-        au rythme voulu, le debit s'auto-regule sans accumulateur.
-
-        Plafond par CONSERVATION DU NOMBRE : le nombre de sites libres
-        n'est PAS a lui seul un plafond fiable des lors que le jitter
-        positionnel ou le bruit de turbulence sont actifs. Un bruit
-        spatialement coherent (`_CurlNoise`) deplace des BLOCS entiers de
-        particules dans la meme direction, ce qui cree simultanement des
-        sites vides (le bloc s'en est eloigne — reemis, on GAGNE des
-        particules) et des sites occupes par deux particules ou plus (deux
-        particules arrondissent au meme site — rien n'est retire, on ne
-        PERD rien). Le bilan naif est donc structurellement positif : sans
-        correction, le debit derive vers le haut avec la turbulence, alors
-        que les deux reglages doivent rester orthogonaux pour l'artiste.
-        La methode calcule donc `deficit = max(0, n_sites - n_occupants)`
-        (le nombre de particules manquantes pour saturer exactement le
-        nuage) et n'emet jamais plus de `deficit` particules : si les
-        sites libres sont plus nombreux que `deficit`, `deficit` d'entre
-        eux sont tires AU HASARD (jamais un prefixe, qui biaiserait
-        spatialement l'emission vers un coin de l'emetteur — les sites
-        sont ranges dans un ordre de reseau), via un generateur numpy
-        DEDIE seede par la meme convention que `_turbulence_rng`. A
-        turbulence nulle, aucune paire de particules n'arrondit au meme
-        site : `deficit` egale alors exactement le nombre de sites libres
-        et le plafond ne mord jamais (comportement inchange).
-
-        Un site peut tomber hors de la zone utile du domaine (pres d'une
-        paroi) : les points hors `self._usable_bounds` sont filtres avant
-        l'appel, comme pour un emetteur BLOCK.
-
-        Ne fait rien si la simulation est deja saturee (`self._saturated`).
-        Sur le premier depassement de `max_particles`, positionne
-        `self._saturated` et rapporte l'avertissement UNE SEULE fois ; les
-        emetteurs suivants (meme frame ou frames suivantes) ne tentent plus
-        d'emission.
+        """Delegue a `_emit_inflow_sites_impl` (fonction PURE, aucun bpy —
+        voir sa docstring pour le detail de la regle d'emission), en lui
+        passant `self.report` comme callable de reporting. Conservee comme
+        methode d'instance UNIQUEMENT pour la compatibilite des scripts de
+        `tools/repro/*.py`, qui la lient a un faux operateur via
+        `types.MethodType` et lisent/ecrivent `self._saturated` — le thread
+        de calcul de `BQ_OT_bake` (voir `_bake_worker`) appelle
+        `_emit_inflow_sites_impl` DIRECTEMENT, jamais cette methode (qui
+        appellerait `self.report`, un acces bpy interdit hors du thread
+        principal — voir la garde en tete de module).
 
         Renvoie le nombre total de particules effectivement emises pour
-        cette frame (utile aux scripts de validation).
+        cette frame (utile aux scripts de validation) ; met a jour
+        `self._saturated` en place.
         """
-        if not self._inflow_states or self._saturated:
-            return 0
-
-        usable = self._usable_bounds
-        # Lues UNE fois pour tous les emetteurs de cette frame : c'est
-        # l'etat de la simulation AVANT l'emission de cette frame (les
-        # sites qui viennent d'etre libere par le mouvement des particules
-        # depuis la frame precedente).
-        positions = self._sim.read_positions()
-
-        total = 0
-        for state in self._inflow_states:
-            if self._saturated:
-                break
-
-            spacing = state.spacing
-            sites = state.sites
-            if sites.shape[0] == 0:
-                continue
-
-            lo = sites.min(axis=0) - spacing / 2.0
-            hi = sites.max(axis=0) + spacing / 2.0
-
-            if positions.shape[0] > 0:
-                in_bbox = np.all((positions >= lo) & (positions <= hi), axis=1)
-                occupants = positions[in_bbox]
-            else:
-                occupants = positions
-
-            site_idx = _site_indices(sites, spacing)
-            if occupants.shape[0] > 0:
-                occ_idx = _site_indices(occupants, spacing)
-                free_mask = ~np.isin(_void_rows(site_idx), _void_rows(occ_idx))
-            else:
-                free_mask = np.ones(sites.shape[0], dtype=bool)
-
-            # Plafond par CONSERVATION DU NOMBRE (voir docstring de la
-            # methode) : sans lui, un bruit spatialement coherent deplace
-            # des blocs entiers de particules dans la meme direction, ce
-            # qui cree simultanement des sites vides (reemis, on GAGNE) et
-            # des sites doublement occupes (rien n'est retire, on ne PERD
-            # rien) — bilan structurellement positif, donc sur-emission.
-            # `deficit` est le nombre de particules manquantes pour
-            # saturer exactement le nuage ; on n'emet jamais plus.
-            n_sites = sites.shape[0]
-            n_occupants = occupants.shape[0]
-            deficit = max(0, n_sites - n_occupants)
-
-            free_idx = np.nonzero(free_mask)[0]
-            if free_idx.shape[0] > deficit:
-                # Plus de sites libres que de deficit (turbulence > 0,
-                # sites doublement occupes ailleurs dans le nuage) : on en
-                # tire `deficit` AU HASARD parmi les sites libres, jamais
-                # un prefixe — les sites sont ranges dans un ordre de
-                # reseau (balayage x,y,z), en garder les premiers
-                # biaiserait spatialement l'emission vers un coin de
-                # l'emetteur. Generateur DEDIE, meme convention de graine
-                # que `_turbulence_rng` (seed emetteur + frame), jamais
-                # l'etat global de numpy (determinisme du bake).
-                select_rng = _turbulence_rng(
-                    state.turbulence_seed, self._frame_index, state.emitter_index
-                )
-                free_idx = select_rng.choice(free_idx, size=deficit, replace=False)
-
-            pts = sites[free_idx]
-            if pts.shape[0] == 0:
-                # Emetteur entierement sature (ou deficit nul) : rien a
-                # emettre.
-                continue
-
-            # Turbulence appliquee AVANT le filtrage par la zone utile : une
-            # particule jittee peut sortir de `usable` (voir docstring de
-            # `_turbulent_emission`), le filtrage doit donc porter sur les
-            # positions DEJA perturbees, pas sur les sites bruts.
-            rng = _turbulence_rng(
-                state.turbulence_seed, self._frame_index, state.emitter_index
-            )
-            # `t` : instant courant du bake, commun a toute la duree du
-            # bake (pas seulement a cet emetteur) — c'est ce qui fait
-            # deriver `state.noise` de facon coherente d'une frame a
-            # l'autre (voir `_CurlNoise`).
-            t = self._frame_index * self._frame_dt
-            pts, vels = _turbulent_emission(
-                pts, state.vel, state.turbulence, spacing, self._frame_dt,
-                rng, state.dx, t, state.noise,
-            )
-
-            if usable is not None:
-                # `domain_usable_bounds` renvoie des tuples de float Python,
-                # pas des ndarray : `tuple - float` leve TypeError des que
-                # cette branche est exercee (elle ne l'etait par aucun test
-                # existant, `self._usable_bounds` etant laisse `None` dans
-                # les scripts de validation precedents). Conversion en
-                # ndarray, seul endroit qui en a besoin pour la soustraction
-                # vectorisee ci-dessous.
-                ulo = np.asarray(usable[0], dtype=np.float64)
-                uhi = np.asarray(usable[1], dtype=np.float64)
-                # Tolerance qui absorbe la divergence float64 (ce filtre,
-                # cote Python) / float32 (la borne recalculee cote coeur a
-                # partir de `config.cell_size`, tronque a float32) sur la
-                # meme valeur de dx : ~1e-8 relatif entre les deux chemins
-                # de calcul. Sans marge, un point que Python juge tout
-                # juste dans la zone utile peut etre rejete par le coeur
-                # comme hors domaine (voir bq_last_error, `emit_particles`
-                # dans mlsmpm.cu). 1e-6 * dx est trois ordres de grandeur
-                # au-dessus de cet ecart et trois ordres en dessous de
-                # toute grandeur physique du domaine : marge negligeable,
-                # mais qui absorbe l'ecart de precision.
-                tol = 1e-6 * state.dx
-                mask = np.all((pts >= ulo - tol) & (pts <= uhi + tol), axis=1)
-                pts = pts[mask]
-                vels = vels[mask]
-            if pts.shape[0] == 0:
-                # Emetteur entierement hors de la zone utile (proche d'une
-                # paroi) : rien a emettre.
-                continue
-
-            try:
-                total += self._sim.emit_points_vel(state.mat_id, pts, vels)
-            except lib.BourrasqueError as exc:
-                # Le coeur remonte deux causes distinctes sur ce meme appel
-                # (voir emit_particles dans core/src/mlsmpm.cu) : la
-                # capacite depassee (message "capacite depassee ...") et le
-                # rejet d'un point hors domaine (message "point %d hors
-                # domaine ..."). Seule la premiere est une saturation reelle
-                # qui justifie d'arreter l'inflow pour le reste du bake ;
-                # attribuer la seconde a la premiere donnerait un
-                # diagnostic faux a l'artiste.
-                msg = str(exc)
-                if "capacite depassee" in msg:
-                    self._saturated = True
-                    self.report(
-                        {"WARNING"},
-                        "Capacité maximale de particules atteinte : "
-                        "l'émission continue (inflow) est arrêtée, la "
-                        "simulation se poursuit jusqu'à la fin du bake avec "
-                        "les particules déjà émises.",
-                    )
-                else:
-                    self.report(
-                        {"WARNING"},
-                        f"« {state.name} » : émission refusée par le "
-                        f"solveur pour cette frame ({msg}). L'inflow "
-                        "continue aux frames suivantes.",
-                    )
+        total, self._saturated = _emit_inflow_sites_impl(
+            self._sim, self._inflow_states, self._usable_bounds,
+            self._frame_index, self._frame_dt, self._saturated, self.report,
+        )
         return total
 
     def _advance_scene_frame(self):
@@ -1524,61 +2623,27 @@ class BQ_OT_bake(bpy.types.Operator):
 
         Ne fait rien si aucun collider n'est configure pour ce bake (la
         simulation cote coeur n'a jamais eu de collider a effacer).
+
+        Delegue a `_collect_collider_frame` (fonction PURE, aucun bpy au-
+        dela de `self._depsgraph` deja resolu par `_advance_scene_frame`)
+        pour l'extraction geometrique, puis applique le resultat a
+        `self._sim` — ce dernier appel EST le seul geste propre a cette
+        methode d'instance. Conservee UNIQUEMENT pour la compatibilite des
+        scripts de `tools/repro/*.py` (voir `_emit_inflow_sites` pour la
+        meme discipline) : le thread de calcul de `BQ_OT_bake` (voir
+        `_bake_worker`) n'appelle jamais cette methode, il consomme
+        directement `self._collider_frames`, PRE-EXTRAIT par
+        `_collect_collider_frame` sur le thread principal avant son
+        lancement (voir `BQ_OT_bake.invoke` et la garde en tete de module).
         """
         if not self._collider_states:
             return
 
-        from . import sampling
-
         origin, size = self._domain_transform
-
-        tri_chunks = []
-        vel_chunks = []
-        fric_chunks = []
-
-        for state in self._collider_states:
-            obj_eval = state.obj.evaluated_get(self._depsgraph)
-            verts_world, tris = sampling.evaluated_world_mesh(obj_eval)
-            n_tri = tris.shape[0]
-            if n_tri == 0:
-                state.prev_verts_world = verts_world
-                continue
-
-            prev = state.prev_verts_world
-            topology_ok = prev is not None and prev.shape[0] == verts_world.shape[0]
-            if prev is not None and not topology_ok and not state.warned_topology:
-                self.report(
-                    {"WARNING"},
-                    f"« {state.obj.name} » : le nombre de sommets a changé "
-                    "d'une frame à l'autre (remesh, modificateur variable) "
-                    "— vitesse nulle pour ce collider tant que sa "
-                    "topologie n'est pas stable.",
-                )
-                state.warned_topology = True
-
-            if topology_ok:
-                vel_world = (verts_world - prev) / self._frame_dt
-            else:
-                vel_world = np.zeros_like(verts_world)
-
-            verts_solver = world_to_solver_array(verts_world, origin, size)
-            vel_solver = world_to_solver_dir_array(vel_world)
-
-            tri_chunks.append(verts_solver[tris].astype(np.float32))
-            vel_chunks.append(vel_solver[tris].astype(np.float32))
-            fric_chunks.append(np.full(n_tri, state.friction, dtype=np.float32))
-
-            state.prev_verts_world = verts_world
-
-        if tri_chunks:
-            tri_all = np.concatenate(tri_chunks, axis=0)
-            vel_all = np.concatenate(vel_chunks, axis=0)
-            fric_all = np.concatenate(fric_chunks, axis=0)
-        else:
-            tri_all = np.empty((0, 3, 3), dtype=np.float32)
-            vel_all = np.empty((0, 3, 3), dtype=np.float32)
-            fric_all = np.empty((0,), dtype=np.float32)
-
+        tri_all, vel_all, fric_all = _collect_collider_frame(
+            self._collider_states, self._depsgraph, origin, size,
+            self._frame_dt, self.report,
+        )
         self._sim.set_colliders(tri_all, vel_all, fric_all)
 
     def _advance_frame(self):
@@ -1618,6 +2683,33 @@ class BQ_OT_bake(bpy.types.Operator):
     def _cleanup(self, context):
         scene = self._scene
         props = scene.bourrasque
+
+        # D10 : arrete et rejoint le thread de calcul AVANT de toucher a
+        # `self._sim`/`self._writer` — sur TOUT chemin qui invoque
+        # `_cleanup` pendant qu'il tourne encore (ex. `unregister()`
+        # appele pendant un bake, extension desactivee en cours de route),
+        # jamais detruire la sim GPU ou fermer le fichier sous les pieds
+        # du thread qui les utilise. `ident is not None` signifie que
+        # `start()` a bien ete appele (un thread jamais demarre ne peut
+        # pas etre `join()`) ; un timeout genereux mais fini evite de
+        # bloquer indefiniment ce filet de securite si le thread reste
+        # coince sur un appel CUDA. `getattr(..., None)` (plutot que
+        # `self._thread` direct) : cette methode reste liee par
+        # `types.MethodType` a un faux operateur minimal dans
+        # `tools/repro/verify_m6.py`, qui ne definit pas ces attributs D10
+        # (il n'exerce que le chemin synchrone historique) — absents, on
+        # les traite comme "pas de thread a nettoyer".
+        thread = getattr(self, "_thread", None)
+        if thread is not None:
+            cancel_event = getattr(self, "_cancel_event", None)
+            if cancel_event is not None:
+                cancel_event.set()
+            if thread.ident is not None:
+                thread.join(timeout=10.0)
+            self._thread = None
+        self._progress = None
+        self._cancel_event = None
+        self._collider_frames = None
 
         if self._writer is not None and self._sim is not None:
             # Le sidecar .mat est ecrit ICI, au tout dernier moment ou la
@@ -1667,6 +2759,939 @@ class BQ_OT_bake(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
+# BQ_OT_bake_mesh — operateur modal, deuxieme passe du bake modulaire
+# ---------------------------------------------------------------------------
+#
+# Lit le `.bqd` (deja bake par BQ_OT_bake) frame par frame, maille chacune
+# via `lib.Mesher`, ecrit le `.bqm` a cote — voir docs/plan-milestone-7.md,
+# D1/D7/D8. Independant de tout `BqSim` (le mailleur ne consomme que des
+# positions, cf. `lib.Mesher`) : c'est ce qui rend les deux passes du bake
+# reellement modulaires, l'une relancable sans l'autre (V6 du plan).
+#
+# Meme squelette modal que BQ_OT_bake (timer, drapeau d'annulation de
+# classe, `_cleanup` unique convergeant TOUS les chemins de sortie), en
+# nettement plus simple : pas d'emission, pas de colliders animes, pas
+# d'avance de la frame Blender (le mailleur ne depend d'aucun etat vivant de
+# la scene, seulement du `.bqd` deja sur disque).
+
+
+def _mesh_bake_worker(progress, cancel_event, reader, mesher, writer, frame_count):
+    """Boucle de calcul du bake de maillage — executee dans un
+    `threading.Thread(daemon=True)` (voir `BQ_OT_bake_mesh.invoke`,
+    docs/plan-milestone-7.md D10).
+
+    NE TOUCHE JAMAIS bpy (voir la garde en tete de module) : `reader`
+    (lecture du `.bqd`, fichier binaire pur, voir `cache.py`), `mesher`
+    (appels ctypes) et `writer` (ecriture du `.bqm`, fichier binaire pur,
+    voir `meshcache.py`) n'en dependent d'aucune facon. Contrairement au
+    bake de particules (`_bake_worker`), AUCUNE pre-extraction n'est
+    requise avant de lancer ce thread : le rognage collider, s'il y en a
+    un, est un champ STATIQUE deja construit et fourni a `mesher` avant le
+    lancement du thread (voir `BQ_OT_bake_mesh.invoke`, docs/plan-
+    milestone-7.md D5) — le mailleur ne depend plus d'aucun etat vivant de
+    la scene une fois ce thread demarre.
+
+    Meme discipline que `_bake_worker` pour `progress`/`cancel_event`/la
+    capture d'exception (voir sa docstring).
+    """
+    try:
+        for frame_index in range(frame_count):
+            if cancel_event.is_set():
+                return
+            positions = reader.read_frame(frame_index)
+            mesher.run(positions)
+            verts, tris = mesher.read()
+            writer.append_frame(verts, tris)
+            progress.frame_index = frame_index + 1
+    except Exception as exc:  # noqa: BLE001 — remonte au tick modal, jamais bpy ici
+        progress.error = str(exc)
+    finally:
+        progress.done = True
+
+
+class BQ_OT_bake_mesh(bpy.types.Operator):
+    """Bake le maillage de surface a partir du cache de particules `.bqd`
+    deja bake, frame par frame, dans un `.bqm` a cote."""
+
+    bl_idname = "bq.bake_mesh"
+    bl_label = "Baker le maillage"
+    bl_description = "Reconstruit la surface pour chaque frame déjà bakée du cache de particules"
+    bl_options = {"REGISTER"}
+
+    cancel_requested = False
+    _active_instance = None
+
+    _timer = None
+    _reader = None
+    _writer = None
+    _mesher = None
+    _frame_index = 0
+    _frame_count = 0
+    _scene = None
+
+    # -- D10 : le calcul tourne dans un thread, le modal ne fait que sonder
+    # -- (voir la garde en tete de module) ---------------------------------
+    _progress = None
+    _cancel_event = None
+    _thread = None
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.bourrasque
+        return not props.is_baking and not props.is_baking_mesh
+
+    def invoke(self, context, event):
+        self._scene = context.scene
+        scene = self._scene
+        props = scene.bourrasque
+
+        cache_dir = bpy.path.abspath(props.cache_dir)
+        bqd_path, _mat_path = cache.cache_paths(cache_dir, scene.name)
+
+        if not os.path.isfile(bqd_path):
+            self.report(
+                {"ERROR"},
+                "Aucun cache de particules (.bqd) trouvé : lancez d'abord "
+                "le bake de particules (« Lancer le bake ») avant de baker "
+                "le maillage.",
+            )
+            return {"CANCELLED"}
+
+        try:
+            self._reader = cache.CacheReader(bqd_path)
+        except (OSError, ValueError) as exc:
+            self.report(
+                {"ERROR"}, f"Impossible de lire le cache de particules : {exc}"
+            )
+            return {"CANCELLED"}
+
+        if self._reader.frame_count == 0:
+            self._reader.close()
+            self._reader = None
+            self.report(
+                {"ERROR"},
+                "Le cache de particules (.bqd) est vide (aucune frame "
+                "bakée) : rien à mailler.",
+            )
+            return {"CANCELLED"}
+
+        layout = mesh_layout(scene)
+        if layout is None:
+            self._reader.close()
+            self._reader = None
+            self.report({"ERROR"}, "Aucun domaine défini.")
+            return {"CANCELLED"}
+        res, cell_size = layout
+        if min(res) <= 0 or cell_size <= 0:
+            self._reader.close()
+            self._reader = None
+            self.report(
+                {"ERROR"},
+                "Le domaine est dégénéré (taille nulle ou négative) : "
+                "vérifiez la bounding box de l'objet domaine.",
+            )
+            return {"CANCELLED"}
+
+        # Facteurs -> valeurs absolues (ergonomie M7.1) : les reglages
+        # `mesh_*_factor` de `scene.bourrasque` sont des multiples de
+        # l'espacement inter-particules, pas des longueurs — c'est
+        # `mesh_effective_radii` qui fait cette conversion, source de
+        # verite unique (voir props.py). `layout` n'etant pas `None` ici,
+        # le domaine est defini et cet appel ne peut pas renvoyer `None`.
+        radii = mesh_effective_radii(scene)
+        influence_radius, particle_radius, collider_offset = radii
+
+        try:
+            cfg = lib.default_mesher_config()
+        except lib.BourrasqueError as exc:
+            self._reader.close()
+            self._reader = None
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        cfg.grid_res[:] = res
+        cfg.cell_size = cell_size
+        cfg.influence_radius = influence_radius
+        cfg.particle_radius = particle_radius
+        cfg.collider_offset = collider_offset
+        cfg.smoothing_iters = props.mesh_smoothing_iters
+        cfg.min_component_tris = props.mesh_min_component_tris
+        # Canal vitesse : reserve cote coeur (bq_mesher_read l'ignore encore,
+        # voir bourrasque.h) — aucun reglage artiste ne peut donc l'activer
+        # pour l'instant, cf. docs/plan-milestone-7.md D9. Le .bqm est donc
+        # toujours ecrit sans ce canal.
+        cfg.channels = 0
+
+        try:
+            self._mesher = lib.Mesher(cfg)
+        except lib.BourrasqueError as exc:
+            self._reader.close()
+            self._reader = None
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        # Rognage contre les colliders (docs/plan-milestone-7.md, D5) : le
+        # champ de distance signee des colliders est construit dES l'appel
+        # a bq_set_colliders (les kernels de champ tournent DANS cette
+        # fonction, aucun bq_step necessaire, cf. core/src/mlsmpm.cu) — une
+        # Sim LEGERE (max_particles=1, rien alloue par particule) suffit
+        # donc a le produire : meme grid_res/cell_size que le domaine (pas
+        # la resolution du champ de maillage, independante, cf.
+        # mesh_layout), triangles de colliders de la scene reutilises tels
+        # quels via `_static_collider_triangles` (memes briques que le bake
+        # de particules), champ relu par `Sim.read_sdf` (echantillonne AUX
+        # NOEUDS) et transmis SANS conversion au mailleur. S'il n'y a aucun
+        # collider dans la scene, aucune Sim n'est creee et
+        # `set_collider_sdf` n'est jamais appelee.
+        collider_objs = [
+            obj for obj in scene.objects if obj.bourrasque.role == "COLLIDER"
+        ]
+        if collider_objs:
+            try:
+                d_res, d_dx = domain_resolution(scene)
+                d_origin, d_size = domain_transform(scene)
+
+                collider_cfg = lib.default_config()
+                collider_cfg.grid_res[:] = d_res
+                collider_cfg.cell_size = d_dx
+                collider_cfg.max_particles = 1
+
+                depsgraph = context.evaluated_depsgraph_get()
+                tri_all = _static_collider_triangles(
+                    collider_objs, depsgraph, d_origin, d_size
+                )
+                n_tri = tri_all.shape[0]
+                vel_zero = np.zeros_like(tri_all)
+                fric_zero = np.zeros((n_tri,), dtype=np.float32)
+
+                with lib.Sim(collider_cfg) as collider_sim:
+                    # `bq_set_colliders` refuse de s'executer tant qu'aucun
+                    # materiau n'est enregistre (garde de mlsmpm.cu : le champ
+                    # de contact depend de la vitesse du son du materiau le
+                    # plus raide). Cette Sim ne fait JAMAIS de pas de temps —
+                    # elle n'existe que pour produire le champ de distance des
+                    # colliders — donc le materiau n'a aucune influence sur le
+                    # resultat ; il satisfait seulement la precondition.
+                    collider_sim.add_material(
+                        lib.BQ_MODEL_WATER, 1000.0, bulk=4.0e4, gamma=3.0
+                    )
+                    collider_sim.set_colliders(tri_all, vel_zero, fric_zero)
+                    collider_sdf = collider_sim.read_sdf()
+
+                self._mesher.set_collider_sdf(collider_sdf, d_res, d_dx)
+            except lib.BourrasqueError as exc:
+                self._mesher.destroy()
+                self._mesher = None
+                self._reader.close()
+                self._reader = None
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+
+        bqm_path = mesh_cache_path(cache_dir, scene.name)
+        cache.ensure_cache_dir(cache_dir)
+
+        params = meshcache.MeshProductionParams(
+            mesh_res=tuple(res),
+            cell_size=cell_size,
+            influence_radius=influence_radius,
+            particle_radius=particle_radius,
+            collider_offset=collider_offset,
+            smoothing_iters=props.mesh_smoothing_iters,
+            min_component_tris=props.mesh_min_component_tris,
+            src_frames=self._reader.frame_count,
+            src_n_max=self._reader.n_particles,
+        )
+
+        try:
+            self._writer = meshcache.MeshCacheWriter(bqm_path, params, velocity=False)
+        except OSError as exc:
+            self._mesher.destroy()
+            self._mesher = None
+            self._reader.close()
+            self._reader = None
+            self.report({"ERROR"}, f"Impossible d'écrire le cache de maillage : {exc}")
+            return {"CANCELLED"}
+
+        self._frame_count = self._reader.frame_count
+        self._frame_index = 0
+
+        BQ_OT_bake_mesh.cancel_requested = False
+        props.is_baking_mesh = True
+        props.bake_mesh_progress = 0.0
+        props.baked_mesh_frames = 0
+
+        # Le calcul (lecture d'une frame .bqd, reconstruction, ecriture
+        # .bqm) part dans un thread daemon : voir la garde en tete de
+        # module et docs/plan-milestone-7.md D10. Contrairement au bake de
+        # particules, aucune pre-extraction n'est necessaire ici : le
+        # mailleur ne depend d'aucun etat vivant de la scene (le rognage
+        # collider, s'il y en a un, est un champ STATIQUE deja construit et
+        # fourni a `self._mesher` plus haut, avant ce point) — `reader`,
+        # `mesher`, `writer` ne touchent jamais bpy.
+        self._progress = _BakeProgress()
+        self._cancel_event = threading.Event()
+        self._thread = threading.Thread(
+            target=_mesh_bake_worker,
+            args=(
+                self._progress, self._cancel_event, self._reader,
+                self._mesher, self._writer, self._frame_count,
+            ),
+            daemon=True,
+        )
+
+        wm = context.window_manager
+        # Meme intervalle de sondage que BQ_OT_bake (voir sa docstring) :
+        # sous le seuil de reactivite ESC (V10, < 200 ms) sans sonder plus
+        # souvent que necessaire.
+        self._timer = wm.event_timer_add(0.05, window=context.window)
+        if not wm.modal_handler_add(self):
+            self._cleanup(context)
+            self.report(
+                {"ERROR"},
+                "impossible d'installer le gestionnaire modal du bake de maillage",
+            )
+            return {"CANCELLED"}
+        self._thread.start()
+
+        BQ_OT_bake_mesh._active_instance = self
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        props = self._scene.bourrasque
+
+        # Meme discipline que BQ_OT_bake.modal : ESC/Annuler ne font que
+        # positionner un drapeau consulte par le thread entre deux frames,
+        # jamais une interruption forcee (docs/plan-milestone-7.md D10).
+        if event.type == "ESC" or BQ_OT_bake_mesh.cancel_requested:
+            self._cancel_event.set()
+
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+
+        progress = self._progress
+        self._frame_index = progress.frame_index
+        props.baked_mesh_frames = self._frame_index
+        props.bake_mesh_progress = self._frame_index / max(1, self._frame_count)
+        _tag_redraw(context)
+
+        if not progress.done:
+            return {"RUNNING_MODAL"}
+
+        self._thread.join()
+
+        if progress.error is not None:
+            self._cleanup(context)
+            self.report(
+                {"ERROR"}, f"Erreur pendant le bake de maillage : {progress.error}"
+            )
+            return {"CANCELLED"}
+
+        if self._cancel_event.is_set():
+            self._cleanup(context)
+            self.report({"INFO"}, "Bake de maillage annulé.")
+            return {"CANCELLED"}
+
+        self._finish(context)
+        return {"FINISHED"}
+
+    def _finish(self, context):
+        scene = self._scene
+        self._cleanup(context)
+
+        from . import display
+
+        display.refresh_mesh(scene)
+
+    def _cleanup(self, context):
+        scene = self._scene
+        props = scene.bourrasque
+
+        # Meme discipline que BQ_OT_bake._cleanup : arrete et rejoint le
+        # thread AVANT de toucher a reader/mesher/writer (voir sa
+        # docstring pour le detail du raisonnement).
+        if self._thread is not None:
+            if self._cancel_event is not None:
+                self._cancel_event.set()
+            if self._thread.ident is not None:
+                self._thread.join(timeout=10.0)
+            self._thread = None
+        self._progress = None
+        self._cancel_event = None
+
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
+
+        if self._mesher is not None:
+            self._mesher.destroy()
+            self._mesher = None
+
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+
+        wm = context.window_manager
+        if self._timer is not None:
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+
+        props.is_baking_mesh = False
+        BQ_OT_bake_mesh.cancel_requested = False
+        BQ_OT_bake_mesh._active_instance = None
+        _tag_redraw(context)
+
+
+# ---------------------------------------------------------------------------
+# BQ_OT_bake_whitewater — operateur modal, troisieme passe du bake modulaire
+# ---------------------------------------------------------------------------
+#
+# Lit le `.bqd` (deja bake par BQ_OT_bake) frame par frame et avance un
+# `lib.Whitewater` a ETAT PERSISTANT (contrairement au mailleur, PAS une
+# reconstruction sans memoire, voir docs/plan-milestone-8.md D1/D5), ecrit
+# le `.bqw` a cote. INDEPENDANT du `.bqm` : ne lit ni n'ecrit jamais le
+# maillage (D8 du plan) — `bq.bake_whitewater` ne depend que du `.bqd`.
+#
+# Meme squelette modal que BQ_OT_bake_mesh (timer, drapeau d'annulation de
+# classe, `_cleanup` unique convergeant TOUS les chemins de sortie), avec en
+# plus le respect du CONTRAT DE SEQUENTIALITE (D5) : les frames sont
+# consommees dans l'ordre CROISSANT, sans saut, par la boucle
+# `range(frame_count)` de `_whitewater_bake_worker` — l'API native ne le
+# verifie pas elle-meme (cf. bourrasque.h, risque 3 du plan).
+
+
+def _whitewater_bake_worker(progress, cancel_event, reader, ww, writer,
+                             frame_count, frame_dt):
+    """Boucle de calcul du bake whitewater — executee dans un
+    `threading.Thread(daemon=True)` (voir `BQ_OT_bake_whitewater.invoke`,
+    docs/plan-milestone-8.md D8).
+
+    NE TOUCHE JAMAIS bpy (voir la garde en tete de module) : `reader`
+    (lecture du `.bqd`, fichier binaire pur, voir `cache.py`), `ww`
+    (`lib.Whitewater`, appels ctypes) et `writer` (ecriture du `.bqw`,
+    fichier binaire pur, voir `whitewatercache.py`) n'en dependent d'aucune
+    facon.
+
+    Contrat de sequentialite STRICT (docs/plan-milestone-8.md, D5) :
+    `ww.step` doit etre appele une fois par frame, dans l'ordre CROISSANT
+    des frames du `.bqd`, sans saut ni retour arriere — c'est cette boucle
+    `range(frame_count)` qui garantit le contrat, l'API native elle-meme ne
+    le verifie pas (cf. bourrasque.h et le risque 3 du plan).
+
+    Meme discipline que `_mesh_bake_worker`/`_bake_worker` pour
+    `progress`/`cancel_event`/la capture d'exception (voir leurs
+    docstrings). `progress.max_refused` accumule le MAXIMUM de
+    `ww.last_refused()` observe sur toute la duree du bake (cf. plan,
+    risque 4 : le compte de candidates refusees doit etre remonte dans le
+    rapport de bake, pas seulement loggue) : ecrit ICI, lu par le tick
+    modal seulement une fois le thread termine, jamais lu depuis le thread
+    lui-meme.
+    """
+    try:
+        pos_buffer = None
+        vel_buffer = None
+        for frame_index in range(frame_count):
+            if cancel_event.is_set():
+                return
+            pos_buffer = reader.read_frame(frame_index, out=pos_buffer)
+            vel_buffer = reader.read_velocity(frame_index, out=vel_buffer)
+            ww.step(pos_buffer, vel_buffer, frame_dt)
+            refused = ww.last_refused()
+            if refused > progress.max_refused:
+                progress.max_refused = refused
+            pos, type_, size, age, vel = ww.read()
+            writer.append_frame(pos, type_, size, age, velocity=vel)
+            progress.frame_index = frame_index + 1
+    except Exception as exc:  # noqa: BLE001 — remonte au tick modal, jamais bpy ici
+        progress.error = str(exc)
+    finally:
+        progress.done = True
+
+
+class BQ_OT_bake_whitewater(bpy.types.Operator):
+    """Bake les particules secondaires (whitewater) a partir du cache de
+    particules `.bqd` deja bake, frame par frame, dans un `.bqw` a cote.
+
+    Independant du `.bqm` : ne lit jamais le maillage (voir docstring de
+    section)."""
+
+    bl_idname = "bq.bake_whitewater"
+    bl_label = "Baker le whitewater"
+    bl_description = (
+        "Simule les particules secondaires (écume, bulles, embruns) à "
+        "partir du cache de particules déjà baké"
+    )
+    bl_options = {"REGISTER"}
+
+    cancel_requested = False
+    _active_instance = None
+
+    _timer = None
+    _reader = None
+    _writer = None
+    _ww = None
+    _frame_index = 0
+    _frame_count = 0
+    _scene = None
+
+    # -- D10 : le calcul tourne dans un thread, le modal ne fait que sonder
+    _progress = None
+    _cancel_event = None
+    _thread = None
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.bourrasque
+        return (
+            not props.is_baking
+            and not props.is_baking_mesh
+            and not props.is_baking_whitewater
+        )
+
+    def invoke(self, context, event):
+        self._scene = context.scene
+        scene = self._scene
+        props = scene.bourrasque
+
+        cache_dir = bpy.path.abspath(props.cache_dir)
+        bqd_path, _mat_path = cache.cache_paths(cache_dir, scene.name)
+
+        if not os.path.isfile(bqd_path):
+            self.report(
+                {"ERROR"},
+                "Aucun cache de particules (.bqd) trouvé : lancez d'abord "
+                "le bake de particules (« Lancer le bake ») avant de baker "
+                "le whitewater.",
+            )
+            return {"CANCELLED"}
+
+        try:
+            self._reader = cache.CacheReader(bqd_path)
+        except (OSError, ValueError) as exc:
+            self.report(
+                {"ERROR"}, f"Impossible de lire le cache de particules : {exc}"
+            )
+            return {"CANCELLED"}
+
+        if self._reader.frame_count == 0:
+            self._reader.close()
+            self._reader = None
+            self.report(
+                {"ERROR"},
+                "Le cache de particules (.bqd) est vide (aucune frame "
+                "bakée) : rien à simuler.",
+            )
+            return {"CANCELLED"}
+
+        # Le canal vitesse du .bqd est requis (D5 de docs/plan-milestone-8.md
+        # : bq_whitewater_step attend une vitesse par particule fluide) —
+        # verifie AVANT de commencer le bake, avec un message actionnable,
+        # plutot que d'echouer sur la premiere frame.
+        if not self._reader.has_velocity:
+            self._reader.close()
+            self._reader = None
+            self.report(
+                {"ERROR"},
+                "Le bake whitewater nécessite le canal vitesse du .bqd : "
+                "rebakez les particules avec la vitesse activée.",
+            )
+            return {"CANCELLED"}
+
+        cfg = whitewater_config_from_scene(scene)
+        if cfg is None:
+            self._reader.close()
+            self._reader = None
+            self.report({"ERROR"}, "Aucun domaine défini.")
+            return {"CANCELLED"}
+
+        # Bornes de domaine (BqWhitewaterConfig.grid_res/cell_size, meme
+        # convention que BqConfig) : SANS elles, les deux champs restent a
+        # zero (ctypes les initialise a zero par defaut) et toute particule
+        # serait immediatement consideree hors domaine des le premier
+        # sous-pas — voir bourrasque.h, section whitewater.
+        d_res, d_dx = domain_resolution(scene)
+        cfg.grid_res[:] = d_res
+        cfg.cell_size = d_dx
+
+        try:
+            self._ww = lib.Whitewater(cfg)
+        except lib.BourrasqueError as exc:
+            self._reader.close()
+            self._reader = None
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        # Rognage contre les colliders (meme limitation assumee que le bake
+        # de maillage, voir BQ_OT_bake_mesh.invoke ci-dessus : collider
+        # STATIQUE, calcule UNE FOIS avant la boucle sur les frames, pas les
+        # colliders animes). S'il n'y a aucun collider dans la scene, aucune
+        # Sim n'est creee et `set_collider_sdf` n'est jamais appelee.
+        collider_objs = [
+            obj for obj in scene.objects if obj.bourrasque.role == "COLLIDER"
+        ]
+        if collider_objs:
+            try:
+                collider_cfg = lib.default_config()
+                collider_cfg.grid_res[:] = d_res
+                collider_cfg.cell_size = d_dx
+                collider_cfg.max_particles = 1
+
+                depsgraph = context.evaluated_depsgraph_get()
+                d_origin, d_size = domain_transform(scene)
+                tri_all = _static_collider_triangles(
+                    collider_objs, depsgraph, d_origin, d_size
+                )
+                n_tri = tri_all.shape[0]
+                vel_zero = np.zeros_like(tri_all)
+                fric_zero = np.zeros((n_tri,), dtype=np.float32)
+
+                with lib.Sim(collider_cfg) as collider_sim:
+                    # `bq_set_colliders` refuse de s'executer tant qu'aucun
+                    # materiau n'est enregistre (garde de mlsmpm.cu). Cette
+                    # Sim ne fait JAMAIS de pas de temps — elle n'existe que
+                    # pour produire le champ de distance des colliders — donc
+                    # le materiau n'a aucune influence sur le resultat ; il
+                    # satisfait seulement la precondition.
+                    collider_sim.add_material(
+                        lib.BQ_MODEL_WATER, 1000.0, bulk=4.0e4, gamma=3.0
+                    )
+                    collider_sim.set_colliders(tri_all, vel_zero, fric_zero)
+                    collider_sdf = collider_sim.read_sdf()
+                    collider_cnrm = collider_sim.read_cnrm()
+
+                self._ww.set_collider_sdf(collider_sdf, d_res, d_dx)
+                self._ww.set_collider_cnrm(collider_cnrm, d_res, d_dx)
+            except lib.BourrasqueError as exc:
+                self._ww.close()
+                self._ww = None
+                self._reader.close()
+                self._reader = None
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+
+        bqw_path = whitewater_cache_path(cache_dir, scene.name)
+        cache.ensure_cache_dir(cache_dir)
+
+        # Params ecrits en en-tete pour l'invalidation du cache (voir
+        # whitewatercache.py, D7 du plan) : miroir exact de `cfg` (deja
+        # construite depuis les reglages courants de la scene, voir
+        # `whitewater_config_from_scene`) plus `src_frames`/`src_n_max` du
+        # `.bqd` source.
+        params = whitewatercache.WhitewaterProductionParams(
+            influence_radius=cfg.influence_radius,
+            spawn_rate=cfg.spawn_rate,
+            ta_min=cfg.ta_min,
+            ta_max=cfg.ta_max,
+            ta_weight=cfg.ta_weight,
+            wc_min=cfg.wc_min,
+            wc_max=cfg.wc_max,
+            wc_weight=cfg.wc_weight,
+            ke_min=cfg.ke_min,
+            ke_max=cfg.ke_max,
+            ke_weight=cfg.ke_weight,
+            life_spray=cfg.life_spray,
+            life_foam=cfg.life_foam,
+            life_bubble=cfg.life_bubble,
+            drag_spray=cfg.drag_spray,
+            drag_foam=cfg.drag_foam,
+            buoyancy_bubble=cfg.buoyancy_bubble,
+            src_frames=self._reader.frame_count,
+            src_n_max=self._reader.n_particles,
+        )
+
+        try:
+            # Canal vitesse TOUJOURS active (motion blur Cycles) : la
+            # vitesse par particule secondaire est desormais calculee cote
+            # GPU (bq_whitewater_read, ABI 10) et coute peu d'espace disque
+            # supplementaire (un tiers du volume deja occupe par les
+            # positions) — pas de reglage UI pour ne pas ajouter une option
+            # de plus a gerer, contrairement au choix "reserve" fait pour le
+            # canal vitesse du .bqm (D9 de M7), qui restait non calcule cote
+            # coeur au moment de cette decision.
+            self._writer = whitewatercache.WhitewaterCacheWriter(
+                bqw_path, params, velocity=True
+            )
+        except OSError as exc:
+            self._ww.close()
+            self._ww = None
+            self._reader.close()
+            self._reader = None
+            self.report(
+                {"ERROR"}, f"Impossible d'écrire le cache de whitewater : {exc}"
+            )
+            return {"CANCELLED"}
+
+        self._frame_count = self._reader.frame_count
+        self._frame_index = 0
+
+        # fps/fps_base ensemble donnent la frequence de rendu reelle (voir
+        # BQ_OT_bake.invoke pour la meme justification).
+        frame_dt = scene.render.fps_base / scene.render.fps
+
+        BQ_OT_bake_whitewater.cancel_requested = False
+        props.is_baking_whitewater = True
+        props.bake_whitewater_progress = 0.0
+        props.baked_whitewater_frames = 0
+
+        # Le calcul (lecture d'une frame .bqd, avance du whitewater,
+        # ecriture .bqw) part dans un thread daemon : voir la garde en tete
+        # de module et docs/plan-milestone-8.md D8. `reader`, `ww`, `writer`
+        # ne touchent jamais bpy.
+        self._progress = _BakeProgress()
+        self._cancel_event = threading.Event()
+        self._thread = threading.Thread(
+            target=_whitewater_bake_worker,
+            args=(
+                self._progress, self._cancel_event, self._reader,
+                self._ww, self._writer, self._frame_count, frame_dt,
+            ),
+            daemon=True,
+        )
+
+        wm = context.window_manager
+        # Meme intervalle de sondage que BQ_OT_bake/BQ_OT_bake_mesh (voir
+        # leurs docstrings) : sous le seuil de reactivite ESC (V8, < 200 ms)
+        # sans sonder plus souvent que necessaire.
+        self._timer = wm.event_timer_add(0.05, window=context.window)
+        if not wm.modal_handler_add(self):
+            self._cleanup(context)
+            self.report(
+                {"ERROR"},
+                "impossible d'installer le gestionnaire modal du bake de whitewater",
+            )
+            return {"CANCELLED"}
+        self._thread.start()
+
+        BQ_OT_bake_whitewater._active_instance = self
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        props = self._scene.bourrasque
+
+        # Meme discipline que BQ_OT_bake_mesh.modal : ESC/Annuler ne font
+        # que positionner un drapeau consulte par le thread entre deux
+        # frames, jamais une interruption forcee (docs/plan-milestone-7.md
+        # D10, reprise ici).
+        if event.type == "ESC" or BQ_OT_bake_whitewater.cancel_requested:
+            self._cancel_event.set()
+
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+
+        progress = self._progress
+        self._frame_index = progress.frame_index
+        props.baked_whitewater_frames = self._frame_index
+        props.bake_whitewater_progress = self._frame_index / max(1, self._frame_count)
+        _tag_redraw(context)
+
+        if not progress.done:
+            return {"RUNNING_MODAL"}
+
+        self._thread.join()
+
+        if progress.error is not None:
+            self._cleanup(context)
+            self.report(
+                {"ERROR"}, f"Erreur pendant le bake de whitewater : {progress.error}"
+            )
+            return {"CANCELLED"}
+
+        if self._cancel_event.is_set():
+            self._cleanup(context)
+            self.report({"INFO"}, "Bake de whitewater annulé.")
+            return {"CANCELLED"}
+
+        self._finish(context)
+        return {"FINISHED"}
+
+    def _finish(self, context):
+        scene = self._scene
+        # Capture AVANT _cleanup (qui remet self._progress a None) : voir
+        # docstring de `_whitewater_bake_worker` sur `progress.max_refused`
+        # (cf. plan, risque 4).
+        max_refused = self._progress.max_refused if self._progress is not None else 0
+        self._cleanup(context)
+        scene.bourrasque.baked_whitewater_max_refused = max_refused
+
+        from . import display
+
+        display.refresh_whitewater(scene)
+
+    def _cleanup(self, context):
+        scene = self._scene
+        props = scene.bourrasque
+
+        # Meme discipline que BQ_OT_bake_mesh._cleanup : arrete et rejoint
+        # le thread AVANT de toucher a reader/ww/writer (voir sa docstring
+        # pour le detail du raisonnement).
+        if self._thread is not None:
+            if self._cancel_event is not None:
+                self._cancel_event.set()
+            if self._thread.ident is not None:
+                self._thread.join(timeout=10.0)
+            self._thread = None
+        self._progress = None
+        self._cancel_event = None
+
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
+
+        if self._ww is not None:
+            self._ww.close()
+            self._ww = None
+
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+
+        wm = context.window_manager
+        if self._timer is not None:
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+
+        props.is_baking_whitewater = False
+        BQ_OT_bake_whitewater.cancel_requested = False
+        BQ_OT_bake_whitewater._active_instance = None
+        _tag_redraw(context)
+
+
+# ---------------------------------------------------------------------------
+# BQ_OT_bake_all — enchaine bq.bake puis bq.bake_mesh, sans dupliquer
+# ---------------------------------------------------------------------------
+#
+# N'implemente AUCUNE logique de simulation, de maillage ou de whitewater
+# propre : ce n'est qu'un chef d'orchestre modal qui invoque `bq.bake` puis,
+# une fois qu'il a reellement termine (toutes les frames demandees, pas une
+# annulation ou une erreur), `bq.bake_mesh`, puis `bq.bake_whitewater` —
+# chacun restant un operateur modal complet, avec son propre timer et sa
+# propre gestion d'annulation (ESC atteint directement l'operateur modal le
+# plus recemment enregistre, donc la passe en cours, sans code
+# supplementaire ici). Voir docs/plan-milestone-7.md, D8, et
+# docs/plan-milestone-8.md, D8 (le whitewater est independant du mesh :
+# `bq.bake_whitewater` seul ne lit que le `.bqd`, mais `bq.bake_all` enchaine
+# quand meme les trois passes dans l'ordre).
+
+
+class BQ_OT_bake_all(bpy.types.Operator):
+    """Lance le bake des particules, puis, une fois terminé, celui du
+    maillage, puis celui du whitewater — sans dupliquer la logique des
+    trois passes (voir docstring de section)."""
+
+    bl_idname = "bq.bake_all"
+    bl_label = "Tout baker"
+    bl_description = (
+        "Lance le bake des particules puis, à sa fin, le bake du maillage "
+        "et du whitewater"
+    )
+    bl_options = {"REGISTER"}
+
+    _phase = "PARTICLES"
+    _timer = None
+    _scene = None
+    _particle_target = 0
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.bourrasque
+        return (
+            not props.is_baking
+            and not props.is_baking_mesh
+            and not props.is_baking_whitewater
+        )
+
+    def invoke(self, context, event):
+        self._scene = context.scene
+        scene = self._scene
+        props = scene.bourrasque
+
+        # Cible de succes de la passe particules : meme calcul que
+        # `BQ_OT_bake.invoke` (voir `_frame_count` la-bas), pour distinguer
+        # une passe terminee normalement d'une annulation/erreur (ou
+        # `baked_frames` reste en-deca) une fois `is_baking` retombe a faux.
+        self._particle_target = max(0, props.frame_end - props.frame_start + 1)
+
+        result = bpy.ops.bq.bake("INVOKE_DEFAULT")
+        if "RUNNING_MODAL" not in result:
+            # bq.bake a refuse des l'invocation (validation) : deja rapporte
+            # par son propre self.report, rien de plus a ajouter.
+            return {"CANCELLED"}
+
+        self._phase = "PARTICLES"
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(0.05, window=context.window)
+        wm.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+
+        props = self._scene.bourrasque
+
+        if self._phase == "PARTICLES":
+            if props.is_baking:
+                return {"RUNNING_MODAL"}
+            # bq.bake vient de rendre la main (fin normale, annulation ou
+            # erreur, toutes convergees par BQ_OT_bake._cleanup).
+            if props.baked_frames < self._particle_target:
+                self._cleanup(context)
+                self.report(
+                    {"WARNING"},
+                    "Bake de particules interrompu : le bake de maillage "
+                    "n'a pas été lancé.",
+                )
+                return {"CANCELLED"}
+
+            result = bpy.ops.bq.bake_mesh("INVOKE_DEFAULT")
+            if "RUNNING_MODAL" not in result:
+                self._cleanup(context)
+                self.report(
+                    {"WARNING"},
+                    "Bake de particules terminé, mais le bake de maillage "
+                    "n'a pas pu démarrer (voir le message précédent).",
+                )
+                return {"CANCELLED"}
+
+            self._phase = "MESH"
+            return {"RUNNING_MODAL"}
+
+        if self._phase == "MESH":
+            if props.is_baking_mesh:
+                return {"RUNNING_MODAL"}
+            # bq.bake_mesh vient de rendre la main (fin normale, annulation
+            # ou erreur, toutes convergees par BQ_OT_bake_mesh._cleanup) :
+            # lance la troisieme passe quel que soit l'issue du maillage —
+            # le whitewater est INDEPENDANT du mesh (docs/plan-milestone-8.md,
+            # D8) et ne lit que le `.bqd`, deja disponible a ce stade.
+
+            result = bpy.ops.bq.bake_whitewater("INVOKE_DEFAULT")
+            if "RUNNING_MODAL" not in result:
+                self._cleanup(context)
+                self.report(
+                    {"WARNING"},
+                    "Bake de maillage terminé, mais le bake de whitewater "
+                    "n'a pas pu démarrer (voir le message précédent).",
+                )
+                return {"CANCELLED"}
+
+            self._phase = "WHITEWATER"
+            return {"RUNNING_MODAL"}
+
+        # phase WHITEWATER
+        if props.is_baking_whitewater:
+            return {"RUNNING_MODAL"}
+
+        self._cleanup(context)
+        return {"FINISHED"}
+
+    def _cleanup(self, context):
+        wm = context.window_manager
+        if self._timer is not None:
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+
+
+# ---------------------------------------------------------------------------
 # Enregistrement
 # ---------------------------------------------------------------------------
 
@@ -1675,23 +3700,38 @@ classes = (
     BQ_OT_add_emitter,
     BQ_OT_add_collider,
     BQ_OT_remove_element,
+    BQ_OT_material_add,
+    BQ_OT_material_remove,
+    BQ_OT_material_duplicate,
+    BQ_OT_migrate_materials,
     BQ_OT_bake,
     BQ_OT_cancel_bake,
     BQ_OT_free_cache,
+    BQ_OT_free_mesh_cache,
+    BQ_OT_bake_mesh,
+    BQ_OT_free_whitewater_cache,
+    BQ_OT_bake_whitewater,
+    BQ_OT_bake_all,
+    BQ_OT_setup_whitewater_display,
+    BQ_OT_setup_whitewater_display_volume,
+    BQ_OT_setup_fluid_display,
 )
 
 
 # Filet de securite : un crash pendant un bake precedent (ou un .blend
 # sauvegarde alors qu'un bake etait en cours) peut laisser `is_baking = True`
-# fige sur une scene, sans instance modale pour la reinitialiser
-# (BQ_OT_bake._active_instance ne survit pas a un redemarrage de Blender).
-# Sans ce reset, le bouton Baker resterait grise indefiniment, sans recours
-# possible depuis l'UI.
+# (ou `is_baking_mesh = True`) fige sur une scene, sans instance modale pour
+# la reinitialiser (BQ_OT_bake._active_instance / BQ_OT_bake_mesh._active_
+# instance ne survivent pas a un redemarrage de Blender). Sans ce reset, le
+# bouton Baker (ou Baker le maillage) resterait grise indefiniment, sans
+# recours possible depuis l'UI.
 @bpy.app.handlers.persistent
 def _bq_reset_baking_flags(*_args):
     for scene in bpy.data.scenes:
         try:
             scene.bourrasque.is_baking = False
+            scene.bourrasque.is_baking_mesh = False
+            scene.bourrasque.is_baking_whitewater = False
         except AttributeError:
             pass  # props.py pas encore enregistre
 
@@ -1738,6 +3778,22 @@ def unregister():
         except Exception:
             pass
         BQ_OT_bake._active_instance = None
+
+    active_mesh = BQ_OT_bake_mesh._active_instance
+    if active_mesh is not None:
+        try:
+            active_mesh._cleanup(bpy.context)
+        except Exception:
+            pass
+        BQ_OT_bake_mesh._active_instance = None
+
+    active_whitewater = BQ_OT_bake_whitewater._active_instance
+    if active_whitewater is not None:
+        try:
+            active_whitewater._cleanup(bpy.context)
+        except Exception:
+            pass
+        BQ_OT_bake_whitewater._active_instance = None
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

@@ -6,8 +6,8 @@ dehors de Blender (voir `extension/tests/test_cache.py`, executable avec
 
 Format `.bqd` — SPECIFICATION DE REFERENCE cote Python.
 
-Il existe DEUX versions du format, toutes deux tout en little-endian
-EXPLICITE (`<`, jamais l'ordre natif) :
+Il existe TROIS versions du format, toutes en little-endian EXPLICITE
+(`<`, jamais l'ordre natif) :
 
 v1 — format historique, a compte de particules FIXE. Produit par
 `core/headless/main.cpp` (C++) et relu par `scripts/view_dump.py`. Cette
@@ -49,7 +49,42 @@ n'importe quelle frame sans relecture sequentielle.
     frame arbitraire au scrub de la timeline reste en O(1) via la table
     d'index (un seek, jamais de relecture sequentielle depuis le debut).
 
-Dans les deux versions :
+v3 — format courant, ecrit par `CacheWriter`. Identique a v2 (compte de
+particules variable par frame, table d'index en fin de fichier) mais avec un
+champ de bits `canaux` en en-tete, qui declare quelles donnees additionnelles
+accompagnent chaque frame. Un seul canal existe pour l'instant : la vitesse
+par particule (`CHANNEL_VELOCITY = 1 << 0`), necessaire au motion blur du
+maillage (voir `extension/meshcache.py`). Le canal est desactive par defaut :
+un v3 sans vitesse a exactement le meme contenu de frame qu'un v2 equivalent
+(seul l'en-tete gagne le champ `canaux`, 4 octets).
+
+    fichier.bqd (v3) :
+        4 octets   "BQD3"      magie
+        int32      version     = 3
+        int32      frames      nombre de frames (reecrit a la fermeture)
+        int32      n_max       nombre de particules a la DERNIERE frame
+                                (reecrit a la fermeture)
+        int32      canaux      champ de bits ; 1<<0 = VITESSE
+        int64      index_off   offset absolu de la table d'index (reecrit
+                                a la fermeture)
+        -- repete `frames` fois, dans l'ordre --
+        int32      count       nombre de particules de cette frame
+        count*3    float32     positions (x, y, z) par particule
+        [si canal VITESSE] count*3 float32   vitesses (vx, vy, vz) par
+                                              particule, meme ordre que les
+                                              positions
+        -- a l'offset index_off --
+        frames * int64         offset absolu du DEBUT de chaque frame (celui
+                                du champ `count`), dans l'ordre des frames
+
+`CacheReader` lit indifferemment v1, v2 et v3. `CacheWriter` n'ecrit
+desormais que du v3 ; le canal vitesse se declare a l'ouverture
+(`CacheWriter(path, velocity=True)`) et `append_frame` prend alors un
+argument de vitesses obligatoire (erreur explicite sinon, dans les deux
+sens : vitesses fournies sans canal declare, ou canal declare sans vitesses
+fournies).
+
+Dans toutes les versions :
 
     fichier.mat (sidecar, meme chemin que le .bqd avec l'extension
                  remplacee par `.mat`, optionnel) :
@@ -92,14 +127,25 @@ import numpy as np
 _V1_HEADER_STRUCT = struct.Struct("<ii")  # n (int32), frames (int32)
 _V1_HEADER_SIZE = _V1_HEADER_STRUCT.size  # 8
 
-# --- v2 (lecture + ecriture) -------------------------------------------
-_MAGIC = b"BQD2"
+# --- v2 (lecture seule) -------------------------------------------------
+_MAGIC_V2 = b"BQD2"
 _V2_VERSION = 2
 # magic(4s) version(i) frames(i) n_max(i) index_off(q)
 _V2_HEADER_STRUCT = struct.Struct("<4siiiq")
 _V2_HEADER_SIZE = _V2_HEADER_STRUCT.size  # 24
-_V2_FRAME_COUNT_STRUCT = struct.Struct("<i")  # count (int32) en tete de frame
-_V2_INDEX_ENTRY_STRUCT = struct.Struct("<q")  # int64 par entree de la table
+
+# --- v3 (lecture + ecriture) ---------------------------------------------
+_MAGIC_V3 = b"BQD3"
+_V3_VERSION = 3
+# magic(4s) version(i) frames(i) n_max(i) canaux(i) index_off(q)
+_V3_HEADER_STRUCT = struct.Struct("<4siiiiq")
+_V3_HEADER_SIZE = _V3_HEADER_STRUCT.size  # 28
+
+CHANNEL_VELOCITY = 1 << 0
+
+# communs aux formats v2 et v3 (meme disposition de frame et d'index)
+_FRAME_COUNT_STRUCT = struct.Struct("<i")  # count (int32) en tete de frame
+_INDEX_ENTRY_STRUCT = struct.Struct("<q")  # int64 par entree de la table
 
 _BYTES_PER_PARTICLE = 3 * 4  # 3 float32 par particule et par frame
 
@@ -137,8 +183,8 @@ def _mat_path_for(bqd_path):
 
 
 class CacheWriter:
-    """Ecrit un fichier `.bqd` frame par frame, au format v2 (compte de
-    particules variable par frame).
+    """Ecrit un fichier `.bqd` frame par frame, au format v3 (compte de
+    particules variable par frame, canal vitesse optionnel).
 
     Le nombre total de frames n'est pas connu a l'ouverture (le bake est
     modal et interruptible par l'artiste) : un header provisoire
@@ -155,9 +201,15 @@ class CacheWriter:
     le fichier reste relisible — avec une table d'index coherente portant
     uniquement sur les frames effectivement ecrites — meme si le bake est
     annule en cours de route.
+
+    `velocity=True` declare le canal vitesse a l'ouverture : `append_frame`
+    exige alors un argument de vitesses a chaque appel. Le canal est
+    desactive par defaut, et dans ce cas un fichier v3 a un contenu de
+    frame identique octet pour octet a un v2 equivalent (seul l'en-tete
+    gagne le champ `canaux`).
     """
 
-    def __init__(self, path, n_particles=None):
+    def __init__(self, path, n_particles=None, velocity=False):
         # n_particles est conserve pour compatibilite d'appel mais ignore :
         # chaque frame porte desormais son propre compte (voir append_frame).
         del n_particles
@@ -166,12 +218,21 @@ class CacheWriter:
         self._last_n = None
         self._frame_offsets = []
         self._closed = False
+        self._channels = CHANNEL_VELOCITY if velocity else 0
         self._f = open(self._path, "wb")
-        self._f.write(_V2_HEADER_STRUCT.pack(_MAGIC, _V2_VERSION, 0, 0, 0))
+        self._f.write(
+            _V3_HEADER_STRUCT.pack(
+                _MAGIC_V3, _V3_VERSION, 0, 0, self._channels, 0
+            )
+        )
 
     @property
     def frames_written(self):
         return self._frames_written
+
+    @property
+    def has_velocity(self):
+        return bool(self._channels & CHANNEL_VELOCITY)
 
     def write_materials(self, mat_array):
         """Ecrit le sidecar `.mat` (id materiau par particule).
@@ -194,11 +255,29 @@ class CacheWriter:
         mat_path = _mat_path_for(self._path)
         arr.tofile(str(mat_path))
 
-    def append_frame(self, positions):
+    def append_frame(self, positions, velocities=None):
         """Ajoute une frame de positions (count*3 float32, ctypes ou numpy).
 
         `count` peut differer d'un appel a l'autre (emission continue).
+
+        `velocities` (count*3 float32, meme convention) est obligatoire si
+        le canal vitesse a ete declare a l'ouverture (`velocity=True`), et
+        interdit sinon : passer l'un sans l'autre leve `ValueError` plutot
+        que de produire un fichier dont le contenu de frame ne correspond
+        plus au champ `canaux` de l'en-tete.
         """
+        wants_velocity = bool(self._channels & CHANNEL_VELOCITY)
+        if wants_velocity and velocities is None:
+            raise ValueError(
+                "append_frame: canal vitesse declare a l'ouverture "
+                "(velocity=True), mais aucune vitesse fournie"
+            )
+        if not wants_velocity and velocities is not None:
+            raise ValueError(
+                "append_frame: des vitesses ont ete fournies mais le canal "
+                "vitesse n'a pas ete declare a l'ouverture (velocity=True)"
+            )
+
         arr = np.asarray(positions, dtype=np.float32)
         if arr.size % 3 != 0:
             raise ValueError(
@@ -206,11 +285,23 @@ class CacheWriter:
                 "un multiple de 3 (x, y, z par particule) est attendu"
             )
         count = arr.size // 3
+
+        vel_arr = None
+        if wants_velocity:
+            vel_arr = np.asarray(velocities, dtype=np.float32)
+            if vel_arr.size != count * 3:
+                raise ValueError(
+                    f"append_frame: {vel_arr.size} valeurs de vitesse, "
+                    f"{count * 3} attendues ({count} particules)"
+                )
+
         # Une frame corrompue/tronquee corromprait tout le reste du fichier
         # sans erreur visible : on ecrit uniquement apres validation.
         offset = self._f.tell()
-        self._f.write(_V2_FRAME_COUNT_STRUCT.pack(count))
+        self._f.write(_FRAME_COUNT_STRUCT.pack(count))
         self._f.write(np.ascontiguousarray(arr).tobytes())
+        if wants_velocity:
+            self._f.write(np.ascontiguousarray(vel_arr).tobytes())
         self._frame_offsets.append(offset)
         self._last_n = count
         self._frames_written += 1
@@ -221,13 +312,18 @@ class CacheWriter:
             return
         index_off = self._f.tell()
         for offset in self._frame_offsets:
-            self._f.write(_V2_INDEX_ENTRY_STRUCT.pack(offset))
+            self._f.write(_INDEX_ENTRY_STRUCT.pack(offset))
 
         self._f.seek(0)
         n_max = self._last_n if self._last_n is not None else 0
         self._f.write(
-            _V2_HEADER_STRUCT.pack(
-                _MAGIC, _V2_VERSION, self._frames_written, n_max, index_off
+            _V3_HEADER_STRUCT.pack(
+                _MAGIC_V3,
+                _V3_VERSION,
+                self._frames_written,
+                n_max,
+                self._channels,
+                index_off,
             )
         )
         self._f.close()
@@ -247,16 +343,18 @@ class CacheReader:
     Mo).
 
     Lit indifferemment les fichiers v1 (compte fixe, produits par le
-    headless C++) et v2 (compte variable, produits par `CacheWriter`). La
-    version est detectee par les 4 premiers octets du fichier : `b"BQD2"`
-    signale un v2, toute autre valeur est interpretee comme le champ `n`
-    (int32) d'un header v1.
+    headless C++), v2 (compte variable, sans canaux) et v3 (compte
+    variable, canal vitesse optionnel, ecrit par `CacheWriter`). La version
+    est detectee par les 4 premiers octets du fichier : `b"BQD2"` signale un
+    v2, `b"BQD3"` un v3, toute autre valeur est interpretee comme le champ
+    `n` (int32) d'un header v1.
     """
 
     def __init__(self, path):
         self._path = pathlib.Path(path)
         self._f = open(self._path, "rb")
         self._closed = False
+        self._channels = 0
 
         try:
             magic = self._f.read(4)
@@ -266,7 +364,9 @@ class CacheReader:
                     "un header d'au moins 4 octets est attendu"
                 )
 
-            if magic == _MAGIC:
+            if magic == _MAGIC_V3:
+                self._read_header_v3()
+            elif magic == _MAGIC_V2:
                 self._read_header_v2()
             else:
                 self._read_header_v1()
@@ -315,7 +415,7 @@ class CacheReader:
                 f"({_V2_HEADER_SIZE} octets attendus)"
             )
         _magic, version, frames, n_max, index_off = _V2_HEADER_STRUCT.unpack(
-            _MAGIC + rest
+            _MAGIC_V2 + rest
         )
         if version != _V2_VERSION:
             raise ValueError(
@@ -328,8 +428,61 @@ class CacheReader:
                 f"n_max={n_max} index_off={index_off}"
             )
 
+        self._version = 2
+        self._channels = 0
+        self._parse_frames_and_index(
+            header_size=_V2_HEADER_SIZE,
+            frames=frames,
+            n_max=n_max,
+            index_off=index_off,
+        )
+
+    # -- v3 ---------------------------------------------------------------
+
+    def _read_header_v3(self):
+        rest = self._f.read(_V3_HEADER_SIZE - 4)
+        if len(rest) < _V3_HEADER_SIZE - 4:
+            raise ValueError(
+                f"cache tronque : {self._path} n'a pas de header v3 complet "
+                f"({_V3_HEADER_SIZE} octets attendus)"
+            )
+        _magic, version, frames, n_max, channels, index_off = (
+            _V3_HEADER_STRUCT.unpack(_MAGIC_V3 + rest)
+        )
+        if version != _V3_VERSION:
+            raise ValueError(
+                f"cache {self._path} : version BQD inconnue ({version}), "
+                f"seule la version {_V3_VERSION} est supportee"
+            )
+        if frames < 0 or n_max < 0 or index_off < _V3_HEADER_SIZE:
+            raise ValueError(
+                f"header v3 incoherent : {self._path} frames={frames} "
+                f"n_max={n_max} index_off={index_off}"
+            )
+        if channels & ~CHANNEL_VELOCITY:
+            raise ValueError(
+                f"header v3 incoherent : {self._path} canaux={channels} "
+                "contient des bits inconnus"
+            )
+
+        self._version = 3
+        self._channels = channels
+        self._parse_frames_and_index(
+            header_size=_V3_HEADER_SIZE,
+            frames=frames,
+            n_max=n_max,
+            index_off=index_off,
+        )
+
+    # -- commun v2/v3 -------------------------------------------------------
+
+    def _parse_frames_and_index(self, header_size, frames, n_max, index_off):
+        """Lit et valide la table d'index, puis relit le champ `count` de
+        chaque frame pour en verifier les bornes. Partage par v2 et v3, qui
+        ne different que par la taille du header et la presence eventuelle
+        de vitesses a la suite des positions de chaque frame."""
         file_size = os.fstat(self._f.fileno()).st_size
-        index_size = frames * _V2_INDEX_ENTRY_STRUCT.size
+        index_size = frames * _INDEX_ENTRY_STRUCT.size
         if index_off > file_size or index_off + index_size > file_size:
             raise ValueError(
                 f"index_off incoherent : {self._path} fait {file_size} "
@@ -348,10 +501,15 @@ class CacheReader:
             struct.unpack(f"<{frames}q", index_bytes) if frames else ()
         )
 
+        has_velocity = bool(self._channels & CHANNEL_VELOCITY)
+        bytes_per_frame_particle = (
+            2 * _BYTES_PER_PARTICLE if has_velocity else _BYTES_PER_PARTICLE
+        )
+
         # Bornes de la region "frames" : entre la fin du header et le debut
         # de la table d'index. Chaque offset doit y tomber, et les offsets
         # doivent etre strictement croissants (ecriture sequentielle).
-        prev_end = _V2_HEADER_SIZE
+        prev_end = header_size
         counts = []
         for i, off in enumerate(offsets):
             if off < prev_end or off >= index_off:
@@ -360,18 +518,18 @@ class CacheReader:
                     f"frame {i} ({off}) hors bornes [{prev_end}, {index_off})"
                 )
             self._f.seek(off)
-            count_bytes = self._f.read(_V2_FRAME_COUNT_STRUCT.size)
-            if len(count_bytes) != _V2_FRAME_COUNT_STRUCT.size:
+            count_bytes = self._f.read(_FRAME_COUNT_STRUCT.size)
+            if len(count_bytes) != _FRAME_COUNT_STRUCT.size:
                 raise ValueError(
                     f"cache tronque : {self._path} frame {i} illisible a "
                     f"l'offset {off}"
                 )
-            (count,) = _V2_FRAME_COUNT_STRUCT.unpack(count_bytes)
+            (count,) = _FRAME_COUNT_STRUCT.unpack(count_bytes)
             if count < 0:
                 raise ValueError(
                     f"frame {i} incoherente : {self._path} count={count}"
                 )
-            frame_end = off + _V2_FRAME_COUNT_STRUCT.size + count * _BYTES_PER_PARTICLE
+            frame_end = off + _FRAME_COUNT_STRUCT.size + count * bytes_per_frame_particle
             if frame_end > index_off:
                 raise ValueError(
                     f"frame {i} deborde de la table d'index : {self._path} "
@@ -382,11 +540,10 @@ class CacheReader:
 
         if frames > 0 and counts[-1] != n_max:
             raise ValueError(
-                f"header v2 incoherent : {self._path} n_max={n_max} mais la "
+                f"header incoherent : {self._path} n_max={n_max} mais la "
                 f"derniere frame contient {counts[-1]} particules"
             )
 
-        self._version = 2
         self._frames = frames
         self._n_max = n_max
         self._frame_offsets = offsets
@@ -405,9 +562,17 @@ class CacheReader:
 
     @property
     def is_variable(self):
-        """Vrai si le cache est au format v2 (compte de particules
+        """Vrai si le cache est au format v2 ou v3 (compte de particules
         variable d'une frame a l'autre)."""
-        return self._version == 2
+        return self._version in (2, 3)
+
+    @property
+    def has_velocity(self):
+        """Vrai si le canal vitesse est present (uniquement possible en
+        v3). Constant pour tout le fichier : declare une fois en en-tete,
+        pas par frame. Permet a l'appelant de savoir si `read_velocity` est
+        utilisable sans avoir a inspecter l'en-tete lui-meme."""
+        return bool(self._channels & CHANNEL_VELOCITY)
 
     def particle_count(self, frame_index):
         """Compte de particules de la frame `frame_index` (0-based).
@@ -442,7 +607,7 @@ class CacheReader:
             offset = _V1_HEADER_SIZE + index * self._n * _BYTES_PER_PARTICLE
         else:
             count = self._counts[index]
-            offset = self._frame_offsets[index] + _V2_FRAME_COUNT_STRUCT.size
+            offset = self._frame_offsets[index] + _FRAME_COUNT_STRUCT.size
 
         if (
             out is not None
@@ -461,6 +626,53 @@ class CacheReader:
         if n_read != expected:
             raise ValueError(
                 f"read_frame: {n_read} octets lus a l'offset {offset}, "
+                f"{expected} attendus (fichier tronque ?)"
+            )
+        return dest
+
+    def read_velocity(self, index, out=None):
+        """Lit le canal vitesse de la frame `index` (0-based).
+
+        Meme contrat que `read_frame` (ndarray `(count, 3)` float32,
+        reutilisation de `out` sous les memes conditions), mais pour les
+        vitesses : leve `ValueError` si le fichier n'a pas de canal vitesse
+        (`has_velocity` est False), plutot que de lire des octets qui
+        n'existent pas.
+        """
+        if not self.has_velocity:
+            raise ValueError(
+                f"read_velocity: {self._path} n'a pas de canal vitesse "
+                "(has_velocity est False)"
+            )
+        if not (0 <= index < self._frames):
+            raise IndexError(
+                f"read_velocity: index {index} hors bornes [0, {self._frames})"
+            )
+
+        count = self._counts[index]
+        offset = (
+            self._frame_offsets[index]
+            + _FRAME_COUNT_STRUCT.size
+            + count * _BYTES_PER_PARTICLE
+        )
+
+        if (
+            out is not None
+            and out.dtype == np.float32
+            and out.ndim == 2
+            and out.shape[1] == 3
+            and out.shape[0] >= count
+        ):
+            dest = out[:count]
+        else:
+            dest = np.empty((count, 3), dtype=np.float32)
+
+        self._f.seek(offset)
+        n_read = self._f.readinto(dest)
+        expected = count * _BYTES_PER_PARTICLE
+        if n_read != expected:
+            raise ValueError(
+                f"read_velocity: {n_read} octets lus a l'offset {offset}, "
                 f"{expected} attendus (fichier tronque ?)"
             )
         return dest

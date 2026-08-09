@@ -14,24 +14,20 @@
 #include "bourrasque.h"
 
 #include <cuda_runtime.h>
+#include <cub/device/device_scan.cuh>
+#include <cub/device/device_reduce.cuh>
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
 /* ------------------------------------------------------------------ erreurs */
-static char g_error[512] = "";
-
-#define BQ_CUDA_CHECK(call)                                                  \
-    do {                                                                     \
-        cudaError_t err_ = (call);                                           \
-        if (err_ != cudaSuccess) {                                           \
-            snprintf(g_error, sizeof(g_error), "%s:%d CUDA: %s", __FILE__,   \
-                     __LINE__, cudaGetErrorString(err_));                    \
-            return -1;                                                       \
-        }                                                                    \
-    } while (0)
+#include "internal.h"
+char g_error[512] = "";
 
 /* ------------------------------------------------------------- petite algebre */
 struct mat3 {
@@ -97,6 +93,33 @@ __device__ inline mat3 outer(float3 a, float3 b) {
     return r;
 }
 
+/* Rotation depuis un quaternion (w, x, y, z) -- convention BqRigidBody::q,
+ * partagee avec l'extension Python (une divergence de convention serait un
+ * bug tres penible a diagnostiquer, cf. plan-milestone-17.md D5). */
+__device__ inline mat3 quat_to_mat3(const float q[4]) {
+    float w = q[0], x = q[1], y = q[2], z = q[3];
+    mat3 r;
+    r.m[0] = 1.f - 2.f * (y * y + z * z); r.m[1] = 2.f * (x * y - w * z);       r.m[2] = 2.f * (x * z + w * y);
+    r.m[3] = 2.f * (x * y + w * z);       r.m[4] = 1.f - 2.f * (x * x + z * z); r.m[5] = 2.f * (y * z - w * x);
+    r.m[6] = 2.f * (x * z - w * y);       r.m[7] = 2.f * (y * z + w * x);       r.m[8] = 1.f - 2.f * (x * x + y * y);
+    return r;
+}
+
+/* Petits helpers vectoriels, utilises par la CCD Moller-Trumbore (cf.
+ * ccd_segment_tri plus bas) -- absents jusqu'ici du fichier, le reste du
+ * code construisant ses float3 intermediaires a la main via make_float3. */
+__device__ inline float3 vsub(float3 a, float3 b) {
+    return make_float3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+__device__ inline float3 vcross(float3 a, float3 b) {
+    return make_float3(a.y * b.z - a.z * b.y,
+                       a.z * b.x - a.x * b.z,
+                       a.x * b.y - a.y * b.x);
+}
+__device__ inline float vdot(float3 a, float3 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
 /* ------------------------------------------------------- colliders : geo */
 /* Plus proche point sur le triangle (a,b,c), Ericson "Real-Time Collision
  * Detection" 5.1.5. Renvoie aussi les poids barycentriques (u,v,w) du point
@@ -147,6 +170,34 @@ __device__ inline float3 closest_pt_triangle(float3 p, float3 a, float3 b,
     v = vb * denom; w = vc * denom; u = 1.f - v - w;
     return make_float3(a.x + ab.x * v + ac.x * w, a.y + ab.y * v + ac.y * w,
                        a.z + ab.z * v + ac.z * w);
+}
+
+/* Intersection segment-triangle, Moller & Trumbore 1997 -- algorithme
+ * standard d'intersection rayon-triangle, ici applique a un SEGMENT borne
+ * (p0 -> p1) plutot qu'a un rayon infini : le test t in [0,1] remplace le
+ * test t >= 0 habituel. Utilise par la CCD de k_g2p (cf. plus bas) comme
+ * filet de securite SUPPLEMENTAIRE avant le mecanisme D7-D9 existant, pas un
+ * remplacement -- ce dernier reste un test ponctuel aux extremites d'un
+ * sous-pas, la CCD teste tout le segment de trajectoire. */
+__device__ inline bool ccd_segment_tri(float3 p0, float3 p1, float3 v0, float3 v1, float3 v2,
+                                       float* out_t) {
+    float3 dir = vsub(p1, p0);
+    float3 edge1 = vsub(v1, v0);
+    float3 edge2 = vsub(v2, v0);
+    float3 h = vcross(dir, edge2);
+    float a = vdot(edge1, h);
+    if (fabsf(a) < 1e-10f) return false; /* segment parallele au triangle */
+    float f = 1.f / a;
+    float3 s = vsub(p0, v0);
+    float u = f * vdot(s, h);
+    if (u < 0.f || u > 1.f) return false;
+    float3 q = vcross(s, edge1);
+    float v = f * vdot(dir, q);
+    if (v < 0.f || u + v > 1.f) return false;
+    float t = f * vdot(edge2, q);
+    if (t < 0.f || t > 1.f) return false; /* hors du segment [p0,p1] */
+    *out_t = t;
+    return true;
 }
 
 /* NOTE : l'ancien calcul de signe par winding number generalise (Jacobson et
@@ -260,7 +311,12 @@ __device__ inline float3 closest_pt_triangle(float3 p, float3 a, float3 b,
  * s'arrete a la surface exacte dans les deux cas, parce que les noeuds
  * exterieurs y sont en contact unilateral (cf. normal_corroborated) et ne
  * bloquent donc que l'entree. */
-#define BQ_CONTACT_BAND_MULT 1.5f
+#define BQ_CONTACT_BAND_MULT 0.5f /* experimental (session 2026-08-03) : 1.5f
+    donnait ~0.95dx de vide de repos, 1.0f ET 0.75f donnent EXACTEMENT 0.5dx
+    (palier, pas de reduction supplementaire entre les deux) -- sans fuite
+    sur le test paroi fine dans les deux cas. On descend encore pour voir si
+    0.5dx est un plancher de quantification de grille ou si ca continue a
+    baisser. Voir diag_gap_collider.py / diag_leak_thinwall.py. */
 
 /* Distance minimale, en multiples de dx, a laquelle la contrainte de position de
  * k_g2p maintient une particule de la surface d'un collider. La condition aux
@@ -269,7 +325,11 @@ __device__ inline float3 closest_pt_triangle(float3 p, float3 a, float3 b,
  * noeuds libres). Cette contrainte-ci agit sur les positions et est dure ; c'est
  * elle qui garantit qu'aucune particule ne franchit une paroi, quelle que soit
  * son epaisseur devant dx. */
-#define BQ_CONTACT_PUSH_MULT 0.5f
+#define BQ_CONTACT_PUSH_MULT 0.5f /* teste a 0.25f (session 2026-08-03) : aucun
+    effet mesure sur le vide de repos (reste a 0.5dx pile, identique) ni sur
+    le rebond -- ce mecanisme ne s'active pas dans le regime de repos sous
+    gravite residuelle (voir diag_gap_collider.py / diag_bounce.py). Remis a
+    sa valeur d'origine, aucun gain a le changer. */
 
 /* Decalage d'echantillonnage du champ de collider, en multiples de dx, destine a
  * lever les coincidences exactes noeud/surface (cf. k_sdf_unsigned). Assez grand
@@ -408,6 +468,12 @@ __device__ inline mat3 polar_rotation(const mat3& F) {
 /* --------------------------------------------------------------- parametres */
 #define BQ_MAX_MATERIALS 8
 
+/* Plafond de corps rigides declares (cf. bq_set_collider_bodies) : les
+ * tampons device (etat, wrench) sont alloues une fois a cette capacite fixe
+ * a bq_create, jamais realloues -- meme politique que mats_host ci-dessus,
+ * un nombre de corps a deux chiffres n'exige aucune reallocation dynamique. */
+#define BQ_MAX_BODIES 64
+
 struct MaterialGpu {
     int   model;
     float p_mass;         /* rho * p_vol */
@@ -517,13 +583,16 @@ __global__ void k_p2g(const float3* __restrict__ x,
 
 /* Initialise (ou reinitialise) le champ de distance a "pas de collider" :
  * grande valeur positive partout, vitesse/friction nulles, couche de contact
- * (normale nulle, distance non signee 1e6) vide elle aussi. */
-__global__ void k_fill_sdf(float* sdf, float4* cvel, float4* cnrm, int ncell) {
+ * (normale nulle, distance non signee 1e6) vide elle aussi, et aucune
+ * cellule attribuee a un corps (cbody = -1, cf. D2 du plan M17). */
+__global__ void k_fill_sdf(float* sdf, float4* cvel, float4* cnrm,
+                           int* __restrict__ cbody, int ncell) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= ncell) return;
     sdf[id] = 1e6f;
     cvel[id] = make_float4(0.f, 0.f, 0.f, 0.f);
     cnrm[id] = make_float4(0.f, 0.f, 0.f, 1e6f);
+    cbody[id] = -1;
 }
 
 /* Index de bucket (non borne : peut deborder de [0,res) si p est hors de la
@@ -560,14 +629,17 @@ __global__ void k_sdf_unsigned(float* __restrict__ sdf, float4* __restrict__ cve
                                const float3* __restrict__ tri,
                                const float3* __restrict__ trivel,
                                const float* __restrict__ trifric,
+                               const int* __restrict__ tri_body,
+                               int default_body,
+                               int* __restrict__ cbody,
                                const int* __restrict__ bucket_off,
                                const int* __restrict__ bucket_tri,
                                float3 bucket_origin, float bucket_h, int3 bucket_res,
-                               float3 aabb_lo, float3 aabb_hi, int ncell) {
+                               float3 aabb_lo, float3 aabb_hi, int ncell,
+                               int3 res, float dx) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= ncell) return;
 
-    int3 res = c_p.res;
     int i = id / (res.y * res.z);
     int j = (id / res.z) % res.y;
     int k = id % res.z;
@@ -588,8 +660,8 @@ __global__ void k_sdf_unsigned(float* __restrict__ sdf, float4* __restrict__ cve
      * solide entier peut se retrouver non signe. Le decalage brise cette
      * coincidence : le noeud tombe a 0.1 % de dx de la face, ce qui suffit a
      * orienter le test de signe sans deplacer le champ de facon perceptible. */
-    const float e = BQ_SDF_NODE_EPS * c_p.dx;
-    float3 p = make_float3(i * c_p.dx + e, j * c_p.dx + e, k * c_p.dx + e);
+    const float e = BQ_SDF_NODE_EPS * dx;
+    float3 p = make_float3(i * dx + e, j * dx + e, k * dx + e);
     bool active = !(p.x < aabb_lo.x || p.x > aabb_hi.x || p.y < aabb_lo.y ||
                     p.y > aabb_hi.y || p.z < aabb_lo.z || p.z > aabb_hi.z);
     if (!active) {
@@ -597,6 +669,7 @@ __global__ void k_sdf_unsigned(float* __restrict__ sdf, float4* __restrict__ cve
         cvel[id] = make_float4(0.f, 0.f, 0.f, 0.f);
         cnrm[id] = make_float4(0.f, 0.f, 0.f, 1e6f);
         state[id] = BQ_SDF_STATE_UNKNOWN; /* resolu par propagation, cf. note plus haut */
+        cbody[id] = -1; /* hors AABB : jamais attribuee a un corps (D2, plan M17) */
         return;
     }
 
@@ -705,11 +778,23 @@ __global__ void k_sdf_unsigned(float* __restrict__ sdf, float4* __restrict__ cve
     cnrm[id] = (best_t >= 0) ? make_float4(nu.x, nu.y, nu.z, sqrtf(best_d2))
                               : make_float4(0.f, 0.f, 0.f, 1e6f);
 
+    /* Identite de corps (D2, plan M17) : derivee gratuitement du triangle
+     * gagnant deja trouve ci-dessus, aucune recherche supplementaire. Le
+     * couplage fluide -> solide de k_grid_update s'en sert pour attribuer
+     * l'impulsion recoltee au bon corps. tri_body == NULL (aucun tableau
+     * fourni par l'appelant) retombe sur default_body, calcule cote hote :
+     * 0 si des corps ont ete declares (compatibilite -- une Sim qui ne
+     * distingue pas ses colliders les traite comme un unique corps 0), -1
+     * sinon (aucun corps declare : comportement cinematique actuel inchange,
+     * cf. non-regression). */
+    cbody[id] = (best_t >= 0) ? ((tri_body != nullptr) ? tri_body[best_t] : default_body)
+                              : -1;
+
     /* Amorce (graine) uniquement dans la bande, et seulement si le test local
      * a pu trancher. Hors bande, ou test local degenere : UNKNOWN, resolu
      * plus tard par propagation depuis une graine voisine (jamais force a
      * "interieur" par defaut -- cf. regle de securite en tete de fichier). */
-    bool near_band = sdf[id] < BQ_SDF_WALL_EPS_MULT * c_p.dx;
+    bool near_band = sdf[id] < BQ_SDF_WALL_EPS_MULT * dx;
     if (near_band && sign_local != 0) {
         state[id] = (sign_local > 0) ? BQ_SDF_STATE_EXTERIOR : BQ_SDF_STATE_INTERIOR;
     } else {
@@ -744,12 +829,11 @@ __global__ void k_sdf_unsigned(float* __restrict__ sdf, float4* __restrict__ cve
  * signee cnrm.w) prend le relais dans ce cas et bloque le fluide meme la ou
  * aucune cellule n'est marquee solide. */
 __global__ void k_sdf_propagate_sign(uint8_t* __restrict__ state,
-                                     int ncell, int* changed) {
+                                     int ncell, int* changed, int3 res) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= ncell) return;
     if (state[id] != BQ_SDF_STATE_UNKNOWN) return; /* deja resolue */
 
-    int3 res = c_p.res;
     int i = id / (res.y * res.z);
     int j = (id / res.z) % res.y;
     int k = id % res.z;
@@ -842,7 +926,10 @@ __device__ inline bool normal_corroborated(const float* __restrict__ sdf,
 
 __global__ void k_grid_update(float4* grid, const float* __restrict__ sdf,
                               const float4* __restrict__ cvel,
-                              const float4* __restrict__ cnrm, int ncell) {
+                              const float4* __restrict__ cnrm,
+                              const int* __restrict__ cbody,
+                              const BqRigidBody* __restrict__ bodies,
+                              float* __restrict__ wrench, int ncell) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= ncell) return;
     float4 g = grid[id];
@@ -850,11 +937,21 @@ __global__ void k_grid_update(float4* grid, const float* __restrict__ sdf,
 
     float3 v = make_float3(g.x / g.w, g.y / g.w, g.z / g.w);
     v.y += c_p.dt * c_p.gravity_y;
+    /* v_pre : capturee APRES la gravite, juste avant la condition de
+     * contact -- c'est elle qui sert de reference a la recolte d'impulsion
+     * plus bas (D1, plan M17) : un corps qui porte une colonne d'eau doit en
+     * sentir le poids, donc la gravite doit deja etre dans v_pre. */
+    float3 v_pre = v;
 
-    int3 res = c_p.res; int b = c_p.bound;
+    int3 res = c_p.res; int bnd = c_p.bound;
     int i = id / (res.y * res.z);
     int j = (id / res.z) % res.y;
     int k = id % res.z;
+
+    /* Identite de corps de la cellule (D2) : -1 si aucun corps (hors AABB
+     * collider ou aucun corps declare), sinon indice dans `bodies`. */
+    int body_id = cbody[id];
+    bool body_dyn = (body_id >= 0) && bodies[body_id].dynamic;
 
     /* condition aux limites du collider : friction de Coulomb (Stomakhin et
      * al. 2013) sur la composante normale, appliquee soit quand le champ de
@@ -875,8 +972,32 @@ __global__ void k_grid_update(float4* grid, const float* __restrict__ sdf,
              * normal_corroborated). */
             bool bidir = !normal_corroborated(sdf, res, i, j, k, n);
             float4 cv = cvel[id];
-            float3 vc = make_float3(cv.x, cv.y, cv.z);
-            float fr = cv.w;
+            float fr = cv.w; /* friction : toujours issue de cvel, quel que soit le corps */
+            float3 vc;
+            if (body_dyn) {
+                /* Vitesse de mur VIVE (D4, plan M17) : recalculee depuis
+                 * l'etat courant du corps plutot que lue dans cvel (figee a
+                 * la derniere frame). C'est ce qui stabilise le couplage --
+                 * un corps qui accelere est moins pousse des le sous-pas
+                 * suivant. Echantillonnage AUX NOEUDS (i*dx), meme
+                 * convention que k_sdf_unsigned ; x_corps est l'origine du
+                 * repere de corps (centre de masse), donc le bras de levier
+                 * est bien x_noeud - x_corps. cnrm.w (friction) reste issu
+                 * de cvel dans tous les cas : seule la partie rigide de la
+                 * vitesse de mur est vive. */
+                float3 xnode = make_float3(i * c_p.dx, j * c_p.dx, k * c_p.dx);
+                const BqRigidBody& bd = bodies[body_id];
+                float3 bx = make_float3(bd.x[0], bd.x[1], bd.x[2]);
+                float3 bv = make_float3(bd.v[0], bd.v[1], bd.v[2]);
+                float3 bw = make_float3(bd.w[0], bd.w[1], bd.w[2]);
+                float3 r = vsub(xnode, bx);
+                float3 wxr = vcross(bw, r);
+                vc = make_float3(bv.x + wxr.x, bv.y + wxr.y, bv.z + wxr.z);
+            } else {
+                /* Corps absent ou cinematique : chemin actuel inchange, lu
+                 * dans cvel (cf. non-regression, plan M17 verification 1). */
+                vc = make_float3(cv.x, cv.y, cv.z);
+            }
             float3 vrel = make_float3(v.x - vc.x, v.y - vc.y, v.z - vc.z);
             float vn = vrel.x * n.x + vrel.y * n.y + vrel.z * n.z;
             if (vn < 0.f || bidir) {
@@ -898,15 +1019,189 @@ __global__ void k_grid_update(float4* grid, const float* __restrict__ sdf,
         }
     }
 
-    /* conditions separantes : composante normale annulee vers la paroi */
-    if (i < b && v.x < 0.f) v.x = 0.f;
-    if (i >= res.x - b && v.x > 0.f) v.x = 0.f;
-    if (j < b && v.y < 0.f) v.y = 0.f;
-    if (j >= res.y - b && v.y > 0.f) v.y = 0.f;
-    if (k < b && v.z < 0.f) v.z = 0.f;
-    if (k >= res.z - b && v.z > 0.f) v.z = 0.f;
+    /* Recolte de l'impulsion (D1, plan M17) : la quantite de mouvement
+     * retiree au noeud par le bloc de contact ci-dessus, masse * (v_pre -
+     * v), est EXACTEMENT l'impulsion que le fluide donne au corps
+     * (troisieme loi de Newton -- ce que le collider a donne au fluide est
+     * masse*(v-v_pre), le corps recoit l'oppose). Nulle des que le bloc
+     * ci-dessus n'a pas modifie v (pas de corps, corps non dynamique, hors
+     * bande de contact, normale nulle, ou vn >= 0 en mode unilateral) --
+     * l'atomicAdd est alors un ajout de zero, sans effet mais sans branche
+     * supplementaire a maintenir.
+     *
+     * Restriction a phi > -h (D1) : au-dela, la cellule est dans
+     * l'interieur PROFOND du solide (au-dela de la bande de contact), donc
+     * seulement atteignable par une particule ayant fuite a travers la
+     * geometrie -- une impulsion recoltee la serait fantome, sans rapport
+     * avec un contact de surface reel. Les parois du domaine (clamps plus
+     * bas dans ce noyau) ne portent jamais de body_id (cf. D2), donc ne
+     * contribuent jamais ici. */
+    if (body_dyn && phi > -h) {
+        float3 dp = make_float3(g.w * (v_pre.x - v.x),
+                                g.w * (v_pre.y - v.y),
+                                g.w * (v_pre.z - v.z));
+        float3 xnode = make_float3(i * c_p.dx, j * c_p.dx, k * c_p.dx);
+        const BqRigidBody& bd = bodies[body_id];
+        float3 bx = make_float3(bd.x[0], bd.x[1], bd.x[2]);
+        float3 r = vsub(xnode, bx);
+        float3 dtau = vcross(r, dp);
+        float* wr = wrench + 7 * body_id;
+        atomicAdd(&wr[0], dp.x); atomicAdd(&wr[1], dp.y); atomicAdd(&wr[2], dp.z);
+        atomicAdd(&wr[3], dtau.x); atomicAdd(&wr[4], dtau.y); atomicAdd(&wr[5], dtau.z);
+        atomicAdd(&wr[6], g.w);
+    }
+
+    /* Conditions separantes : composante normale annulee vers la paroi.
+     *
+     * Le test porte sur j <= b, et non j < b : le clamp de position de k_g2p
+     * retient les particules a y = b*dx, c'est-a-dire SUR le noeud d'indice b.
+     * Avec j < b ce noeud restait libre, donc les particules maintenues par le
+     * clamp y recevaient la gravite a chaque substep, repressaient, et se
+     * faisaient re-clamper. Le clamp deplace la particule sans toucher son J :
+     * ce volume-la etait detruit sans que la loi de comportement le voie, et le
+     * fond d'une colonne au repos se tassait indefiniment (mesure : 38
+     * particules par cellule au lieu de 8 apres 4 s, Jw restant a 1.00 donc
+     * pression nulle, voire negative). Contraindre le noeud b aligne le plan
+     * ou la vitesse est annulee sur le plan ou les positions sont retenues.
+     *
+     * Ce n'est PAS le fait que la particule repousse qui compte : annuler sa
+     * vitesse normale quand le clamp mord a ete essaye et ne change rien (meme
+     * densite de fond, meme Jw, a la troisieme decimale). Ce qui compte est que
+     * le clamp ABSORBE. Tant que c'est lui qui arrete le fluide, la deceleration
+     * se produit dans un plan infiniment mince, sous la resolution de la grille :
+     * tr(C) ne la voit pas, donc J ne descend pas, donc aucune pression ne nait.
+     * Il faut que ce soit la condition de vitesse qui arrete le fluide, sur une
+     * bande que la grille resout.
+     *
+     * Mesure, colonne d'eau au repos couvrant le fond du domaine (bulk = 4e4,
+     * H = 0.25 m), avant / apres :
+     *   densite du fond a 4 s   38 part./cellule (J_geo 0.21) -> 8 (J_geo 1.0)
+     *   Jw au fond              1.004 (donc en TRACTION)      -> 0.950
+     *   pression au fond        -0.14 kPa                     -> 2.2 kPa
+     *                           (il en faut 2.45 pour porter la colonne)
+     *   centre de masse a 20 s  -86 mm, non convergent        -> -21 mm, stable
+     *
+     * Contrepartie assumee : la bande contrainte gagne un noeud sur chaque face,
+     * donc un fluide rapide s'arrete un peu plus tot devant la paroi. C'est le
+     * comportement correct -- c'est la condition de vitesse qui doit arreter le
+     * fluide, pas le clamp de position, qui n'est qu'un filet de securite. */
+    if (i <= bnd && v.x < 0.f) v.x = 0.f;
+    if (i >= res.x - bnd - 1 && v.x > 0.f) v.x = 0.f;
+    if (j <= bnd && v.y < 0.f) v.y = 0.f;
+    if (j >= res.y - bnd - 1 && v.y > 0.f) v.y = 0.f;
+    if (k <= bnd && v.z < 0.f) v.z = 0.f;
+    if (k >= res.z - bnd - 1 && v.z > 0.f) v.z = 0.f;
 
     grid[id] = make_float4(v.x, v.y, v.z, g.w);
+}
+
+/* Integration des corps rigides (D5, plan M17), un thread par corps. Ne
+ * fait rien si le corps est cinematique/statique : sa position/orientation
+ * est fournie par l'appelant (Blender), le solveur n'y touche jamais.
+ *
+ * Masse ajoutee (D5) : m_eff = mass + added_mass * m_contact, ou m_contact
+ * (7e accumulateur du wrench) est la masse de fluide qui a effectivement
+ * contribue a l'impulsion ce sous-pas -- gratuite, recoltee par le meme
+ * atomicAdd que la force. Attenue un couplage explicite instable quand un
+ * corps est leger devant la masse de fluide en contact, sans seuil
+ * arbitraire sur dv.
+ *
+ * Rotation : l'inertie inverse est portee en repere de CORPS
+ * (BqRigidBody::inv_inertia), tournee en repere MONDE via R * I_inv * R^T
+ * avant usage (I_w_inv). Le terme gyroscopique w x (I_w * w) est ajoute
+ * explicitement (Euler semi-implicite classique pour un corps rigide libre,
+ * necessaire des qu'un corps n'a pas une inertie isotrope -- une toupie qui
+ * ne le recevrait pas ne precederait jamais).
+ *
+ * Masse ajoutee en rotation : approximation SCALAIRE assumee (l'effet est en
+ * toute rigueur tensoriel -- la masse ajoutee depend de la direction et de
+ * la forme du corps face a l'ecoulement). On se contente de diviser la
+ * contribution de la torque FLUIDE (pas le terme gyroscopique, qui n'a rien
+ * a voir avec le contact) par le meme facteur mass/m_eff que la translation,
+ * cf. commentaire de la spec (plan-milestone-17.md, D5/A1). */
+__global__ void k_integrate_bodies(BqRigidBody* __restrict__ bodies,
+                                   const float* __restrict__ wrench,
+                                   int n_bodies) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_bodies) return;
+    if (!bodies[b].dynamic) return;
+
+    const float* wr = wrench + 7 * b;
+    float3 imp = make_float3(wr[0], wr[1], wr[2]);
+    float3 tau = make_float3(wr[3], wr[4], wr[5]);
+    float  m_contact = wr[6];
+
+    float mass = bodies[b].mass;
+    float m_eff = mass + bodies[b].added_mass * m_contact;
+    float mass_factor = 1.f; /* mass/m_eff, applique a la seule torque fluide */
+
+    float3 v = make_float3(bodies[b].v[0], bodies[b].v[1], bodies[b].v[2]);
+    if (m_eff > 1e-8f) {
+        v.x += imp.x / m_eff; v.y += imp.y / m_eff; v.z += imp.z / m_eff;
+        mass_factor = mass / m_eff;
+    }
+    if (bodies[b].use_gravity) v.y += c_p.dt * c_p.gravity_y;
+
+    mat3 Ib_inv;
+    for (int e = 0; e < 9; ++e) Ib_inv.m[e] = bodies[b].inv_inertia[e];
+    mat3 R = quat_to_mat3(bodies[b].q);
+    mat3 Iw_inv = matmul(matmul(R, Ib_inv), transpose(R)); /* inertie inverse, repere MONDE */
+    mat3 Iw = inverse(Iw_inv); /* seulement pour le terme gyroscopique */
+
+    float3 w = make_float3(bodies[b].w[0], bodies[b].w[1], bodies[b].w[2]);
+    float3 gyro = vcross(w, matvec(Iw, w));
+
+    float3 tau_eff = make_float3(tau.x * mass_factor, tau.y * mass_factor, tau.z * mass_factor);
+    float3 rhs = make_float3(tau_eff.x - c_p.dt * gyro.x,
+                             tau_eff.y - c_p.dt * gyro.y,
+                             tau_eff.z - c_p.dt * gyro.z);
+    float3 dw = matvec(Iw_inv, rhs);
+    w.x += dw.x; w.y += dw.y; w.z += dw.z;
+
+    /* Verrous d'axe (repere MONDE) : composante mise a zero apres
+     * integration -- une contrainte dure, pas une force de rappel. */
+    if (bodies[b].lock_lin[0]) v.x = 0.f;
+    if (bodies[b].lock_lin[1]) v.y = 0.f;
+    if (bodies[b].lock_lin[2]) v.z = 0.f;
+    if (bodies[b].lock_ang[0]) w.x = 0.f;
+    if (bodies[b].lock_ang[1]) w.y = 0.f;
+    if (bodies[b].lock_ang[2]) w.z = 0.f;
+
+    bodies[b].v[0] = v.x; bodies[b].v[1] = v.y; bodies[b].v[2] = v.z;
+    bodies[b].w[0] = w.x; bodies[b].w[1] = w.y; bodies[b].w[2] = w.z;
+}
+
+/* Avancee des corps rigides (D5, plan M17), un thread par corps -- separe
+ * de k_integrate_bodies (et non fusionne) parce que la phase B du jalon
+ * inserera le solveur de contact corps-corps entre les deux (cf. D13 du
+ * plan). Ne fait rien si le corps est cinematique/statique. */
+__global__ void k_advance_bodies(BqRigidBody* __restrict__ bodies, int n_bodies) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_bodies) return;
+    if (!bodies[b].dynamic) return;
+
+    float dt = c_p.dt;
+    bodies[b].x[0] += dt * bodies[b].v[0];
+    bodies[b].x[1] += dt * bodies[b].v[1];
+    bodies[b].x[2] += dt * bodies[b].v[2];
+
+    /* q += dt * 0.5 * quat(0, w) (x) q -- produit de Hamilton, w purement
+     * imaginaire A GAUCHE. Convention (w, x, y, z), IMPERATIVE : le module
+     * Python cote extension utilise deja exactement celle-ci. */
+    float qw = bodies[b].q[0], qx = bodies[b].q[1], qy = bodies[b].q[2], qz = bodies[b].q[3];
+    float wx = bodies[b].w[0], wy = bodies[b].w[1], wz = bodies[b].w[2];
+    float dqw = -wx * qx - wy * qy - wz * qz;
+    float dqx =  wx * qw + wy * qz - wz * qy;
+    float dqy = -wx * qz + wy * qw + wz * qx;
+    float dqz =  wx * qy - wy * qx + wz * qw;
+    qw += dt * 0.5f * dqw; qx += dt * 0.5f * dqx;
+    qy += dt * 0.5f * dqy; qz += dt * 0.5f * dqz;
+    float qn = sqrtf(qw * qw + qx * qx + qy * qy + qz * qz);
+    if (qn > 1e-12f) {
+        float qinv = 1.f / qn;
+        qw *= qinv; qx *= qinv; qy *= qinv; qz *= qinv;
+    }
+    bodies[b].q[0] = qw; bodies[b].q[1] = qx; bodies[b].q[2] = qy; bodies[b].q[3] = qz;
 }
 
 __global__ void k_g2p(float3* __restrict__ x,
@@ -916,7 +1211,12 @@ __global__ void k_g2p(float3* __restrict__ x,
                       const uint8_t* __restrict__ mat,
                       const float4* __restrict__ grid,
                       const float* __restrict__ sdf,
-                      const float4* __restrict__ cnrm, int n) {
+                      const float4* __restrict__ cnrm,
+                      const float3* __restrict__ ccd_tri,
+                      const int* __restrict__ ccd_bucket_off,
+                      const int* __restrict__ ccd_bucket_tri,
+                      float3 ccd_bucket_origin, float ccd_bucket_h,
+                      int3 ccd_bucket_res, int n_tri, int n) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n) return;
 
@@ -963,6 +1263,77 @@ __global__ void k_g2p(float3* __restrict__ x,
     float3 xnew = make_float3(fminf(fmaxf(xp.x + c_p.dt * nv.x, lo), hi_x),
                               fminf(fmaxf(xp.y + c_p.dt * nv.y, lo), hi_y),
                               fminf(fmaxf(xp.z + c_p.dt * nv.z, lo), hi_z));
+
+    /* CCD (detection de collision continue), Moller & Trumbore 1997 --
+     * filet de securite SUPPLEMENTAIRE avant le mecanisme D7-D9 ci-dessous
+     * (contrainte de position / projection sur le champ de distance), qui ne
+     * teste que les deux EXTREMITES du sous-pas (xp et xnew) : un
+     * deplacement qui traverse une paroi fine sans que le champ signe change
+     * de signe aux points echantillonnes, ou dont les normales ne se
+     * contredisent pas franchement, passe encore au travers. La CCD teste le
+     * SEGMENT xp -> xnew lui-meme contre les triangles du collider, et
+     * corrige xnew AVANT que D7-D9 ne le consomme (ci/cj/ck/idx_new/phi sont
+     * calcules plus bas, sur la position CCD-corrigee).
+     *
+     * Recherche des triangles candidats par la meme grille de buckets que le
+     * SDF (build_bucket_grid, cf. plus haut) : union du voisinage 27-buckets
+     * autour de xp ET autour de xnew (deux recherches, pas de deduplication
+     * -- tester deux fois le meme triangle ne change pas le resultat, cout
+     * redondant accepte). Suffisant par le meme argument CFL que D9 : le
+     * deplacement d'un sous-pas est borne a environ dx, donc le segment reste
+     * court par rapport a un bucket (BQ_BUCKET_DX_MULT*dx = 2*dx).
+     *
+     * Position UNIQUEMENT : comme le mecanisme D7-D9 (cf. note plus bas,
+     * juste avant le re-clamp final -- "La vitesse n'est volontairement pas
+     * touchee : c'est le role de k_grid_update, la retoucher ici injecterait
+     * de l'energie et ferait vibrer le contact"), la CCD ne touche jamais nv
+     * ni v[p]. La particule repositionnee est naturellement freinee au pas
+     * SUIVANT par k_grid_update.
+     *
+     * Recul le long du SEGMENT (xp -> xnew), pas le long de la normale du
+     * triangle touche : evite toute question d'orientation/sens de la
+     * normale -- xp est par construction une position valide (elle vient du
+     * substep precedent), donc reculer VERS xp le long du segment reste
+     * toujours du bon cote, quelle que soit l'orientation du triangle.
+     *
+     * Cout en l'absence de collider (n_tri == 0) : chemin quasi gratuit,
+     * meme discipline que le reste du fichier pour ce cas (cf. k_sdf_unsigned,
+     * D7-D9 ci-dessous). */
+    if (n_tri > 0) {
+        float3 ccd_dir = make_float3(xnew.x - xp.x, xnew.y - xp.y, xnew.z - xp.z);
+        float ccd_best_t = 2.f; /* sentinelle > 1 : aucune intersection valide */
+        bool ccd_hit = false;
+        for (int ccd_pass = 0; ccd_pass < 2; ++ccd_pass) {
+            float3 ccd_q = (ccd_pass == 0) ? xp : xnew;
+            int3 ccd_bc = bucket_index(ccd_q, ccd_bucket_origin, ccd_bucket_h);
+            int ccd_lo_i = max(ccd_bc.x - 1, 0), ccd_hi_i = min(ccd_bc.x + 1, ccd_bucket_res.x - 1);
+            int ccd_lo_j = max(ccd_bc.y - 1, 0), ccd_hi_j = min(ccd_bc.y + 1, ccd_bucket_res.y - 1);
+            int ccd_lo_k = max(ccd_bc.z - 1, 0), ccd_hi_k = min(ccd_bc.z + 1, ccd_bucket_res.z - 1);
+            for (int ii = ccd_lo_i; ii <= ccd_hi_i; ++ii)
+                for (int jj = ccd_lo_j; jj <= ccd_hi_j; ++jj)
+                    for (int kk = ccd_lo_k; kk <= ccd_hi_k; ++kk) {
+                        int ccd_bidx = (ii * ccd_bucket_res.y + jj) * ccd_bucket_res.z + kk;
+                        int ccd_off0 = ccd_bucket_off[ccd_bidx];
+                        int ccd_off1 = ccd_bucket_off[ccd_bidx + 1];
+                        for (int e = ccd_off0; e < ccd_off1; ++e) {
+                            int t = ccd_bucket_tri[e];
+                            float3 v0 = ccd_tri[3 * t + 0], v1 = ccd_tri[3 * t + 1],
+                                   v2 = ccd_tri[3 * t + 2];
+                            float tt;
+                            if (ccd_segment_tri(xp, xnew, v0, v1, v2, &tt) && tt < ccd_best_t) {
+                                ccd_best_t = tt;
+                                ccd_hit = true;
+                            }
+                        }
+                    }
+        }
+        if (ccd_hit) {
+            float t_safe = ccd_best_t * 0.99f;
+            xnew.x = xp.x + t_safe * ccd_dir.x;
+            xnew.y = xp.y + t_safe * ccd_dir.y;
+            xnew.z = xp.z + t_safe * ccd_dir.z;
+        }
+    }
 
     /* Correction de position (projection sur la surface du collider) : le
      * contact MPM passe par la grille et reste "mou" -- une particule dont
@@ -1091,6 +1462,290 @@ __global__ void k_g2p(float3* __restrict__ x,
     }
 }
 
+/* --------------------------------------------------------- reseeding (M10)
+ * Requilibre la population de particules par cellule une fois par frame,
+ * apres le dernier sous-pas -- corrige la fragmentation en zones de forte
+ * deformation (mesuree en M9, cf. plan-milestone-10.md D1-D5). Motif valide
+ * en production par deux moteurs : Houdini FLIP (section "Reseeding",
+ * `Particles Per Voxel` + seuils naissance/mort) et Mantaflow, le moteur
+ * fluide natif de Blender, notre cible directe (seuils min/max par cellule).
+ *
+ * Cible = ppc_axis^3 (deja expose dans BqConfig, pas un nouveau parametre).
+ * Seuils de naissance/mort internes, non exposes -- meme philosophie que les
+ * autres constantes internes du fichier (l'utilisateur ne doit rien regler).
+ *
+ * Meme motif de compaction par flux deja utilise trois fois dans ce projet
+ * (marching cubes M7, generation whitewater M8, compaction whitewater M8) :
+ * comptage par thread, cub::DeviceScan::ExclusiveSum, emission aux offsets
+ * calcules, tampon sentinelle mis a zero avant chaque scan.
+ *
+ * Frequence : une fois par appel a bq_step (une fois par frame, apres le
+ * dernier sous-pas), jamais a chaque sous-pas -- cf. reseed() plus bas et
+ * son appel en fin de bq_step. */
+#define BQ_RESEED_BIRTH_MULT 0.5f
+#define BQ_RESEED_DEATH_MULT 2.0f
+
+/* Hash entier bon marche (variante Wang hash), duplique ici sous un nom
+ * distinct : meme motif que mc_hash01 de mesher.cu, mais chaque unite de
+ * compilation reste autonome (CUDA_SEPARABLE_COMPILATION OFF, aucun symbole
+ * partage entre .cu). Utilise pour le jitter de position des naissances et
+ * la selection aleatoire des morts. */
+__device__ inline float reseed_hash01(unsigned int x) {
+    x = (x ^ 61u) ^ (x >> 16);
+    x *= 9u;
+    x ^= x >> 4;
+    x *= 0x27d4eb2du;
+    x ^= x >> 15;
+    return (float)(x & 0x00FFFFFFu) * (1.f / 16777216.f); /* [0,1) */
+}
+
+/* Indexe une position sur la cellule (noeud) la plus proche, EXACTEMENT la
+ * meme convention que celle deja utilisee pour indexer sdf/cnrm dans k_g2p
+ * (floorf(x*inv_dx + 0.5), clampee) -- la coherence entre le comptage de
+ * reseeding et le contact du collider est requise par la spec (D2). */
+__device__ inline int reseed_cell_index(float3 xp) {
+    int3 res = c_p.res;
+    int ci = min(max((int)floorf(xp.x * c_p.inv_dx + 0.5f), 0), res.x - 1);
+    int cj = min(max((int)floorf(xp.y * c_p.inv_dx + 0.5f), 0), res.y - 1);
+    int ck = min(max((int)floorf(xp.z * c_p.inv_dx + 0.5f), 0), res.z - 1);
+    return (ci * res.y + cj) * res.z + ck;
+}
+
+/* Vitesse G2P (meme stencil B-spline quadratique 3x3x3, memes poids que
+ * k_g2p) evaluee a un point de requete ARBITRAIRE plutot qu'a une particule
+ * existante -- utilise pour la vitesse initiale d'une particule nee par
+ * reseeding. Pas de nouvelle formule : copie du calcul de `nv` de k_g2p,
+ * sans le calcul de C (non requis pour une naissance, cf. D3). */
+__device__ inline float3 reseed_g2p_velocity(float3 xp, const float4* __restrict__ grid) {
+    int3 base = make_int3((int)floorf(xp.x * c_p.inv_dx - 0.5f),
+                          (int)floorf(xp.y * c_p.inv_dx - 0.5f),
+                          (int)floorf(xp.z * c_p.inv_dx - 0.5f));
+    float3 fx = make_float3(xp.x * c_p.inv_dx - base.x,
+                            xp.y * c_p.inv_dx - base.y,
+                            xp.z * c_p.inv_dx - base.z);
+    float w[3][3];
+    bspline_weights(fx, w);
+
+    float3 nv = make_float3(0.f, 0.f, 0.f);
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            for (int k = 0; k < 3; ++k) {
+                int gx = base.x + i, gy = base.y + j, gz = base.z + k;
+                if (gx < 0 || gx >= c_p.res.x || gy < 0 || gy >= c_p.res.y ||
+                    gz < 0 || gz >= c_p.res.z)
+                    continue;
+                float weight = w[i][0] * w[j][1] * w[k][2];
+                int idx = (gx * c_p.res.y + gy) * c_p.res.z + gz;
+                float4 g = grid[idx];
+                nv.x += weight * g.x;
+                nv.y += weight * g.y;
+                nv.z += weight * g.z;
+            }
+    return nv;
+}
+
+/* D1/D2 -- comptage par cellule : un thread par particule active, atomicAdd
+ * sur le compte de la cellule (meme convention d'indexation que
+ * reseed_cell_index), somme des J existants (pour la moyenne de naissance,
+ * D3) et indice de la premiere particule trouvee dans la cellule (pour
+ * heriter son materiau, D3) -- via atomicCAS sur la sentinelle -1, la
+ * premiere ecriture gagnante (ordre d'execution des threads, pas ordre
+ * d'indice). count/jsum doivent etre remis a zero et first a -1 avant
+ * l'appel (cf. reseed()). */
+__global__ void k_reseed_count(const float3* __restrict__ x,
+                               const float* __restrict__ Jw,
+                               int* __restrict__ count, float* __restrict__ jsum,
+                               int* __restrict__ first, int n) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    int idx = reseed_cell_index(x[p]);
+    atomicAdd(&count[idx], 1);
+    atomicAdd(&jsum[idx], Jw[p]);
+    atomicCAS(&first[idx], -1, p);
+}
+
+/* D1/D3/D4 -- decision par cellule : combien de naissances (jusqu'a la
+ * cible, seulement si la cellule contient deja au moins une particule), et
+ * quelle probabilite de survie appliquer si la cellule est au-dessus du
+ * seuil de mort (1 = aucune mort). birth[ncell] (sentinelle du scan) doit
+ * etre mise a zero avant l'appel (cf. reseed()). */
+__global__ void k_reseed_plan(const int* __restrict__ count, int* __restrict__ birth,
+                              float* __restrict__ keepprob, int target, int ncell) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= ncell) return;
+    int cnt = count[c];
+    float ft = (float)target;
+
+    /* Correctif regression mesuree (session reseeding) : autoriser la
+     * naissance des qu'une cellule contenait >=1 particule et etait sous le
+     * seuil densifiait artificiellement toute la couche de surface -- une
+     * cellule d'interface fluide/air est LEGITIMEMENT sous la cible (une
+     * partie de son volume est de l'air, pas une fragmentation numerique a
+     * corriger). Mesure : 430592 -> 854843 particules en 48 frames (+98%) sur
+     * une nappe au repos, maillage reconstruit passant de 1 a 30 composantes
+     * connexes, ecart-type de hauteur de 2.6mm a 19.4mm. La naissance ne doit
+     * s'appliquer qu'a l'interieur reel du fluide, jamais a sa frontiere :
+     * une cellule n'est eligible que si ses 6 voisins directs (face, pas
+     * diagonale) contiennent chacun au moins une particule -- un voisin hors
+     * grille compte comme vide (le bord du domaine est aussi une surface). */
+    int3 res = c_p.res;
+    int i = c / (res.y * res.z);
+    int j = (c / res.z) % res.y;
+    int k = c % res.z;
+    bool entouree = true;
+    {
+        int ni, nj, nk;
+        ni = i - 1; entouree = entouree && (ni >= 0) && (count[(ni * res.y + j) * res.z + k] >= 1);
+        ni = i + 1; entouree = entouree && (ni < res.x) && (count[(ni * res.y + j) * res.z + k] >= 1);
+        nj = j - 1; entouree = entouree && (nj >= 0) && (count[(i * res.y + nj) * res.z + k] >= 1);
+        nj = j + 1; entouree = entouree && (nj < res.y) && (count[(i * res.y + nj) * res.z + k] >= 1);
+        nk = k - 1; entouree = entouree && (nk >= 0) && (count[(i * res.y + j) * res.z + nk] >= 1);
+        nk = k + 1; entouree = entouree && (nk < res.z) && (count[(i * res.y + j) * res.z + nk] >= 1);
+    }
+    /* Correctif M12 (investigation de la derive volume/masse mesuree sur une
+     * nappe au repos, 100s simulees : +9% puis -4% de population, jamais
+     * stabilise) : la correction visait le CENTRE (target), pas le SEUIL de
+     * declenchement -- une cellule a peine sous 0.5*target sautait d'un coup
+     * a 100% de la cible (gros correctif pour un petit ecart), alors qu'une
+     * cellule ne perdait des particules qu'au-dela de 2*target, et seulement
+     * en esperance vers la cible (petit correctif pour un gros ecart). Cette
+     * asymetrie amplifie le bruit de tassement en oscillation de population
+     * (controle bang-bang), confirme empiriquement : le meme run SANS
+     * reseeding (commutateur de diagnostic BQ_DISABLE_RESEED) ne derive que
+     * de +0.8% et converge, la derive n'est donc pas une derive de J
+     * independante. Correctif : chaque correction ne vise plus que SON PROPRE
+     * seuil de declenchement (ceil(0.5*target) pour la naissance,
+     * 2.0*target pour la mort), jamais le centre -- correction proportionnelle
+     * a l'ecart plutot qu'un reset complet, meme esprit que les seuils
+     * min/max de Mantaflow (pas une remise a la cible nominale). */
+    int birth_threshold = (int)ceilf(BQ_RESEED_BIRTH_MULT * ft);
+    bool can_birth = entouree && (cnt >= 1) && (cnt < birth_threshold);
+    birth[c] = can_birth ? (birth_threshold - cnt) : 0;
+    bool dying = (float)cnt > BQ_RESEED_DEATH_MULT * ft;
+    keepprob[c] = (dying && cnt > 0) ? (BQ_RESEED_DEATH_MULT * ft / (float)cnt) : 1.f;
+}
+
+/* D4 -- mort : suppression ALEATOIRE, pas de fusion (cf. plan, ecarte
+ * explicitement). Approche probabiliste plutot qu'une selection exacte des
+ * `target` survivants (qui demanderait un classement par cellule, motif
+ * bien plus lourd pour un correctif de population) : chaque particule d'une
+ * cellule au-dessus du seuil de mort survit avec probabilite
+ * target/count(cellule), via un hash deterministe par indice de particule
+ * -- en esperance la cellule revient a la cible, sans garantie exacte au
+ * tirage pres. Decision prise faute d'indication plus precise dans la spec
+ * sur l'exactitude requise ; a signaler si une cible EXACTE s'avere
+ * necessaire (cf. V3/V4 du plan). */
+__global__ void k_reseed_mark_alive(const float3* __restrict__ x,
+                                    const float* __restrict__ keepprob,
+                                    int* __restrict__ alive, int n) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    int idx = reseed_cell_index(x[p]);
+    float kp = keepprob[idx];
+    int a;
+    if (kp >= 1.f) {
+        a = 1;
+    } else {
+        float r = reseed_hash01((unsigned int)p * 2654435761u ^ 0x51ed270bu);
+        a = (r < kp) ? 1 : 0;
+    }
+    alive[p] = a;
+}
+
+/* D5 -- compaction des survivantes (celles PAS marquees pour la mort) vers
+ * le second jeu de tampons (ping-pong), a l'offset donne par le scan
+ * exclusif de alive_flag. */
+__global__ void k_reseed_compact_survivors(
+    const float3* __restrict__ old_x, const float3* __restrict__ old_v,
+    const float* __restrict__ old_C, const float* __restrict__ old_F,
+    const float* __restrict__ old_J, const uint8_t* __restrict__ old_mat,
+    const int* __restrict__ alive, const int* __restrict__ alive_scan,
+    float3* __restrict__ new_x, float3* __restrict__ new_v,
+    float* __restrict__ new_C, float* __restrict__ new_F,
+    float* __restrict__ new_J, uint8_t* __restrict__ new_mat, int n) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    if (!alive[p]) return;
+    int idx = alive_scan[p];
+    new_x[idx] = old_x[p];
+    new_v[idx] = old_v[p];
+    for (int c9 = 0; c9 < 9; ++c9) {
+        new_C[9 * idx + c9] = old_C[9 * p + c9];
+        new_F[9 * idx + c9] = old_F[9 * p + c9];
+    }
+    new_J[idx] = old_J[p];
+    new_mat[idx] = old_mat[p];
+}
+
+/* D3 -- naissance : un thread par cellule, emet ses `birth[cell]` nouvelles
+ * particules a la suite des survivantes (n_survivors + birth_scan[cell] +
+ * rang local), plafonnees a `room` (capacite restante, cf. reseed()) --
+ * naissances excedentaires omises silencieusement, meme politique que le
+ * whitewater (D6 de M8). Position : jitter uniforme dans le volume de la
+ * cellule (noeud i*dx +/- dx/2 par axe, meme convention que
+ * reseed_cell_index). Vitesse : G2P au point jitte (reseed_g2p_velocity).
+ * J : moyenne des J existants de la cellule, uniquement si le materiau herite
+ * (celui de la premiere particule trouvee, cell_first) est WATER -- sinon 1.
+ * C=0, F=identite : meme initialisation par defaut qu'une particule fraiche
+ * de bq_emit_box (emit_particles). Masse : pas de champ par particule dans
+ * ce solveur, deja derivee du materiau (MaterialGpu.p_mass) a chaque
+ * substep -- rien a initialiser ici. */
+__global__ void k_reseed_emit_births(
+    const int* __restrict__ cell_count, const int* __restrict__ cell_first,
+    const float* __restrict__ cell_jsum, const int* __restrict__ birth,
+    const int* __restrict__ birth_scan, const uint8_t* __restrict__ old_mat,
+    const float4* __restrict__ grid, float3* __restrict__ new_x,
+    float3* __restrict__ new_v, float* __restrict__ new_C,
+    float* __restrict__ new_F, float* __restrict__ new_J,
+    uint8_t* __restrict__ new_mat, int n_survivors, int room, int ncell) {
+    int cell = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cell >= ncell) return;
+    int nb = birth[cell];
+    if (nb <= 0) return;
+
+    int3 res = c_p.res;
+    int i = cell / (res.y * res.z);
+    int j = (cell / res.z) % res.y;
+    int k = cell % res.z;
+    float3 corner = make_float3((i - 0.5f) * c_p.dx, (j - 0.5f) * c_p.dx,
+                                (k - 0.5f) * c_p.dx);
+
+    int fi = cell_first[cell];
+    if (fi < 0) return; /* garde-fou : ne devrait pas arriver (nb>0 => count>=1) */
+    uint8_t mid = old_mat[fi];
+    bool water = (c_p.mats[mid].model == BQ_MODEL_WATER);
+    int cnt = cell_count[cell];
+    float javg = (cnt > 0) ? (cell_jsum[cell] / (float)cnt) : 1.f;
+
+    float lo = c_p.bound * c_p.dx;
+    float hi_x = res.x * c_p.dx - lo, hi_y = res.y * c_p.dx - lo,
+          hi_z = res.z * c_p.dx - lo;
+
+    int base = birth_scan[cell];
+    for (int r = 0; r < nb; ++r) {
+        int g = base + r;
+        if (g >= room) return; /* capacite atteinte : reste de cette cellule omis */
+        unsigned int seed = (unsigned int)cell * 9781u + (unsigned int)r * 6271u + 12345u;
+        float jx = reseed_hash01(seed);
+        float jy = reseed_hash01(seed ^ 0x9e3779b9u);
+        float jz = reseed_hash01(seed ^ 0x85ebca6bu);
+        float3 xp = make_float3(fminf(fmaxf(corner.x + jx * c_p.dx, lo), hi_x),
+                                fminf(fmaxf(corner.y + jy * c_p.dx, lo), hi_y),
+                                fminf(fmaxf(corner.z + jz * c_p.dx, lo), hi_z));
+        float3 v = reseed_g2p_velocity(xp, grid);
+
+        int idx = n_survivors + g;
+        new_x[idx] = xp;
+        new_v[idx] = v;
+        for (int c9 = 0; c9 < 9; ++c9) {
+            new_C[9 * idx + c9] = 0.f;
+            new_F[9 * idx + c9] = (c9 == 0 || c9 == 4 || c9 == 8) ? 1.f : 0.f;
+        }
+        new_J[idx] = water ? javg : 1.f;
+        new_mat[idx] = mid;
+    }
+}
+
 /* ------------------------------------------------------------------- BqSim */
 struct BqSim {
     BqConfig cfg;
@@ -1120,8 +1775,31 @@ struct BqSim {
     float3* d_tri = nullptr;
     float3* d_trivel = nullptr;
     float*  d_trifric = nullptr;
+    /* indice de corps rigide par triangle (D2, plan M17), meme politique de
+     * reallocation que d_tri ci-dessus (tri_cap partage) -- upload seulement
+     * si l'appelant fournit un tableau non NULL a bq_set_colliders, sinon le
+     * contenu est ignore (default_body passe directement au kernel, cf.
+     * k_sdf_unsigned). */
+    int*    d_tri_body = nullptr;
     int tri_cap = 0;
     int n_tri = 0;
+
+    /* corps rigides (M17, phase A) : identite de corps par cellule, derivee
+     * du triangle gagnant (cf. k_sdf_unsigned) -- taille ncell, -1 = aucun
+     * corps. */
+    int* d_cbody = nullptr;
+    /* etat + parametres des corps rigides, capacite fixe BQ_MAX_BODIES (cf.
+     * sa def) : x/q/v/w sont mutes en place par k_integrate_bodies et
+     * k_advance_bodies a chaque sous-pas, dynamic/mass/inv_inertia/... sont
+     * fournis une fois par bq_set_collider_bodies et jamais modifies par le
+     * solveur. */
+    BqRigidBody* d_bodies = nullptr;
+    /* accumulateur d'impulsion par corps (D1), 7 floats/corps (impulsion
+     * lineaire [3], couple [3], masse de fluide en contact [1]) -- remis a
+     * zero a CHAQUE sous-pas (cf. bq_step), jamais alloue au-dela de
+     * BQ_MAX_BODIES. */
+    float* d_body_wrench = nullptr;
+    int n_bodies = 0;
 
     /* grille de buckets (CSR), reconstruite sur l'hote a chaque appel de
      * bq_set_colliders puis televersee ; les buffers device ne sont
@@ -1130,12 +1808,74 @@ struct BqSim {
     int* d_bucket_tri = nullptr; /* taille bucket_off[nb], indices de triangles */
     int bucket_off_cap = 0;
     int bucket_tri_cap = 0;
+    /* geometrie de la grille de buckets (origine, pas, resolution) : la
+     * structure CSR (d_bucket_off/d_bucket_tri) ne suffit pas a elle seule a
+     * indexer un point, il faut aussi ces trois champs -- construits sur
+     * l'hote dans bq_set_colliders (build_bucket_grid) mais jusqu'ici jamais
+     * conserves au-dela de cet appel (variable locale `bg`). Persistes ici
+     * pour que k_g2p puisse les reutiliser a chaque substep pour la CCD. */
+    float3 bucket_origin = make_float3(0.f, 0.f, 0.f);
+    float  bucket_h = 0.f;
+    int3   bucket_res = make_int3(0, 0, 0);
 
     /* etat de signe par cellule (ncell) : BQ_SDF_STATE_UNKNOWN / _EXTERIOR /
      * _INTERIOR (cf. mlsmpm.cu, section SDF), et flag device de convergence
      * pour k_sdf_propagate_sign */
     uint8_t* d_ext = nullptr;
     int* d_changed = nullptr;
+
+    /* reseeding (M10, T1-T3) : cf. section "reseeding" plus haut et reseed()
+     * plus bas. Tampons ping-pong par particule (capacite fixe =
+     * max_particles, alloues une fois a bq_create, jamais realloues -- meme
+     * politique que le whitewater) et tampons de comptage par cellule
+     * (capacite fixe = ncell, alloues une fois). */
+    float3* d_x2 = nullptr;
+    float3* d_v2 = nullptr;
+    float*  d_C2 = nullptr;
+    float*  d_F2 = nullptr;
+    float*  d_J2 = nullptr;
+    uint8_t* d_mat2 = nullptr;
+
+    int*   d_reseed_count = nullptr;      /* ncell : particules actives par cellule */
+    float* d_reseed_jsum = nullptr;       /* ncell : somme des J existants (moyenne de naissance) */
+    int*   d_reseed_first = nullptr;      /* ncell : indice de la 1ere particule trouvee (materiau herite), sentinelle -1 */
+    int*   d_reseed_birth = nullptr;      /* ncell+1 : naissances par cellule, case ncell = sentinelle du scan */
+    int*   d_reseed_birth_scan = nullptr; /* ncell+1 : scan exclusif de d_reseed_birth */
+    float* d_reseed_keepprob = nullptr;   /* ncell : probabilite de survie a la mort (1 = pas de mort) */
+    int*   d_reseed_alive = nullptr;      /* max_particles+1 : marquage de survie, case n = sentinelle */
+    int*   d_reseed_alive_scan = nullptr; /* max_particles+1 : scan exclusif de d_reseed_alive */
+    void*  d_reseed_cub_tmp = nullptr;    /* espace de travail CUB, dimensionne une fois a bq_create */
+    size_t reseed_cub_tmp_bytes = 0;
+
+    /* Tri spatial par cellule (optimisation perf, cf. sort_particles() plus
+     * bas) : reutilise EXACTEMENT les tampons ping-pong *2 de reseed()
+     * ci-dessus -- libres de nouveau une fois reseed() revenu (son propre
+     * swap en a deja vide le contenu utile). Comptage/offset/curseur dedies
+     * (capacite fixe = ncell, alloues une fois a bq_create, meme politique
+     * que d_reseed_count et consorts). */
+    int*   d_sort_count = nullptr;   /* ncell : particules actives par cellule */
+    int*   d_sort_offset = nullptr;  /* ncell : scan exclusif de d_sort_count (debut de plage par cellule) */
+    int*   d_sort_cursor = nullptr;  /* ncell : curseur d'ecriture par cellule pendant le scatter */
+    void*  d_sort_cub_tmp = nullptr; /* espace de travail CUB, dimensionne une fois a bq_create */
+    size_t sort_cub_tmp_bytes = 0;
+
+    /* plancher de dt sur la vitesse reelle des particules (garde-fou CCD) :
+     * dt n'est aujourd'hui derive que de material_sound_speed, jamais de la
+     * vitesse effective des particules. En regime extreme (materiau tres mou
+     * + vitesse elevee), le deplacement par sous-pas peut alors depasser
+     * largement le rayon de recherche de la CCD contre les colliders (cf.
+     * commentaire CCD dans k_g2p) et laisser des particules traverser un mur
+     * fin sans jamais etre rattrapees. Reduction cub::DeviceReduce::Max sur
+     * |v[p]| de toutes les particules actives, calculee une fois par frame a
+     * la fin de bq_step (apres le dernier sous-pas, avant reseed) et
+     * consommee par upload_params au step suivant. Au tout premier appel,
+     * prev_frame_max_speed vaut 0 : le plancher ne change donc rien tant
+     * qu'aucune frame n'a encore ete simulee. */
+    float* d_speed = nullptr;          /* cap : |v[p]| par particule, tampon scratch */
+    float* d_max_speed = nullptr;      /* 1 : resultat de cub::DeviceReduce::Max */
+    void*  d_speed_cub_tmp = nullptr;  /* espace de travail CUB, dimensionne une fois a bq_create */
+    size_t speed_cub_tmp_bytes = 0;
+    float  prev_frame_max_speed = 0.f;
 };
 
 static float material_sound_speed(const BqMaterial& m) {
@@ -1147,6 +1887,10 @@ static int upload_params(BqSim* s) {
     float c_max = 1e-3f;
     for (int i = 0; i < s->n_mats; ++i)
         c_max = fmaxf(c_max, material_sound_speed(s->mats_host[i]));
+    /* plancher de vitesse reelle (garde-fou CCD, cf. commentaire sur
+     * prev_frame_max_speed dans BqSim) : vaut 0 tant qu'aucune frame n'a ete
+     * simulee, donc sans effet au demarrage. */
+    c_max = fmaxf(c_max, s->prev_frame_max_speed);
     float dx = s->cfg.cell_size;
     s->dt = s->cfg.cfl * dx / c_max;
 
@@ -1210,15 +1954,91 @@ BQ_API BqSim* bq_create(const BqConfig* cfg) {
         cudaMalloc(&s->d_sdf, ncell * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&s->d_cvel, ncell * sizeof(float4)) != cudaSuccess ||
         cudaMalloc(&s->d_cnrm, ncell * sizeof(float4)) != cudaSuccess ||
+        cudaMalloc(&s->d_cbody, ncell * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&s->d_bodies, BQ_MAX_BODIES * sizeof(BqRigidBody)) != cudaSuccess ||
+        cudaMalloc(&s->d_body_wrench, BQ_MAX_BODIES * 7 * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&s->d_ext, ncell * sizeof(uint8_t)) != cudaSuccess ||
-        cudaMalloc(&s->d_changed, sizeof(int)) != cudaSuccess) {
+        cudaMalloc(&s->d_changed, sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&s->d_x2, cap * sizeof(float3)) != cudaSuccess ||
+        cudaMalloc(&s->d_v2, cap * sizeof(float3)) != cudaSuccess ||
+        cudaMalloc(&s->d_C2, cap * 9 * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&s->d_F2, cap * 9 * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&s->d_J2, cap * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&s->d_mat2, cap * sizeof(uint8_t)) != cudaSuccess ||
+        cudaMalloc(&s->d_reseed_count, ncell * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&s->d_reseed_jsum, ncell * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&s->d_reseed_first, ncell * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&s->d_reseed_birth, (ncell + 1) * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&s->d_reseed_birth_scan, (ncell + 1) * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&s->d_reseed_keepprob, ncell * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&s->d_reseed_alive, (cap + 1) * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&s->d_reseed_alive_scan, (cap + 1) * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&s->d_speed, cap * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&s->d_max_speed, sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&s->d_sort_count, ncell * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&s->d_sort_offset, ncell * sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&s->d_sort_cursor, ncell * sizeof(int)) != cudaSuccess) {
         snprintf(g_error, sizeof(g_error), "cudaMalloc: memoire insuffisante");
         bq_destroy(s);
         return nullptr;
     }
+    /* espace de travail CUB pour les deux scans de reseed() (naissances par
+     * cellule, ncell+1 ; survie par particule, cap+1) -- dimensionne une
+     * fois pour le plus grand des deux, jamais realloue ensuite (capacite
+     * fixe, cf. commentaires de BqSim). */
+    {
+        size_t tmp_cell = 0, tmp_part = 0;
+        cub::DeviceScan::ExclusiveSum(nullptr, tmp_cell, (int*)nullptr,
+                                      (int*)nullptr, ncell + 1);
+        cub::DeviceScan::ExclusiveSum(nullptr, tmp_part, (int*)nullptr,
+                                      (int*)nullptr, cap + 1);
+        s->reseed_cub_tmp_bytes = (tmp_cell > tmp_part) ? tmp_cell : tmp_part;
+        if (s->reseed_cub_tmp_bytes == 0) s->reseed_cub_tmp_bytes = 1;
+        if (cudaMalloc(&s->d_reseed_cub_tmp, s->reseed_cub_tmp_bytes) != cudaSuccess) {
+            snprintf(g_error, sizeof(g_error),
+                     "cudaMalloc: espace de travail CUB (reseeding) insuffisant");
+            bq_destroy(s);
+            return nullptr;
+        }
+    }
+    /* espace de travail CUB pour la reduction max de vitesse (garde-fou dt,
+     * cf. commentaire sur prev_frame_max_speed dans BqSim) -- dimensionne une
+     * fois pour cap elements, jamais realloue ensuite. */
+    {
+        size_t tmp_speed = 0;
+        cub::DeviceReduce::Max(nullptr, tmp_speed, (float*)nullptr,
+                               (float*)nullptr, cap);
+        s->speed_cub_tmp_bytes = tmp_speed;
+        if (s->speed_cub_tmp_bytes == 0) s->speed_cub_tmp_bytes = 1;
+        if (cudaMalloc(&s->d_speed_cub_tmp, s->speed_cub_tmp_bytes) != cudaSuccess) {
+            snprintf(g_error, sizeof(g_error),
+                     "cudaMalloc: espace de travail CUB (vitesse max) insuffisant");
+            bq_destroy(s);
+            return nullptr;
+        }
+    }
+    /* espace de travail CUB pour le scan du tri spatial (sort_particles,
+     * ncell elements) -- dimensionne une fois, jamais realloue ensuite. Non
+     * partage avec d_reseed_cub_tmp : celui-ci est deja dimensionne pour
+     * ncell+1/cap+1, ce qui suffirait probablement, mais un tampon dedie
+     * evite toute hypothese fragile sur la relation taille/octets de CUB
+     * entre deux appels de tailles differentes. */
+    {
+        size_t tmp_sort = 0;
+        cub::DeviceScan::ExclusiveSum(nullptr, tmp_sort, (int*)nullptr,
+                                      (int*)nullptr, ncell);
+        s->sort_cub_tmp_bytes = tmp_sort;
+        if (s->sort_cub_tmp_bytes == 0) s->sort_cub_tmp_bytes = 1;
+        if (cudaMalloc(&s->d_sort_cub_tmp, s->sort_cub_tmp_bytes) != cudaSuccess) {
+            snprintf(g_error, sizeof(g_error),
+                     "cudaMalloc: espace de travail CUB (tri spatial) insuffisant");
+            bq_destroy(s);
+            return nullptr;
+        }
+    }
     /* pas de collider au depart : sdf grand partout, vitesse/friction nulles */
     dim3 bp(256), gc((ncell + 255) / 256);
-    k_fill_sdf<<<gc, bp>>>(s->d_sdf, s->d_cvel, s->d_cnrm, ncell);
+    k_fill_sdf<<<gc, bp>>>(s->d_sdf, s->d_cvel, s->d_cnrm, s->d_cbody, ncell);
     if (cudaDeviceSynchronize() != cudaSuccess) {
         snprintf(g_error, sizeof(g_error), "k_fill_sdf: echec init");
         bq_destroy(s);
@@ -1234,8 +2054,20 @@ BQ_API void bq_destroy(BqSim* s) {
     cudaFree(s->d_grid);
     cudaFree(s->d_sdf); cudaFree(s->d_cvel); cudaFree(s->d_cnrm);
     cudaFree(s->d_tri); cudaFree(s->d_trivel); cudaFree(s->d_trifric);
+    cudaFree(s->d_tri_body); cudaFree(s->d_cbody);
+    cudaFree(s->d_bodies); cudaFree(s->d_body_wrench);
     cudaFree(s->d_bucket_off); cudaFree(s->d_bucket_tri);
     cudaFree(s->d_ext); cudaFree(s->d_changed);
+    cudaFree(s->d_x2);  cudaFree(s->d_v2);  cudaFree(s->d_C2);
+    cudaFree(s->d_F2);  cudaFree(s->d_J2);  cudaFree(s->d_mat2);
+    cudaFree(s->d_reseed_count);      cudaFree(s->d_reseed_jsum);
+    cudaFree(s->d_reseed_first);      cudaFree(s->d_reseed_birth);
+    cudaFree(s->d_reseed_birth_scan); cudaFree(s->d_reseed_keepprob);
+    cudaFree(s->d_reseed_alive);      cudaFree(s->d_reseed_alive_scan);
+    cudaFree(s->d_reseed_cub_tmp);
+    cudaFree(s->d_speed); cudaFree(s->d_max_speed); cudaFree(s->d_speed_cub_tmp);
+    cudaFree(s->d_sort_count); cudaFree(s->d_sort_offset); cudaFree(s->d_sort_cursor);
+    cudaFree(s->d_sort_cub_tmp);
     delete s;
 }
 
@@ -1287,10 +2119,58 @@ static int emit_particles(BqSim* s, int mat_id, const float3* px,
         }
     }
 
-    std::vector<float> id9(count * 9, 0.f), ones(count, 1.f);
+    std::vector<float> id9(count * 9, 0.f), jinit(count, 1.f);
     for (int i = 0; i < count; ++i) { id9[9 * i] = id9[9 * i + 4] = id9[9 * i + 8] = 1.f; }
     std::vector<float> zero9(count * 9, 0.f);
     std::vector<uint8_t> mid(count, (uint8_t)mat_id);
+
+    /* Initialisation HYDROSTATIQUE de J (modele WATER, corps emis au repos).
+     *
+     * A J = 1 la pression de Tait est nulle : un corps pose sous gravite n'est
+     * porte par RIEN a t = 0. Il tombe, comprime, depasse, et sonne autour de
+     * son equilibre -- l'effet de ressort visible au demarrage d'un bloc au
+     * repos. Le fluide etant inviscide, rien ne l'amortit : mesure sur une
+     * colonne de 0.25 m, 3.2 mm crete-a-crete encore presents apres 20 s.
+     *
+     * On part donc directement de l'equilibre. La colonne est lagrangienne (la
+     * masse par particule est fixe), donc la pression a la profondeur h vaut
+     * exactement rho*g*h, et l'inversion de l'EOS de Tait donne
+     *
+     *     p = (K/gamma) * (J^-gamma - 1)   =>   J = (1 + gamma*p/K)^(-1/gamma)
+     *
+     * `h` est mesuree sous la surface libre du corps emis, prise a l'extremite
+     * du nuage de points situee du cote oppose a la gravite.
+     *
+     * Restriction aux corps emis SANS VITESSE, volontaire : un jet d'inflow ou
+     * un bloc lance n'est pas une colonne au repos et n'a aucune raison d'etre
+     * pre-comprime. Lui appliquer ce profil le ferait se detendre au demarrage,
+     * ce qui est le meme artefact qu'on corrige ici, juste en sens inverse. */
+    const BqMaterial& mem = s->mats_host[mat_id];
+    const float gy = s->cfg.gravity_y;
+    if (mem.model == BQ_MODEL_WATER && gy != 0.f && mem.bulk > 0.f &&
+        mem.gamma > 0.f) {
+        bool au_repos = true;
+        for (int i = 0; i < count && au_repos; ++i)
+            au_repos = (pv[i].x == 0.f && pv[i].y == 0.f && pv[i].z == 0.f);
+
+        if (au_repos) {
+            /* surface libre = extremite du corps a l'oppose de la gravite */
+            float y_surf = px[0].y;
+            for (int i = 1; i < count; ++i)
+                y_surf = (gy < 0.f) ? fmaxf(y_surf, px[i].y)
+                                    : fminf(y_surf, px[i].y);
+
+            const float rho_g = mem.rho * fabsf(gy);
+            for (int i = 0; i < count; ++i) {
+                float h = (gy < 0.f) ? (y_surf - px[i].y) : (px[i].y - y_surf);
+                if (h < 0.f) h = 0.f;
+                float J = powf(1.f + mem.gamma * rho_g * h / mem.bulk,
+                               -1.f / mem.gamma);
+                /* meme domaine de validite que le clamp de k_g2p */
+                jinit[i] = fminf(fmaxf(J, 0.5f), 1.5f);
+            }
+        }
+    }
 
     int off = s->n;
     BQ_CUDA_CHECK(cudaMemcpy(s->d_x + off, px, count * sizeof(float3),
@@ -1301,7 +2181,7 @@ static int emit_particles(BqSim* s, int mat_id, const float3* px,
                              count * 9 * sizeof(float), cudaMemcpyHostToDevice));
     BQ_CUDA_CHECK(cudaMemcpy(s->d_C + 9 * off, zero9.data(),
                              count * 9 * sizeof(float), cudaMemcpyHostToDevice));
-    BQ_CUDA_CHECK(cudaMemcpy(s->d_J + off, ones.data(), count * sizeof(float),
+    BQ_CUDA_CHECK(cudaMemcpy(s->d_J + off, jinit.data(), count * sizeof(float),
                              cudaMemcpyHostToDevice));
     BQ_CUDA_CHECK(cudaMemcpy(s->d_mat + off, mid.data(), count * sizeof(uint8_t),
                              cudaMemcpyHostToDevice));
@@ -1403,7 +2283,8 @@ BQ_API int bq_emit_points_vel(BqSim* s, int mat_id, const float* pos,
  * remonte un "CUDA: invalid argument" totalement opaque sur le premier
  * kernel venu plus loin dans la fonction. */
 BQ_API int bq_set_colliders(BqSim* s, const float* tri, const float* tri_vel,
-                            const float* tri_friction, int n_tri) {
+                            const float* tri_friction, const int* tri_body,
+                            int n_tri) {
     if (s->n_mats == 0) {
         snprintf(g_error, sizeof(g_error),
                  "bq_set_colliders: aucun materiau enregistre -- appeler "
@@ -1419,7 +2300,7 @@ BQ_API int bq_set_colliders(BqSim* s, const float* tri, const float* tri_vel,
     }
     if (n_tri == 0) {
         s->n_tri = 0;
-        k_fill_sdf<<<gc, bp>>>(s->d_sdf, s->d_cvel, s->d_cnrm, ncell);
+        k_fill_sdf<<<gc, bp>>>(s->d_sdf, s->d_cvel, s->d_cnrm, s->d_cbody, ncell);
         BQ_CUDA_CHECK(cudaGetLastError());
         BQ_CUDA_CHECK(cudaDeviceSynchronize());
         return 0;
@@ -1430,14 +2311,20 @@ BQ_API int bq_set_colliders(BqSim* s, const float* tri, const float* tri_vel,
         return -1;
     }
 
-    /* reallocation seulement quand la capacite courante est depassee */
+    /* reallocation seulement quand la capacite courante est depassee.
+     * d_tri_body suit la meme politique que d_tri/d_trivel/d_trifric bien
+     * que son upload plus bas soit conditionnel (tri_body peut etre NULL a
+     * cet appel precis, cf. bq_set_colliders dans bourrasque.h). */
     if (n_tri > s->tri_cap) {
         cudaFree(s->d_tri); cudaFree(s->d_trivel); cudaFree(s->d_trifric);
+        cudaFree(s->d_tri_body);
         s->d_tri = nullptr; s->d_trivel = nullptr; s->d_trifric = nullptr;
+        s->d_tri_body = nullptr;
         s->tri_cap = 0;
         if (cudaMalloc(&s->d_tri, (size_t)n_tri * 3 * sizeof(float3)) != cudaSuccess ||
             cudaMalloc(&s->d_trivel, (size_t)n_tri * 3 * sizeof(float3)) != cudaSuccess ||
-            cudaMalloc(&s->d_trifric, (size_t)n_tri * sizeof(float)) != cudaSuccess) {
+            cudaMalloc(&s->d_trifric, (size_t)n_tri * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&s->d_tri_body, (size_t)n_tri * sizeof(int)) != cudaSuccess) {
             snprintf(g_error, sizeof(g_error),
                      "bq_set_colliders: cudaMalloc echoue (n_tri=%d)", n_tri);
             return -1;
@@ -1452,6 +2339,14 @@ BQ_API int bq_set_colliders(BqSim* s, const float* tri, const float* tri_vel,
                              cudaMemcpyHostToDevice));
     BQ_CUDA_CHECK(cudaMemcpy(s->d_trifric, tri_friction, (size_t)n_tri * sizeof(float),
                              cudaMemcpyHostToDevice));
+    if (tri_body != NULL)
+        BQ_CUDA_CHECK(cudaMemcpy(s->d_tri_body, tri_body, (size_t)n_tri * sizeof(int),
+                                 cudaMemcpyHostToDevice));
+    /* default_body pour k_sdf_unsigned : utilise seulement quand tri_body ==
+     * NULL a CET appel (cf. le pointeur passe au kernel plus bas, jamais
+     * s->d_tri_body dans ce cas -- son contenu peut etre perime d'un appel
+     * precedent, sans consequence puisqu'il n'est pas lu). */
+    int default_body = (s->n_bodies > 0) ? 0 : -1;
 
     /* AABB des colliders, cote hote, dilatee de quelques dx pour la bande
      * etroite du kernel de distance. */
@@ -1476,6 +2371,7 @@ BQ_API int bq_set_colliders(BqSim* s, const float* tri, const float* tri_vel,
         return -1; /* g_error deja rempli par build_bucket_grid */
     }
     int nb = bg.res.x * bg.res.y * bg.res.z; /* borne par BQ_BUCKET_MAX_TOTAL_BUCKETS */
+    s->bucket_origin = bg.origin; s->bucket_h = bg.h; s->bucket_res = bg.res;
 
     if (nb + 1 > s->bucket_off_cap) {
         cudaFree(s->d_bucket_off);
@@ -1510,9 +2406,12 @@ BQ_API int bq_set_colliders(BqSim* s, const float* tri, const float* tri_vel,
      *    / INTERIOR dans la bande proche de la surface, UNKNOWN partout
      *    ailleurs (cf. k_sdf_unsigned). */
     k_sdf_unsigned<<<gc, bp>>>(s->d_sdf, s->d_cvel, s->d_cnrm, s->d_ext,
-                               s->d_tri, s->d_trivel,
-                               s->d_trifric, s->d_bucket_off, s->d_bucket_tri,
-                               bg.origin, bg.h, bg.res, lo, hi, ncell);
+                               s->d_tri, s->d_trivel, s->d_trifric,
+                               (tri_body != NULL) ? s->d_tri_body : nullptr,
+                               default_body, s->d_cbody,
+                               s->d_bucket_off, s->d_bucket_tri,
+                               bg.origin, bg.h, bg.res, lo, hi, ncell,
+                               s->prm.res, s->prm.dx);
     BQ_CUDA_CHECK(cudaGetLastError());
 
     /* 2. signe par propagation depuis les graines, jusqu'a convergence
@@ -1537,7 +2436,7 @@ BQ_API int bq_set_colliders(BqSim* s, const float* tri, const float* tri_vel,
     BQ_CUDA_CHECK(cudaMemset(s->d_changed, 0, sizeof(int)));
     bool converged = false;
     for (int it = 0; it < max_iter; ++it) {
-        k_sdf_propagate_sign<<<gc, bp>>>(s->d_ext, ncell, s->d_changed);
+        k_sdf_propagate_sign<<<gc, bp>>>(s->d_ext, ncell, s->d_changed, s->prm.res);
         BQ_CUDA_CHECK(cudaGetLastError());
         bool check_now = ((it + 1) % BQ_SDF_CHECK_EVERY == 0) || (it + 1 == max_iter);
         if (check_now) {
@@ -1566,22 +2465,318 @@ BQ_API int bq_set_colliders(BqSim* s, const float* tri, const float* tri_vel,
     return 0;
 }
 
+BQ_API size_t bq_rigid_body_size(void) {
+    return sizeof(BqRigidBody);
+}
+
+BQ_API int bq_set_collider_bodies(BqSim* s, const BqRigidBody* bodies, int n_bodies) {
+    if (n_bodies < 0) {
+        snprintf(g_error, sizeof(g_error),
+                 "bq_set_collider_bodies: n_bodies negatif (%d)", n_bodies);
+        return -1;
+    }
+    if (n_bodies > BQ_MAX_BODIES) {
+        snprintf(g_error, sizeof(g_error),
+                 "bq_set_collider_bodies: n_bodies (%d) depasse le plafond de %d corps",
+                 n_bodies, BQ_MAX_BODIES);
+        return -1;
+    }
+    s->n_bodies = n_bodies;
+    if (n_bodies == 0) return 0; /* efface tout, cf. commentaire dans bourrasque.h */
+    BQ_CUDA_CHECK(cudaMemcpy(s->d_bodies, bodies, (size_t)n_bodies * sizeof(BqRigidBody),
+                             cudaMemcpyHostToDevice));
+    return 0;
+}
+
+BQ_API int bq_read_collider_bodies(BqSim* s, float* dst) {
+    if (s->n_bodies == 0) return 0;
+    /* BqRigidBody est dense (tous ses membres font 4 octets, alignes
+     * naturellement -- aucun padding), donc x/q/v/w (13 floats contigus en
+     * son sein) sont extractibles directement par un memcpy 2D a foulee
+     * sizeof(BqRigidBody), sans kernel ni tampon intermediaire. */
+    const char* src = (const char*)s->d_bodies + offsetof(BqRigidBody, x);
+    BQ_CUDA_CHECK(cudaMemcpy2D(dst, 13 * sizeof(float), src, sizeof(BqRigidBody),
+                               13 * sizeof(float), (size_t)s->n_bodies,
+                               cudaMemcpyDeviceToHost));
+    return s->n_bodies;
+}
+
+BQ_API int bq_read_collider_wrench(BqSim* s, float* dst) {
+    if (s->n_bodies == 0) return 0;
+    BQ_CUDA_CHECK(cudaMemcpy(dst, s->d_body_wrench,
+                             (size_t)s->n_bodies * 7 * sizeof(float),
+                             cudaMemcpyDeviceToHost));
+    return s->n_bodies;
+}
+
+/* Norme de la vitesse par particule, tampon scratch pour la reduction max
+ * (garde-fou dt, cf. commentaire sur prev_frame_max_speed dans BqSim). */
+__global__ void k_velocity_norm(const float3* __restrict__ v,
+                                 float* __restrict__ speed, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float3 vi = v[i];
+    speed[i] = sqrtf(vi.x * vi.x + vi.y * vi.y + vi.z * vi.z);
+}
+
+/* Reseeding (M10, T1-T3) : cf. section "reseeding" plus haut (kernels) pour
+ * la justification et les references de production. Sequence complete :
+ *   1. comptage par cellule (k_reseed_count) sur les n particules courantes ;
+ *   2. plan par cellule (k_reseed_plan) : naissances a generer, probabilite
+ *      de survie a la mort ;
+ *   3. scan des naissances (cub) -> offsets + total ;
+ *   4. marquage de survie par particule (k_reseed_mark_alive), scan (cub)
+ *      -> offsets + nombre de survivantes ;
+ *   5. compaction des survivantes vers le second jeu de tampons
+ *      (k_reseed_compact_survivors) ;
+ *   6. emission des naissances a la suite, plafonnee a la capacite restante
+ *      (k_reseed_emit_births) -- exces omis silencieusement (D5) ;
+ *   7. echange des tampons (ping-pong) et mise a jour de s->n.
+ * Appelee UNE FOIS par bq_step, apres le dernier sous-pas (cf. bq_step). */
+static int reseed(BqSim* s) {
+    /* Commutateur de diagnostic (M12, investigation de la derive volume/masse
+     * mesuree sur la nappe au repos) : desactive tout le reseeding sans
+     * toucher a l'ABI publique -- pas un reglage utilisateur, sert
+     * uniquement a isoler la contribution du reseeding d'une eventuelle
+     * derive numerique independante de J. Lu une fois, mis en cache
+     * statique (getenv n'est pas cher, mais pas de raison de le refaire a
+     * chaque frame). */
+    static int disabled = -1;
+    if (disabled < 0) disabled = (getenv("BQ_DISABLE_RESEED") != nullptr) ? 1 : 0;
+    if (disabled) return 0;
+
+    int ncell = s->prm.res.x * s->prm.res.y * s->prm.res.z;
+    int target = s->cfg.ppc_axis * s->cfg.ppc_axis * s->cfg.ppc_axis;
+    dim3 bp(256), gp((s->n + 255) / 256), gc((ncell + 255) / 256);
+
+    BQ_CUDA_CHECK(cudaMemset(s->d_reseed_count, 0, (size_t)ncell * sizeof(int)));
+    BQ_CUDA_CHECK(cudaMemset(s->d_reseed_jsum, 0, (size_t)ncell * sizeof(float)));
+    BQ_CUDA_CHECK(cudaMemset(s->d_reseed_first, 0xFF, (size_t)ncell * sizeof(int))); /* -1 */
+
+    k_reseed_count<<<gp, bp>>>(s->d_x, s->d_J, s->d_reseed_count,
+                               s->d_reseed_jsum, s->d_reseed_first, s->n);
+    BQ_CUDA_CHECK(cudaGetLastError());
+
+    BQ_CUDA_CHECK(cudaMemset(s->d_reseed_birth + ncell, 0, sizeof(int))); /* sentinelle scan */
+    k_reseed_plan<<<gc, bp>>>(s->d_reseed_count, s->d_reseed_birth,
+                              s->d_reseed_keepprob, target, ncell);
+    BQ_CUDA_CHECK(cudaGetLastError());
+
+    BQ_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        s->d_reseed_cub_tmp, s->reseed_cub_tmp_bytes, s->d_reseed_birth,
+        s->d_reseed_birth_scan, ncell + 1));
+    int total_births = 0;
+    BQ_CUDA_CHECK(cudaMemcpy(&total_births, s->d_reseed_birth_scan + ncell,
+                             sizeof(int), cudaMemcpyDeviceToHost));
+
+    BQ_CUDA_CHECK(cudaMemset(s->d_reseed_alive + s->n, 0, sizeof(int))); /* sentinelle scan */
+    k_reseed_mark_alive<<<gp, bp>>>(s->d_x, s->d_reseed_keepprob,
+                                    s->d_reseed_alive, s->n);
+    BQ_CUDA_CHECK(cudaGetLastError());
+
+    BQ_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        s->d_reseed_cub_tmp, s->reseed_cub_tmp_bytes, s->d_reseed_alive,
+        s->d_reseed_alive_scan, s->n + 1));
+    int n_survivors = 0;
+    BQ_CUDA_CHECK(cudaMemcpy(&n_survivors, s->d_reseed_alive_scan + s->n,
+                             sizeof(int), cudaMemcpyDeviceToHost));
+
+    k_reseed_compact_survivors<<<gp, bp>>>(
+        s->d_x, s->d_v, s->d_C, s->d_F, s->d_J, s->d_mat,
+        s->d_reseed_alive, s->d_reseed_alive_scan,
+        s->d_x2, s->d_v2, s->d_C2, s->d_F2, s->d_J2, s->d_mat2, s->n);
+    BQ_CUDA_CHECK(cudaGetLastError());
+
+    int room = s->cfg.max_particles - n_survivors;
+    if (room < 0) room = 0;
+    int actually_births = (total_births < room) ? total_births : room;
+
+    if (actually_births > 0) {
+        k_reseed_emit_births<<<gc, bp>>>(
+            s->d_reseed_count, s->d_reseed_first, s->d_reseed_jsum,
+            s->d_reseed_birth, s->d_reseed_birth_scan,
+            s->d_mat, s->d_grid,
+            s->d_x2, s->d_v2, s->d_C2, s->d_F2, s->d_J2, s->d_mat2,
+            n_survivors, actually_births, ncell);
+        BQ_CUDA_CHECK(cudaGetLastError());
+    }
+
+    std::swap(s->d_x, s->d_x2); std::swap(s->d_v, s->d_v2);
+    std::swap(s->d_C, s->d_C2); std::swap(s->d_F, s->d_F2);
+    std::swap(s->d_J, s->d_J2); std::swap(s->d_mat, s->d_mat2);
+    s->n = n_survivors + actually_births;
+    return 0;
+}
+
+/* --------------------------------------------------------- tri spatial (perf)
+ * k_p2g (scatter, atomicAdd vers ~27 cellules voisines par particule) et
+ * k_g2p (gather depuis ces memes cellules) tournent `substeps` fois par
+ * frame -- les deux kernels les plus chauds du solveur. Si les particules
+ * voisines dans l'espace sont a des indices arbitrairement eloignes dans le
+ * tableau (ce qui arrive naturellement : le reseeding ajoute/retire des
+ * particules par cellule, l'advection deplace les particules d'une cellule a
+ * l'autre au fil des substeps), les acces GPU sur ces deux kernels ne sont
+ * plus coalescents. Motif observe dans les solveurs SPH (tri spatial des
+ * particules avant le calcul de voisinage, pour la coherence de cache), ici
+ * adapte au motif de compaction par flux DEJA etabli dans ce fichier
+ * (comptage/scan/scatter, cf. reseed() ci-dessus) plutot que copie tel quel.
+ *
+ * Reordonne physiquement le tableau de particules par cellule de grille
+ * (meme convention d'indexation que reseed_cell_index, deja utilisee par le
+ * contact collider) : deux particules voisines dans l'espace se retrouvent
+ * proches en indice. Frequence : une fois par frame, juste apres reseed()
+ * (meme cadence et meme justification que le reseeding lui-meme -- refaire
+ * ce tri a chaque sous-pas couterait plus cher que le gain qu'il procure).
+ * Passe INDEPENDANTE et SUBSEQUENTE a reseed() : ne modifie ni sa logique de
+ * naissance/mort, ni les kernels physiques (k_p2g/k_g2p/k_grid_update)
+ * eux-memes -- seulement l'ordre memoire des particules. */
+
+/* Comptage par cellule : un thread par particule, atomicAdd sur le compte de
+ * sa cellule (meme convention que reseed_cell_index). count doit etre remis
+ * a zero avant l'appel (cf. sort_particles()). */
+__global__ void k_sort_count(const float3* __restrict__ x,
+                             int* __restrict__ count, int n) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    int idx = reseed_cell_index(x[p]);
+    atomicAdd(&count[idx], 1);
+}
+
+/* Scatter : un thread par particule, retrouve sa cellule (meme appel
+ * reseed_cell_index que k_sort_count), obtient un slot d'ecriture via
+ * offset[cellule] + rang local (atomicAdd sur un curseur par cellule,
+ * initialise a zero avant l'appel -- cf. sort_particles()), puis copie tous
+ * les champs par particule vers le second jeu de tampons (*2) a cet indice.
+ * Meme ensemble de champs et meme motif de copie que
+ * k_reseed_compact_survivors. */
+__global__ void k_sort_scatter(
+    const float3* __restrict__ old_x, const float3* __restrict__ old_v,
+    const float* __restrict__ old_C, const float* __restrict__ old_F,
+    const float* __restrict__ old_J, const uint8_t* __restrict__ old_mat,
+    const int* __restrict__ offset, int* __restrict__ cursor,
+    float3* __restrict__ new_x, float3* __restrict__ new_v,
+    float* __restrict__ new_C, float* __restrict__ new_F,
+    float* __restrict__ new_J, uint8_t* __restrict__ new_mat, int n) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    int cell = reseed_cell_index(old_x[p]);
+    int slot = offset[cell] + atomicAdd(&cursor[cell], 1);
+    new_x[slot] = old_x[p];
+    new_v[slot] = old_v[p];
+    for (int c9 = 0; c9 < 9; ++c9) {
+        new_C[9 * slot + c9] = old_C[9 * p + c9];
+        new_F[9 * slot + c9] = old_F[9 * p + c9];
+    }
+    new_J[slot] = old_J[p];
+    new_mat[slot] = old_mat[p];
+}
+
+/* Sequence complete (meme motif que reseed(), cf. commentaire de section
+ * ci-dessus) :
+ *   1. comptage par cellule (k_sort_count) sur les n particules courantes ;
+ *   2. scan exclusif (cub) -> offset de depart par cellule ;
+ *   3. scatter (k_sort_scatter) vers le second jeu de tampons, curseur par
+ *      cellule remis a zero juste avant ;
+ *   4. echange des tampons (ping-pong) -- s->n est INCHANGE (aucune
+ *      naissance/mort ici, seulement un reordonnement).
+ * Appelee UNE FOIS par bq_step, juste apres reseed() (cf. bq_step). */
+static int sort_particles(BqSim* s) {
+    int ncell = s->prm.res.x * s->prm.res.y * s->prm.res.z;
+    dim3 bp(256), gp((s->n + 255) / 256);
+
+    BQ_CUDA_CHECK(cudaMemset(s->d_sort_count, 0, (size_t)ncell * sizeof(int)));
+    k_sort_count<<<gp, bp>>>(s->d_x, s->d_sort_count, s->n);
+    BQ_CUDA_CHECK(cudaGetLastError());
+
+    BQ_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        s->d_sort_cub_tmp, s->sort_cub_tmp_bytes, s->d_sort_count,
+        s->d_sort_offset, ncell));
+
+    BQ_CUDA_CHECK(cudaMemset(s->d_sort_cursor, 0, (size_t)ncell * sizeof(int)));
+    k_sort_scatter<<<gp, bp>>>(
+        s->d_x, s->d_v, s->d_C, s->d_F, s->d_J, s->d_mat,
+        s->d_sort_offset, s->d_sort_cursor,
+        s->d_x2, s->d_v2, s->d_C2, s->d_F2, s->d_J2, s->d_mat2, s->n);
+    BQ_CUDA_CHECK(cudaGetLastError());
+
+    std::swap(s->d_x, s->d_x2); std::swap(s->d_v, s->d_v2);
+    std::swap(s->d_C, s->d_C2); std::swap(s->d_F, s->d_F2);
+    std::swap(s->d_J, s->d_J2); std::swap(s->d_mat, s->d_mat2);
+    return 0;
+}
+
 BQ_API int bq_step(BqSim* s, float frame_dt) {
     if (s->n == 0 || s->n_mats == 0) return 0;
     int substeps = (int)ceilf(frame_dt / s->dt);
     int ncell = s->prm.res.x * s->prm.res.y * s->prm.res.z;
     dim3 bp(256), gp((s->n + 255) / 256), gc((ncell + 255) / 256);
 
+    /* Grille de lancement des noyaux par corps (D5, plan M17) : BQ_MAX_BODIES
+     * est petit (64), un seul bloc suffit toujours -- pas de dependance a
+     * s->n_bodies dans le dimensionnement pour eviter tout recalcul de
+     * grille par sous-pas quand n_bodies change (il ne change pas en cours
+     * de bake de toute facon, bq_set_collider_bodies n'est appelee qu'une
+     * fois). */
+    dim3 bpb(64), gpb((BQ_MAX_BODIES + 63) / 64);
+
     for (int i = 0; i < substeps; ++i) {
+        /* Ordre du sous-pas (D13, plan M17) : la recolte d'impulsion de
+         * k_grid_update doit lire un accumulateur remis a zero a CHAQUE
+         * sous-pas -- une somme sur toute la frame melangerait des
+         * geometries de corps qui ont deja bouge d'un sous-pas a l'autre.
+         * cudaMemsetAsync, aucune synchronisation hote introduite (contrainte
+         * de performance existante de cette boucle). Saute integralement
+         * si aucun corps n'est declare : chemin actuel intact (D3,
+         * non-regression). */
+        if (s->n_bodies > 0)
+            cudaMemsetAsync(s->d_body_wrench, 0, (size_t)s->n_bodies * 7 * sizeof(float));
         k_clear_grid<<<gc, bp>>>(s->d_grid, ncell);
         k_p2g<<<gp, bp>>>(s->d_x, s->d_v, s->d_C, s->d_F, s->d_J, s->d_mat,
                           s->d_grid, s->n);
-        k_grid_update<<<gc, bp>>>(s->d_grid, s->d_sdf, s->d_cvel, s->d_cnrm, ncell);
+        k_grid_update<<<gc, bp>>>(s->d_grid, s->d_sdf, s->d_cvel, s->d_cnrm,
+                                  s->d_cbody, s->d_bodies, s->d_body_wrench, ncell);
+        if (s->n_bodies > 0) {
+            k_integrate_bodies<<<gpb, bpb>>>(s->d_bodies, s->d_body_wrench, s->n_bodies);
+            /* phase B (plan M17) inserera ici k_contact_solve, entre
+             * l'integration des forces et l'avancee des positions. */
+            k_advance_bodies<<<gpb, bpb>>>(s->d_bodies, s->n_bodies);
+        }
         k_g2p<<<gp, bp>>>(s->d_x, s->d_v, s->d_C, s->d_J, s->d_mat,
-                          s->d_grid, s->d_sdf, s->d_cnrm, s->n);
+                          s->d_grid, s->d_sdf, s->d_cnrm,
+                          s->d_tri, s->d_bucket_off, s->d_bucket_tri,
+                          s->bucket_origin, s->bucket_h, s->bucket_res,
+                          s->n_tri, s->n);
     }
     BQ_CUDA_CHECK(cudaGetLastError());
     BQ_CUDA_CHECK(cudaDeviceSynchronize());
+
+    /* Plancher de dt sur la vitesse reelle (garde-fou CCD, cf. commentaire
+     * sur prev_frame_max_speed dans BqSim) : reduction max sur |v[p]| des
+     * particules simulees cette frame, consommee par upload_params pour la
+     * frame suivante. Doit s'executer avant reseed() : on veut la vitesse
+     * reelle produite par la physique de cette frame, pas une eventuelle
+     * vitesse heritee d'une naissance. */
+    k_velocity_norm<<<gp, bp>>>(s->d_v, s->d_speed, s->n);
+    BQ_CUDA_CHECK(cudaGetLastError());
+    BQ_CUDA_CHECK(cub::DeviceReduce::Max(s->d_speed_cub_tmp, s->speed_cub_tmp_bytes,
+                                         s->d_speed, s->d_max_speed, s->n));
+    BQ_CUDA_CHECK(cudaMemcpy(&s->prev_frame_max_speed, s->d_max_speed, sizeof(float),
+                             cudaMemcpyDeviceToHost));
+    if (upload_params(s) < 0) return -1;
+
+    /* Reseeding (M10) : une fois par frame, apres le dernier sous-pas --
+     * jamais a chaque sous-pas (cf. reseed() et plan-milestone-10.md D5). */
+    if (reseed(s) < 0) return -1;
+    BQ_CUDA_CHECK(cudaGetLastError());
+
+    /* Tri spatial (optimisation perf) : une fois par frame, juste apres le
+     * reseeding -- meme cadence et meme justification, cf. section "tri
+     * spatial" ci-dessus et sort_particles(). Passe independante, ne change
+     * que l'ordre memoire des particules (s->n inchange). */
+    if (sort_particles(s) < 0) return -1;
+    BQ_CUDA_CHECK(cudaGetLastError());
+    BQ_CUDA_CHECK(cudaDeviceSynchronize());
+
     return substeps;
 }
 
@@ -1589,6 +2784,18 @@ BQ_API int bq_particle_count(const BqSim* s) { return s->n; }
 
 BQ_API int bq_read_positions(BqSim* s, float* dst) {
     BQ_CUDA_CHECK(cudaMemcpy(dst, s->d_x, s->n * sizeof(float3),
+                             cudaMemcpyDeviceToHost));
+    return s->n;
+}
+
+BQ_API int bq_read_velocities(BqSim* s, float* dst) {
+    BQ_CUDA_CHECK(cudaMemcpy(dst, s->d_v, s->n * sizeof(float3),
+                             cudaMemcpyDeviceToHost));
+    return s->n;
+}
+
+BQ_API int bq_read_J(BqSim* s, float* dst) {
+    BQ_CUDA_CHECK(cudaMemcpy(dst, s->d_J, s->n * sizeof(float),
                              cudaMemcpyDeviceToHost));
     return s->n;
 }
@@ -1605,6 +2812,17 @@ BQ_API int bq_read_materials(BqSim* s, uint8_t* dst) {
 BQ_API int bq_read_sdf(BqSim* s, float* dst) {
     int ncell = s->prm.res.x * s->prm.res.y * s->prm.res.z;
     BQ_CUDA_CHECK(cudaMemcpy(dst, s->d_sdf, ncell * sizeof(float),
+                             cudaMemcpyDeviceToHost));
+    return ncell;
+}
+
+/* Copie le champ de normale de contact courant vers dst (ncell*4 floats,
+ * meme indexation aux noeuds que bq_read_sdf : x,y,z normale unitaire,
+ * w distance non signee). Diagnostic et validation, et transmission vers
+ * whitewater via bq_whitewater_set_collider_cnrm. */
+BQ_API int bq_read_cnrm(BqSim* s, float* dst) {
+    int ncell = s->prm.res.x * s->prm.res.y * s->prm.res.z;
+    BQ_CUDA_CHECK(cudaMemcpy(dst, s->d_cnrm, ncell * sizeof(float4),
                              cudaMemcpyDeviceToHost));
     return ncell;
 }

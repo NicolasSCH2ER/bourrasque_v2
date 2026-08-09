@@ -13,7 +13,13 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from cache import CacheReader, CacheWriter, cache_paths, ensure_cache_dir  # noqa: E402
+from cache import (  # noqa: E402
+    CHANNEL_VELOCITY,
+    CacheReader,
+    CacheWriter,
+    cache_paths,
+    ensure_cache_dir,
+)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 
@@ -308,6 +314,166 @@ def test_v2_index_off_out_of_bounds_raises():
         )
 
 
+def test_v3_roundtrip_without_velocity():
+    counts = [10, 25, 25, 60, 100]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "v3_no_vel.bqd"
+        expected = []
+        with CacheWriter(path) as w:
+            assert w.has_velocity is False
+            for fr, count in enumerate(counts):
+                frame = np.full((count, 3), float(fr) + 1.0, dtype=np.float32)
+                expected.append(frame)
+                w.append_frame(frame)
+
+        with CacheReader(path) as r:
+            assert r.is_variable is True
+            assert r.has_velocity is False
+            assert r.frame_count == len(counts)
+            for fr, count in enumerate(counts):
+                got = r.read_frame(fr)
+                assert np.array_equal(got, expected[fr]), f"frame {fr} differe"
+
+
+def test_v3_roundtrip_with_velocity():
+    counts = [8, 15, 40, 12]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "v3_vel.bqd"
+        expected_pos = []
+        expected_vel = []
+        with CacheWriter(path, velocity=True) as w:
+            assert w.has_velocity is True
+            for fr, count in enumerate(counts):
+                pos = np.full((count, 3), float(fr) + 1.0, dtype=np.float32)
+                vel = np.full((count, 3), -float(fr) - 0.5, dtype=np.float32)
+                expected_pos.append(pos)
+                expected_vel.append(vel)
+                w.append_frame(pos, velocities=vel)
+
+        with CacheReader(path) as r:
+            assert r.has_velocity is True
+            for fr, count in enumerate(counts):
+                got_pos = r.read_frame(fr)
+                got_vel = r.read_velocity(fr)
+                assert np.array_equal(got_pos, expected_pos[fr]), f"frame {fr}: positions"
+                assert np.array_equal(got_vel, expected_vel[fr]), f"frame {fr}: vitesses"
+
+
+def test_v3_append_frame_velocity_mismatch_raises():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "mismatch_missing.bqd"
+        with CacheWriter(path, velocity=True) as w:
+            raised = False
+            try:
+                w.append_frame(np.zeros((5, 3), dtype=np.float32))
+            except ValueError:
+                raised = True
+            assert raised, "append_frame aurait du exiger les vitesses"
+
+        path2 = pathlib.Path(tmp) / "mismatch_unexpected.bqd"
+        with CacheWriter(path2, velocity=False) as w:
+            raised = False
+            try:
+                w.append_frame(
+                    np.zeros((5, 3), dtype=np.float32),
+                    velocities=np.zeros((5, 3), dtype=np.float32),
+                )
+            except ValueError:
+                raised = True
+            assert raised, "append_frame aurait du refuser des vitesses non declarees"
+
+
+def test_v3_read_velocity_without_channel_raises():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "no_channel.bqd"
+        with CacheWriter(path) as w:
+            w.append_frame(np.zeros((3, 3), dtype=np.float32))
+
+        with CacheReader(path) as r:
+            assert r.has_velocity is False
+            raised = False
+            try:
+                r.read_velocity(0)
+            except ValueError:
+                raised = True
+            assert raised, "read_velocity aurait du lever ValueError sans canal vitesse"
+
+
+def test_v3_channel_constant_value():
+    assert CHANNEL_VELOCITY == 1
+
+
+def _write_v1_dump(path, n, frames):
+    """Fabrique un dump v1 synthetique (meme layout que le binaire C++),
+    sans dependre d'aucun fichier du depot."""
+    with open(path, "wb") as f:
+        f.write(struct.pack("<ii", n, frames))
+        for fr in range(frames):
+            frame = np.full((n, 3), float(fr) * 0.1, dtype=np.float32)
+            f.write(frame.tobytes())
+
+
+def test_read_synthetic_v1_dump():
+    n = 37
+    frames = 4
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "synthetic_v1.bqd"
+        _write_v1_dump(path, n, frames)
+
+        with CacheReader(path) as r:
+            assert r.is_variable is False
+            assert r.has_velocity is False
+            assert r.n_particles == n
+            assert r.frame_count == frames
+            for fr in range(frames):
+                got = r.read_frame(fr)
+                assert got.shape == (n, 3)
+                assert np.allclose(got, fr * 0.1)
+
+
+def _write_v2_dump(path, counts):
+    """Fabrique un dump v2 synthetique en reimplementant le format a la
+    main (pas via CacheWriter, qui n'ecrit plus que du v3), pour verifier
+    que le lecteur continue a accepter des v2 reels independamment de
+    l'ecrivain courant."""
+    header_struct = struct.Struct("<4siiiq")
+    frame_count_struct = struct.Struct("<i")
+    index_entry_struct = struct.Struct("<q")
+
+    with open(path, "wb") as f:
+        f.write(header_struct.pack(b"BQD2", 2, 0, 0, 0))
+        offsets = []
+        last_n = 0
+        for fr, count in enumerate(counts):
+            offsets.append(f.tell())
+            f.write(frame_count_struct.pack(count))
+            frame = np.full((count, 3), float(fr) + 1.0, dtype=np.float32)
+            f.write(frame.tobytes())
+            last_n = count
+        index_off = f.tell()
+        for off in offsets:
+            f.write(index_entry_struct.pack(off))
+        f.seek(0)
+        f.write(header_struct.pack(b"BQD2", 2, len(counts), last_n, index_off))
+
+
+def test_read_synthetic_v2_dump():
+    counts = [12, 12, 30, 5]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "synthetic_v2.bqd"
+        _write_v2_dump(path, counts)
+
+        with CacheReader(path) as r:
+            assert r.is_variable is True
+            assert r.has_velocity is False
+            assert r.frame_count == len(counts)
+            for fr, count in enumerate(counts):
+                assert r.particle_count(fr) == count
+                got = r.read_frame(fr)
+                assert got.shape == (count, 3)
+                assert np.allclose(got, fr + 1.0)
+
+
 def main():
     check("roundtrip", test_roundtrip)
     check("interrupted_bake", test_interrupted_bake)
@@ -323,6 +489,19 @@ def main():
     check("v2_unknown_magic_raises", test_v2_unknown_magic_raises)
     check("v2_truncated_before_index_raises", test_v2_truncated_before_index_raises)
     check("v2_index_off_out_of_bounds_raises", test_v2_index_off_out_of_bounds_raises)
+    check("v3_roundtrip_without_velocity", test_v3_roundtrip_without_velocity)
+    check("v3_roundtrip_with_velocity", test_v3_roundtrip_with_velocity)
+    check(
+        "v3_append_frame_velocity_mismatch_raises",
+        test_v3_append_frame_velocity_mismatch_raises,
+    )
+    check(
+        "v3_read_velocity_without_channel_raises",
+        test_v3_read_velocity_without_channel_raises,
+    )
+    check("v3_channel_constant_value", test_v3_channel_constant_value)
+    check("read_synthetic_v1_dump", test_read_synthetic_v1_dump)
+    check("read_synthetic_v2_dump", test_read_synthetic_v2_dump)
 
     if _FAILURES:
         print(f"\n{len(_FAILURES)} test(s) en echec.")

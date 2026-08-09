@@ -21,6 +21,7 @@ import numpy as np  # noqa: E402
 
 from transform import (  # noqa: E402
     solver_to_world,
+    solver_to_world_dir_array,
     world_to_solver,
     world_to_solver_array,
     world_to_solver_dir,
@@ -305,6 +306,46 @@ def test_world_to_solver_dir_array_no_translation():
     )
 
 
+def test_solver_to_world_dir_array_is_inverse():
+    """`solver_to_world_dir_array` doit annuler exactement
+    `world_to_solver_dir_array` (round-trip), meme piege de non-translation
+    que ci-dessus mais dans le sens whitewater -> Blender (attribut
+    `velocity`, motion blur Cycles)."""
+    vectors = np.array(
+        [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (2.5, -1.5, 0.75),
+        ],
+        dtype=np.float64,
+    )
+    solver_vecs = world_to_solver_dir_array(vectors)
+    got = solver_to_world_dir_array(solver_vecs)
+    err = float(np.max(np.abs(got - vectors)))
+    check(
+        "solver_to_world_dir_array(world_to_solver_dir_array(v)) == v",
+        err < 1e-9,
+        f"err={err:.2e}",
+    )
+
+
+def test_solver_to_world_dir_array_no_translation():
+    """Une vitesse solveur convertie via `solver_to_world_dir_array` ne
+    doit JAMAIS deriver avec `origin`/`size` : pas de terme de translation,
+    contrairement a `solver_to_world_array`."""
+    vel_solver = np.array([[0.0, 0.0, -1.0]], dtype=np.float64)
+    got = solver_to_world_dir_array(vel_solver)
+    # Inverse exact du cas documente dans world_to_solver_dir : -sz solveur
+    # -> +Y monde.
+    check(
+        "solver_to_world_dir_array: -sz solveur -> +Y monde",
+        approx_eq(got[0], (0.0, 1.0, 0.0), 1e-9),
+        f"got={got[0]}",
+    )
+
+
 if __name__ == "__main__":
     test_round_trip()
     test_round_trip_non_cubic()
@@ -315,6 +356,8 @@ if __name__ == "__main__":
     test_world_to_solver_array_matches_scalar()
     test_world_to_solver_dir_array_matches_scalar()
     test_world_to_solver_dir_array_no_translation()
+    test_solver_to_world_dir_array_is_inverse()
+    test_solver_to_world_dir_array_no_translation()
 
     print()
     if FAILURES:

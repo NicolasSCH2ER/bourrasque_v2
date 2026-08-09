@@ -34,7 +34,7 @@ project(bourrasque LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
-add_library(bourrasque SHARED core/src/mlsmpm.cu)
+add_library(bourrasque SHARED core/src/mlsmpm.cu core/src/mesher.cu core/src/whitewater.cu)
 target_include_directories(bourrasque PUBLIC core/include)
 set_target_properties(bourrasque PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF

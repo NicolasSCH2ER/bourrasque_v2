@@ -102,6 +102,12 @@ int main(int argc, char** argv) {
     for (int fr = 0; fr < frames; ++fr) {
         int sub = bq_step(sim, 1.f / 24.f);
         if (sub < 0) { fprintf(stderr, "step: %s\n", bq_last_error()); return 1; }
+        /* le reseeding (M10) fait grandir le nombre de particules frame apres
+         * frame -- redimensionner le tampon avant lecture, sinon
+         * bq_read_positions ecrit au-dela de sa taille (depassement de tas
+         * silencieux jusqu'au crash suivant). */
+        int n_now = bq_particle_count(sim);
+        if (n_now > n) { n = n_now; pos.resize(3 * (size_t)n); }
         if (bq_read_positions(sim, pos.data()) < 0) {
             fprintf(stderr, "read_positions: %s\n", bq_last_error());
             return 1;

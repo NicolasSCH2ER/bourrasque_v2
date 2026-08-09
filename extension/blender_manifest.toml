@@ -21,6 +21,15 @@ license = [
 
 tags = ["Physics", "3D View"]
 
+# scipy (cKDTree) pour le masque d'ecume (extension/foam.py) : absent de
+# l'environnement Python embarque de Blender, fourni ici en wheel bundle.
+# Un seul wheel necessaire car `platforms` est restreint a windows-x64
+# (voir plus haut) ; numpy n'est pas bundle a part, Blender le fournit deja
+# et le wheel scipy s'y lie dynamiquement sans etape de resolution pip.
+wheels = [
+  "./wheels/scipy-1.18.0-cp313-cp313-win_amd64.whl",
+]
+
 [permissions]
 files = "Charge le moteur natif et lit/écrit le cache de bake sur disque"
 
@@ -30,4 +39,5 @@ paths_exclude_pattern = [
   "/.git/",
   "/*.zip",
   "/tests/",
+  "/.pytest_cache/",
 ]

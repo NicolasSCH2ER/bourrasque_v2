@@ -108,6 +108,29 @@ def world_to_solver_dir_array(vectors, out=None):
     return out
 
 
+def solver_to_world_dir_array(vectors, out=None):
+    """Conversion vectorisee numpy, INVERSE de `world_to_solver_dir_array`
+    (SANS translation : `vectors` sont des directions, typiquement des
+    vitesses de particule).
+
+    `world_to_solver_dir` fait `(vx, vy, vz) -> (vx, vz, -vy)` ; l'inverse
+    est donc `(sx, sy, sz) -> (sx, -sz, sy)`.
+
+    Utilisee par `display.py` pour convertir la vitesse par particule
+    whitewater (attribut Blender `velocity`, motion blur Cycles) : meme
+    piege que documente pour `world_to_solver_dir_array`, une vitesse
+    (direction) ne doit JAMAIS passer par `solver_to_world_array` (qui
+    translate), sous peine d'un vecteur vitesse decale par l'origine du
+    domaine.
+    """
+    if out is None or out.shape != vectors.shape:
+        out = np.empty_like(vectors)
+    out[:, 0] = vectors[:, 0]
+    out[:, 1] = -vectors[:, 2]
+    out[:, 2] = vectors[:, 1]
+    return out
+
+
 def solver_to_world_array(positions, origin, size, out=None):
     """Conversion vectorisee numpy, equivalente a `solver_to_world` appliquee
     point par point, mais sur un tableau (n, 3) entier d'un coup.
