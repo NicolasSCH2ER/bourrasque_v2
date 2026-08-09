@@ -8,8 +8,9 @@ bq.remove_element, bq.material_add, bq.material_remove,
 bq.material_duplicate, bq.migrate_materials, bq.bake, bq.cancel_bake,
 bq.free_cache, bq.bake_mesh, bq.bake_all, bq.free_mesh_cache,
 bq.bake_whitewater, bq.free_whitewater_cache, bq.setup_fluid_display,
-bq.setup_whitewater_display, bq.setup_whitewater_display_volume). Aucun appel
-a la DLL, aucune logique de simulation ici : voir lib.py et ops.py.
+bq.setup_whitewater_display, bq.setup_whitewater_display_volume,
+bq.clear_rigid_keys). Aucun appel a la DLL, aucune logique de simulation
+ici : voir lib.py et ops.py.
 
 Regle absolue (voir chaque `draw()` ci-dessous) : un `draw()` ne modifie
 JAMAIS de donnees Blender. Il detecte un etat et affiche des boutons ; ce
@@ -71,6 +72,16 @@ from .props import (
 # devient comparable au cout d'un step (donc perceptible sur le temps total
 # de bake), pas des la premiere dizaine de milliers de triangles.
 _COLLIDER_TRIANGLE_WARNING_THRESHOLD = 100000
+
+# Au-dela de ce nombre de corps rigides dynamiques, le tableau de bord bascule
+# d'une liste nom-par-nom a une synthese (compte flotte/coule) : le tableau
+# de bord existe pour donner l'etat de la simulation D'UN COUP D'OEIL (voir
+# docstring du module), une liste qui deborde de l'ecran va a l'encontre de
+# ce but. Pas de mesure de cout de rendu ici (contrairement au seuil
+# triangles ci-dessus) : c'est un choix de densite visuelle, pas de
+# performance -- comparer `density` a 1000 est gratuit quel que soit le
+# nombre de corps.
+_DASHBOARD_RIGID_BODY_LIST_THRESHOLD = 6
 
 __all__ = ("classes", "register", "unregister")
 
@@ -258,6 +269,21 @@ def _material_model_label(mat_props):
 
 def _is_vector_zero(vec, eps=1e-6):
     return math.sqrt(vec[0] * vec[0] + vec[1] * vec[1] + vec[2] * vec[2]) < eps
+
+
+def _has_uniform_scale(obj, rel_tol=1e-4):
+    """Echelle X == Y == Z de `obj`, a `rel_tol` pres.
+
+    Lecture gratuite de `obj.scale` (pas d'evaluation de maillage) : sert a
+    detecter, SANS COUT, le cas ou un collider DYNAMIQUE aurait une echelle
+    non uniforme -- la composition/decomposition en keyframes de fin de
+    bake (D8/D6 du plan M17) suppose une rotation a echelle uniforme pres,
+    une echelle non uniforme y introduirait un cisaillement non represente
+    par une simple paire loc/rot (voir `rigidbody.decompose_loc_rot`)."""
+    sx, sy, sz = obj.scale
+    return math.isclose(sx, sy, rel_tol=rel_tol) and math.isclose(
+        sy, sz, rel_tol=rel_tol
+    )
 
 
 def _is_object_animated(obj):
@@ -473,6 +499,78 @@ def _draw_dashboard_elements(layout, scene):
     _dashboard_row(box, "Triangles colliders", _thousands(n_tri))
 
 
+def _draw_dashboard_rigid_bodies(layout, scene, props):
+    """Corps rigides dynamiques (jalon M17, phase A) : combien il y en a,
+    un aperçu flotte/coule par rapport à l'eau (1000 kg/m³ — repère demandé
+    par l'artiste, pas une constante du solveur), les cas d'échelle non
+    uniforme détectables SANS COÛT (`_has_uniform_scale`, simple lecture de
+    `obj.scale`), et le bouton qui retire les clés posées par le bake.
+
+    Contrairement au sous-panneau Collider (`BQ_PT_collider`), qui affiche
+    la masse RÉELLEMENT calculée (densité × volume du maillage), ce tableau
+    de bord ne recalcule PAS le volume de chaque corps à chaque redessin :
+    comparer `density` à 1000 suffit à dire flotte/coule, et c'est gratuit
+    quel que soit le nombre de corps dynamiques de la scène.
+    """
+    dynamic_objs = [
+        obj
+        for obj in scene.objects
+        if obj.bourrasque.role == "COLLIDER" and obj.bourrasque.dynamic
+    ]
+    if not dynamic_objs:
+        return
+
+    box = layout.box()
+    box.label(text="Corps rigides", icon="MOD_PHYSICS")
+    _dashboard_row(box, "Corps dynamiques", str(len(dynamic_objs)))
+
+    if len(dynamic_objs) <= _DASHBOARD_RIGID_BODY_LIST_THRESHOLD:
+        for obj in dynamic_objs:
+            density = obj.bourrasque.density
+            if density < 1000.0:
+                state = "flotte"
+            elif density > 1000.0:
+                state = "coule"
+            else:
+                state = "neutre"
+            row = box.row(align=True)
+            row.label(text=obj.name)
+            row.label(text=f"{density:.0f} kg/m³ — {state}")
+    else:
+        n_float = sum(1 for obj in dynamic_objs if obj.bourrasque.density < 1000.0)
+        n_sink = sum(1 for obj in dynamic_objs if obj.bourrasque.density > 1000.0)
+        n_neutral = len(dynamic_objs) - n_float - n_sink
+        _dashboard_row(box, "Flottent (< 1000 kg/m³)", str(n_float))
+        _dashboard_row(box, "Coulent (> 1000 kg/m³)", str(n_sink))
+        if n_neutral:
+            _dashboard_row(box, "Neutres (= 1000 kg/m³)", str(n_neutral))
+
+    non_uniform = [obj.name for obj in dynamic_objs if not _has_uniform_scale(obj)]
+    if non_uniform:
+        warn = box.box()
+        warn.label(
+            text=f"{len(non_uniform)} corps à échelle non uniforme :",
+            icon="ERROR",
+        )
+        for name in non_uniform[:5]:
+            warn.label(text=f"— {name}")
+        if len(non_uniform) > 5:
+            warn.label(text=f"… et {len(non_uniform) - 5} autre(s)")
+        warn.label(
+            text="la décomposition en keyframes de fin de bake sera "
+            "approximative (cisaillement)."
+        )
+
+    busy = props.is_baking or props.is_baking_mesh or props.is_baking_whitewater
+    row = box.row()
+    row.enabled = not busy
+    row.operator(
+        "bq.clear_rigid_keys",
+        text="Effacer les clés posées par le bake (corps dynamiques uniquement)",
+        icon="TRASH",
+    )
+
+
 def _draw_dashboard_particle_estimate(layout, scene, props):
     box = layout.box()
     box.label(text="Particules estimées", icon="PARTICLES")
@@ -634,6 +732,7 @@ class BQ_PT_dashboard(Panel):
 
         _draw_dashboard_materials(layout, scene, props)
         _draw_dashboard_elements(layout, scene)
+        _draw_dashboard_rigid_bodies(layout, scene, props)
         _draw_dashboard_particle_estimate(layout, scene, props)
 
         res_layout = mesh_layout(scene)
@@ -924,8 +1023,84 @@ class BQ_PT_collider(Panel):
         scene = context.scene
         layout.enabled = not scene.bourrasque.is_baking
 
-        obj_props = context.active_object.bourrasque
+        obj = context.active_object
+        obj_props = obj.bourrasque
         layout.prop(obj_props, "friction")
+        layout.prop(obj_props, "dynamic")
+
+        # D14 du plan M17 : le collider FIXE (le cas majoritaire, cf.
+        # docstring du module) ne doit rien perdre, donc rien de plus ne se
+        # dessine ci-dessous quand `dynamic` est faux -- pas de propriete de
+        # corps rigide, pas d'avertissement, pas d'information de masse.
+        if not obj_props.dynamic:
+            return
+
+        layout.prop(obj_props, "density")
+        layout.prop(obj_props, "use_gravity")
+        layout.prop(obj_props, "lock_location")
+        layout.prop(obj_props, "lock_rotation")
+        layout.prop(obj_props, "restitution")
+
+        # -- Masse calculee, lecture seule (D7 du plan M17) ----------------
+        #
+        # C'est l'information dont l'artiste a reellement besoin pour savoir
+        # si son objet va flotter ou couler (repere : l'eau est a
+        # 1000 kg/m3). Reutilise l'integrale de volume DEJA ecrite pour
+        # l'emission par maillage (`sampling._evaluated_world_volume_and_bbox`)
+        # plutot que de la redupliquer -- import paresseux, meme motif
+        # defensif que `check_mesh_closed` plus haut dans ce fichier.
+        #
+        # On n'appelle PAS `check_mesh_closed` ici : c'est un lancer de
+        # rayons sur un BVH, beaucoup trop couteux pour un redessin appele a
+        # chaque frame de survol de souris. Un maillage OUVERT donne donc
+        # simplement un volume sans signification physique, affiche tel
+        # quel sans faire planter le panneau -- le bake, lui, refuse
+        # proprement (voir `ops._setup_dynamic_collider`).
+        try:
+            from .sampling import (
+                _evaluated_object_and_depsgraph,
+                _evaluated_world_volume_and_bbox,
+            )
+        except ImportError:
+            _evaluated_object_and_depsgraph = None
+
+        if _evaluated_object_and_depsgraph is not None:
+            obj_eval, _depsgraph = _evaluated_object_and_depsgraph(obj)
+            volume, _bbox_volume = _evaluated_world_volume_and_bbox(obj_eval)
+
+            box = layout.box()
+            if volume <= 0.0:
+                box.label(
+                    text="Volume nul ou maillage ouvert : masse non calculable.",
+                    icon="ERROR",
+                )
+            else:
+                mass = obj_props.density * volume
+                if obj_props.density < 1000.0:
+                    state = "flotte (densité < eau, 1000 kg/m³)"
+                elif obj_props.density > 1000.0:
+                    state = "coule (densité > eau, 1000 kg/m³)"
+                else:
+                    state = "neutre (densité = eau, 1000 kg/m³)"
+                box.label(text=f"Volume : {volume:.4f} m³")
+                box.label(text=f"Masse calculée : {mass:.3f} kg — {state}")
+
+        if not _has_uniform_scale(obj):
+            warn = layout.box()
+            warn.label(text="Échelle non uniforme :", icon="ERROR")
+            warn.label(
+                text="la décomposition en keyframes de fin de bake sera "
+                "approximative (cisaillement)."
+            )
+
+        # `added_mass` (props.py) volontairement PAS expose ici : le
+        # balayage de stabilite du jalon a montre que ce reglage est
+        # structurellement casse (divise l'impulsion de flottaison sans
+        # alleger la gravite appliquee a la masse reelle -- a alpha >= 0.25,
+        # meme un corps de densite 20 kg/m3 traverse une colonne d'eau de
+        # 0.86 m en moins d'une seconde), pas seulement couteux. Remplace
+        # par une formulation implicite dans un lot separe. La propriete
+        # reste declaree cote props.py, seulement retiree de l'UI.
 
 
 # ---------------------------------------------------------------------------

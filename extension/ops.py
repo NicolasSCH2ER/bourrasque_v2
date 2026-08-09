@@ -59,7 +59,11 @@ from .props import (
     whitewater_config_from_scene,
     world_to_solver_dir,
 )
-from .transform import world_to_solver_array, world_to_solver_dir_array
+from .transform import (
+    solver_to_world,
+    world_to_solver_array,
+    world_to_solver_dir_array,
+)
 
 __all__ = ("classes", "register", "unregister")
 
@@ -550,17 +554,303 @@ class _InflowState:
 
 class _ColliderState:
     """Etat maintenu par `BQ_OT_bake` pour un collider, pour toute la duree
-    du bake : la position MONDE de ses sommets a la frame precedente (pour
-    la difference finie de vitesse), et si l'avertissement de topologie
-    changeante a deja ete emis."""
+    du bake.
 
-    __slots__ = ("obj", "friction", "prev_verts_world", "warned_topology")
+    Un collider FIXE (`dynamic` faux — cas majoritaire : bassin, sol,
+    obstacle anime a la main) conserve EXACTEMENT le comportement
+    historique : position MONDE de ses sommets a la frame precedente (pour
+    la difference finie de vitesse), avertissement de topologie changeante
+    au plus une fois, aucune propriete massique calculee, aucun controle de
+    maillage ferme, jamais de keyframe posee (voir `_collect_collider_frame`,
+    qui l'ignore purement et simplement dans son propre traitement).
+
+    Un collider DYNAMIQUE (jalon M17, phase A) porte en plus son maillage de
+    repos (espace SOLVEUR, evalue UNE SEULE FOIS a la premiere frame du bake
+    — voir D6 du plan — par `_setup_dynamic_collider`) et ses proprietes
+    massiques : necessaires a la fois a la declaration du corps rigide
+    aupres du solveur (`Sim.set_collider_bodies`) et a la reconstruction de
+    ses triangles a chaque frame depuis l'etat rigide courant (voir
+    `_dynamic_collider_geometry`), ainsi qu'a la composition des keyframes
+    en fin de bake (`BQ_OT_bake._post_keyframes`).
+
+    `body_index` est l'indice de ce collider dans le tableau `BqRigidBody`
+    transmis a `Sim.set_collider_bodies` — TOUS les colliders y figurent,
+    dynamiques ou non (voir docs/plan-milestone-17.md, section fichiers :
+    "le solveur attend un corps par collider pour que l'attribution
+    tri_body soit coherente") — assigne par `BQ_OT_bake.invoke` dans l'ordre
+    de `self._collider_states`.
+    """
+
+    __slots__ = (
+        "obj",
+        "friction",
+        "prev_verts_world",
+        "warned_topology",
+        "dynamic",
+        "body_index",
+        "density",
+        "use_gravity",
+        "added_mass",
+        "lock_lin",
+        "lock_ang",
+        "restitution",
+        "rest_tris",
+        "rest_offsets",
+        "com0_solver",
+        "com0_world",
+        "m0",
+        "mass",
+        "inv_inertia",
+    )
 
     def __init__(self, obj, friction):
         self.obj = obj
         self.friction = friction
         self.prev_verts_world = None
         self.warned_topology = False
+
+        op = obj.bourrasque
+        self.dynamic = bool(op.dynamic)
+        self.body_index = 0
+        self.density = float(op.density)
+        self.use_gravity = bool(op.use_gravity)
+        self.added_mass = float(op.added_mass)
+        self.lock_lin = tuple(int(bool(b)) for b in op.lock_location)
+        self.lock_ang = tuple(int(bool(b)) for b in op.lock_rotation)
+        self.restitution = float(op.restitution)
+
+        # Rempli par `_setup_dynamic_collider` UNIQUEMENT si `dynamic` est
+        # vrai : maillage de repos (espace solveur), proprietes massiques,
+        # reperes necessaires a la composition des keyframes.
+        self.rest_tris = None
+        self.rest_offsets = None
+        self.com0_solver = None
+        self.com0_world = None
+        self.m0 = None
+        self.mass = 0.0
+        self.inv_inertia = None
+
+
+def _setup_dynamic_collider(state, depsgraph, origin, size):
+    """Capture le maillage de repos et les proprietes massiques d'un
+    collider DYNAMIQUE, a la premiere frame du bake (D6/D7 du plan).
+
+    `state.dynamic` DOIT etre vrai — l'appelant (`BQ_OT_bake.invoke`) ne
+    doit appeler cette fonction que pour les colliders dynamiques : un
+    collider fixe ne subit NI le controle de maillage ferme NI le calcul de
+    proprietes massiques (il continue de passer meme ouvert ou de volume
+    nul, voir `_collect_collider_frame`).
+
+    Leve `ValueError` (message DEJA FORME, nommant l'objet) si le maillage
+    est ouvert ou de volume degenere — l'appelant traduit en refus de bake.
+    Renvoie un message d'avertissement (str) si l'echelle de l'objet n'est
+    pas uniforme (la decomposition en keyframes sera approximative, D8),
+    sinon None. Mute `state` en place.
+    """
+    from . import rigidbody, sampling
+
+    obj = state.obj
+
+    closed, message = sampling.check_mesh_closed(obj)
+    if not closed:
+        raise ValueError(
+            f"« {obj.name} » ne peut pas être un collider dynamique : {message}"
+        )
+
+    obj_eval = obj.evaluated_get(depsgraph)
+    verts_world, tris = sampling.evaluated_world_mesh(obj_eval)
+    verts_solver = world_to_solver_array(verts_world, origin, size)
+
+    try:
+        _volume, mass, com0_solver, inertia_solver = rigidbody.mass_properties(
+            verts_solver, tris, state.density
+        )
+    except ValueError as exc:
+        raise ValueError(f"« {obj.name} » : {exc}") from exc
+
+    state.rest_tris = tris
+    state.rest_offsets = verts_solver - com0_solver
+    state.com0_solver = com0_solver
+    state.com0_world = np.array(
+        solver_to_world(tuple(com0_solver), origin, size), dtype=np.float64
+    )
+    state.m0 = np.array(obj.matrix_world, dtype=np.float64)
+    state.mass = mass
+    state.inv_inertia = np.linalg.inv(inertia_solver)
+
+    loc, rot, scale = obj.matrix_world.decompose()
+    scale_ref = max(abs(scale.x), abs(scale.y), abs(scale.z), 1.0)
+    if (
+        abs(scale.x - scale.y) > 1e-4 * scale_ref
+        or abs(scale.y - scale.z) > 1e-4 * scale_ref
+        or abs(scale.x - scale.z) > 1e-4 * scale_ref
+    ):
+        return (
+            f"« {obj.name} » a une échelle non uniforme : la décomposition "
+            "de sa transformation rigide en position/rotation pour les "
+            "keyframes sera approximative."
+        )
+    return None
+
+
+def _build_rigid_bodies(collider_states):
+    """Construit le tableau `lib.BqRigidBody` transmis a
+    `Sim.set_collider_bodies` — TOUS les colliders y figurent (dynamiques ET
+    fixes), dans l'ordre de `collider_states` (= `body_index`), pour que
+    l'attribution `tri_body` reste coherente (voir docs/plan-milestone-17.md).
+
+    Un collider FIXE (`dynamic` faux) recoit un corps de masse nulle,
+    entierement ignore par la physique — `dynamic=0` fait retomber
+    `k_grid_update` sur le chemin cinematique actuel (voir `bourrasque.h`) :
+    seul son indice compte, pour que ses triangles (attribues par
+    `_collect_collider_frame`) pointent vers une entree valide.
+    """
+    bodies = []
+    for state in collider_states:
+        if state.dynamic:
+            inv_inertia = tuple(float(v) for v in state.inv_inertia.reshape(-1))
+            x = tuple(float(v) for v in state.com0_solver)
+            mass = float(state.mass)
+        else:
+            inv_inertia = (0.0,) * 9
+            x = (0.0, 0.0, 0.0)
+            mass = 0.0
+        bodies.append(
+            lib.BqRigidBody(
+                dynamic=1 if state.dynamic else 0,
+                mass=mass,
+                inv_inertia=inv_inertia,
+                x=x,
+                q=(1.0, 0.0, 0.0, 0.0),
+                v=(0.0, 0.0, 0.0),
+                w=(0.0, 0.0, 0.0),
+                use_gravity=1 if state.use_gravity else 0,
+                added_mass=float(state.added_mass),
+                lock_lin=state.lock_lin,
+                lock_ang=state.lock_ang,
+                restitution=float(state.restitution),
+            )
+        )
+    return bodies
+
+
+# Rotation FIXE reliant les axes SOLVEUR aux axes MONDE — partie lineaire de
+# `world_to_solver`/`world_to_solver_dir` (voir transform.py) :
+# (dx, dy, dz) -> (dx, dz, -dy). Orthogonale, determinant +1 (rotation pure,
+# pas une reflexion).
+#
+# Necessaire pour convertir l'ORIENTATION d'un corps rigide en keyframe
+# monde : le couple qu'accumule le solveur (D1 du plan) vient de positions
+# de GRILLE, donc de vecteurs SOLVEUR (x_noeud - com) — l'integration de
+# l'etat rigide (x, q, v, w) qu'il en deduit est donc necessairement tenue
+# en axes SOLVEUR d'un bout a l'autre (c'est aussi pourquoi
+# `_setup_dynamic_collider` calcule les proprietes massiques sur des
+# sommets deja convertis en espace solveur — meme coherence d'axes que
+# `inv_inertia`). La position se convertit simplement par
+# `solver_to_world` (translation + cette meme rotation) ; l'orientation
+# exige une CONJUGAISON par cette rotation fixe (changement de repere d'une
+# matrice de rotation), pas une simple substitution — une conjugaison par
+# l'identite laisse l'identite inchangee, ce qui NE distingue PAS cette
+# conversion d'un cablage naif a l'etat de repos (voir l'invariant de
+# `rigidbody.compose_body_transform`) : verifiee independamment sur une
+# rotation non triviale par le script de validation Blender reel du jalon.
+_R_SOLVER_FROM_WORLD = np.array(
+    [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]], dtype=np.float64
+)
+
+
+def _solver_quat_to_world(q_solver):
+    """Convertit un quaternion d'orientation de corps rigide — integre par
+    le solveur en axes SOLVEUR — vers son equivalent en axes MONDE, par
+    conjugaison avec la rotation fixe `_R_SOLVER_FROM_WORLD` (voir sa
+    docstring)."""
+    from . import rigidbody
+
+    r_solver = rigidbody.quat_to_matrix(q_solver)
+    r_world = _R_SOLVER_FROM_WORLD.T @ r_solver @ _R_SOLVER_FROM_WORLD
+    return rigidbody.quat_from_matrix(r_world)
+
+
+def _dynamic_collider_geometry(dynamic_states, body_state):
+    """Triangles/vitesses/frictions/tri_body des colliders DYNAMIQUES,
+    reconstruits depuis l'etat rigide COURANT lu du solveur (`body_state`,
+    ndarray `(n_bodies, 13)`, meme mise en forme que
+    `Sim.read_collider_bodies` : `x[3], q[4], v[3], w[3]` par corps,
+    entierement en espace SOLVEUR) — fonction PURE (aucun bpy), callable
+    depuis le thread de calcul du bake (voir `_bake_worker`).
+
+    Pour chaque sommet de repos (espace solveur, capture UNE FOIS a la
+    premiere frame du bake, voir `_setup_dynamic_collider`/D6) : position
+    courante `x_corps + R(q) @ decalage`, vitesse `v + w x (position -
+    x_corps)` — champ de vitesse RIGIDE, PAS une difference finie (D4 du
+    plan : c'est ce qui stabilise le couplage, le corps qui accelere est
+    moins pousse des le sous-pas suivant).
+
+    `dynamic_states` : sous-ensemble de `collider_states` dont `dynamic` est
+    vrai. Renvoie `(tri_all, vel_all, fric_all, tri_body_all)`, memes
+    conventions que `_collect_collider_frame`.
+    """
+    from . import rigidbody
+
+    tri_chunks = []
+    vel_chunks = []
+    fric_chunks = []
+    body_chunks = []
+
+    for state in dynamic_states:
+        n_tri = state.rest_tris.shape[0]
+        if n_tri == 0:
+            continue
+
+        row = body_state[state.body_index]
+        x = row[0:3]
+        q = row[3:7]
+        v = row[7:10]
+        w = row[10:13]
+
+        R = rigidbody.quat_to_matrix(q)
+        verts_now = x[np.newaxis, :] + state.rest_offsets @ R.T
+        rel = verts_now - x[np.newaxis, :]
+        vel_now = v[np.newaxis, :] + np.cross(np.broadcast_to(w, rel.shape), rel)
+
+        tri_chunks.append(verts_now[state.rest_tris].astype(np.float32))
+        vel_chunks.append(vel_now[state.rest_tris].astype(np.float32))
+        fric_chunks.append(np.full(n_tri, state.friction, dtype=np.float32))
+        body_chunks.append(np.full(n_tri, state.body_index, dtype=np.int32))
+
+    if tri_chunks:
+        tri_all = np.concatenate(tri_chunks, axis=0)
+        vel_all = np.concatenate(vel_chunks, axis=0)
+        fric_all = np.concatenate(fric_chunks, axis=0)
+        body_all = np.concatenate(body_chunks, axis=0)
+    else:
+        tri_all = np.empty((0, 3, 3), dtype=np.float32)
+        vel_all = np.empty((0, 3, 3), dtype=np.float32)
+        fric_all = np.empty((0,), dtype=np.float32)
+        body_all = np.empty((0,), dtype=np.int32)
+
+    return tri_all, vel_all, fric_all, body_all
+
+
+def _combine_collider_geometry(static_frame, dynamic_geo):
+    """Concatene la geometrie STATIQUE (pre-extraite, `_collect_collider_frame`)
+    et la geometrie DYNAMIQUE (recalculee depuis l'etat rigide,
+    `_dynamic_collider_geometry`) d'une meme frame, en un seul quadruplet
+    pret pour `Sim.set_colliders(..., tri_body=...)`. Court-circuite la
+    concatenation si l'un des deux cotes est vide (cas courant : un bake
+    sans collider dynamique, ou sans collider fixe)."""
+    tri_s, vel_s, fric_s, body_s = static_frame
+    tri_d, vel_d, fric_d, body_d = dynamic_geo
+    if tri_s.shape[0] == 0:
+        return tri_d, vel_d, fric_d, body_d
+    if tri_d.shape[0] == 0:
+        return tri_s, vel_s, fric_s, body_s
+    return (
+        np.concatenate([tri_s, tri_d], axis=0),
+        np.concatenate([vel_s, vel_d], axis=0),
+        np.concatenate([fric_s, fric_d], axis=0),
+        np.concatenate([body_s, body_d], axis=0),
+    )
 
 
 def _tag_redraw(context):
@@ -1762,20 +2052,38 @@ def _collect_collider_frame(collider_states, depsgraph, origin, size,
     `state.warned_topology` EN PLACE (etat persistant entre deux appels
     successifs, une frame apres l'autre).
 
+    Un collider DYNAMIQUE (`state.dynamic` vrai) est totalement IGNORE ici
+    (`continue` immediat, aucun controle de maillage/topologie, aucune
+    lecture de `evaluated_world_mesh`) : sa geometrie est reconstruite
+    ailleurs depuis l'etat rigide courant, jamais reevaluee depuis la scene
+    (D6 du plan — voir `_dynamic_collider_geometry`). C'est ce qui garantit
+    qu'un collider FIXE (le cas majoritaire) ne perd RIEN de son
+    comportement historique, y compris pour un maillage ouvert ou de volume
+    nul : cette fonction ne lui applique jamais `sampling.check_mesh_closed`
+    ni de calcul de proprietes massiques.
+
     `report` : callable `report(level, message)`, jamais un appel bpy
     direct fait par cette fonction — voir `_emit_inflow_sites_impl` pour la
     meme convention.
 
-    Renvoie `(tri_all, vel_all, fric_all)`, trois ndarray (potentiellement
-    vides) prets pour `Sim.set_colliders`.
+    Renvoie `(tri_all, vel_all, fric_all, tri_body_all)`, quatre ndarray
+    (potentiellement vides) prets pour `Sim.set_colliders`. `tri_body_all`
+    (int32) porte `state.body_index` par triangle — assigne par l'appelant
+    (`BQ_OT_bake.invoke`) AVANT le premier appel a cette fonction.
     """
     from . import sampling
 
     tri_chunks = []
     vel_chunks = []
     fric_chunks = []
+    body_chunks = []
 
     for state in collider_states:
+        if state.dynamic:
+            # Geometrie recalculee depuis l'etat rigide courant (voir
+            # _dynamic_collider_geometry), jamais reevaluee ici — D6.
+            continue
+
         obj_eval = state.obj.evaluated_get(depsgraph)
         verts_world, tris = sampling.evaluated_world_mesh(obj_eval)
         n_tri = tris.shape[0]
@@ -1806,6 +2114,7 @@ def _collect_collider_frame(collider_states, depsgraph, origin, size,
         tri_chunks.append(verts_solver[tris].astype(np.float32))
         vel_chunks.append(vel_solver[tris].astype(np.float32))
         fric_chunks.append(np.full(n_tri, state.friction, dtype=np.float32))
+        body_chunks.append(np.full(n_tri, state.body_index, dtype=np.int32))
 
         state.prev_verts_world = verts_world
 
@@ -1813,12 +2122,14 @@ def _collect_collider_frame(collider_states, depsgraph, origin, size,
         tri_all = np.concatenate(tri_chunks, axis=0)
         vel_all = np.concatenate(vel_chunks, axis=0)
         fric_all = np.concatenate(fric_chunks, axis=0)
+        body_all = np.concatenate(body_chunks, axis=0)
     else:
         tri_all = np.empty((0, 3, 3), dtype=np.float32)
         vel_all = np.empty((0, 3, 3), dtype=np.float32)
         fric_all = np.empty((0,), dtype=np.float32)
+        body_all = np.empty((0,), dtype=np.int32)
 
-    return tri_all, vel_all, fric_all
+    return tri_all, vel_all, fric_all, body_all
 
 
 def _static_collider_triangles(collider_objs, depsgraph, origin, size):
@@ -1852,7 +2163,8 @@ def _static_collider_triangles(collider_objs, depsgraph, origin, size):
 
 
 def _bake_worker(progress, cancel_event, sim, writer, frame_count, frame_dt,
-                  inflow_states, usable_bounds, collider_frames):
+                  inflow_states, usable_bounds, collider_frames,
+                  dynamic_collider_states, body_track):
     """Boucle de calcul du bake de particules — executee dans un
     `threading.Thread(daemon=True)` (voir `BQ_OT_bake.invoke`,
     docs/plan-milestone-7.md D10).
@@ -1860,12 +2172,25 @@ def _bake_worker(progress, cancel_event, sim, writer, frame_count, frame_dt,
     NE TOUCHE JAMAIS bpy (voir la garde en tete de module) : uniquement
     `sim` (appels ctypes, qui relachent le GIL — c'est ce qui rend ce
     thread utile), `writer` (ecriture de fichier), et `progress`/
-    `cancel_event` (objets Python simples). Les colliders animes ont deja
-    ete PRE-EXTRAITS sur le thread principal avant l'appel a cette
-    fonction (`collider_frames`, une liste de `(tri, vel, fric)` par
-    frame, ou `None` si aucun collider) : c'est l'unique moyen de leur
+    `cancel_event` (objets Python simples). Les colliders FIXES animes ont
+    deja ete PRE-EXTRAITS sur le thread principal avant l'appel a cette
+    fonction (`collider_frames`, une liste de `(tri, vel, fric, tri_body)`
+    par frame — voir `_collect_collider_frame` — ou `None` si aucun
+    collider n'est configure pour ce bake) : c'est l'unique moyen de leur
     faire traverser la frontiere thread, leur extraction necessitant le
-    depsgraph bpy (non thread-safe).
+    depsgraph bpy (non thread-safe). Les colliders DYNAMIQUES, eux, sont
+    reconstruits ICI a chaque frame, en PUR numpy (`_dynamic_collider_geometry`),
+    depuis leur maillage de repos (deja capture sur le thread principal,
+    voir `_setup_dynamic_collider`) et l'etat rigide COURANT relu du solveur
+    (`sim.read_collider_bodies`, un appel ctypes — jamais bpy) : c'est ce qui
+    permet a un corps dynamique de traverser la frontiere thread sans jamais
+    toucher la scene.
+
+    `body_track` (liste mutee EN PLACE) accumule une copie de l'etat de
+    TOUS les corps apres CHAQUE frame effectivement calculee — y compris en
+    cas d'annulation en cours de route, ce qui permet a l'appelant de poser
+    des keyframes sur les frames deja bakees plutot que de jeter le travail
+    (voir `BQ_OT_bake._post_keyframes`).
 
     Toute exception est capturee et deposee dans `progress.error` (une
     chaine, jamais l'exception elle-meme — un traceback ou un objet
@@ -1878,17 +2203,30 @@ def _bake_worker(progress, cancel_event, sim, writer, frame_count, frame_dt,
         saturated = False
         pos_buffer = None
         vel_buffer = None
+        body_state = sim.read_collider_bodies() if collider_frames is not None else None
         for frame_index in range(frame_count):
             if cancel_event.is_set():
                 return
             if collider_frames is not None:
-                tri_all, vel_all, fric_all = collider_frames[frame_index]
-                sim.set_colliders(tri_all, vel_all, fric_all)
+                static_frame = collider_frames[frame_index]
+                if dynamic_collider_states:
+                    dynamic_geo = _dynamic_collider_geometry(
+                        dynamic_collider_states, body_state
+                    )
+                    tri_all, vel_all, fric_all, body_all = _combine_collider_geometry(
+                        static_frame, dynamic_geo
+                    )
+                else:
+                    tri_all, vel_all, fric_all, body_all = static_frame
+                sim.set_colliders(tri_all, vel_all, fric_all, tri_body=body_all)
             _total, saturated = _emit_inflow_sites_impl(
                 sim, inflow_states, usable_bounds, frame_index, frame_dt,
                 saturated, lambda level, msg: progress.reports.put((level, msg)),
             )
             sim.step(frame_dt)
+            if collider_frames is not None:
+                body_state = sim.read_collider_bodies()
+                body_track.append(body_state.copy())
             pos_buffer = sim.read_positions(out=pos_buffer)
             vel_buffer = sim.read_velocities(out=vel_buffer)
             writer.append_frame(pos_buffer, vel_buffer)
@@ -1951,6 +2289,16 @@ class BQ_OT_bake(bpy.types.Operator):
     # Colliders de la scene (liste de _ColliderState), collectes une fois a
     # invoke() ; chacun est reevalue a chaque frame (_update_colliders).
     _collider_states = ()
+    # Sous-ensemble de _collider_states dont `dynamic` est vrai (jalon M17,
+    # phase A) — memorise separement pour ne pas reparcourir/refiltrer
+    # _collider_states a chaque frame du bake. `()` si aucun collider
+    # dynamique (bake inchange, voir _update_colliders/_bake_worker).
+    _dynamic_collider_states = ()
+    # Etat de TOUS les corps rigides (dynamiques et fixes), une entree par
+    # frame effectivement bakee (ndarray (n_bodies, 13), voir
+    # Sim.read_collider_bodies) — accumule par _bake_worker, consomme par
+    # _post_keyframes. `None` tant qu'aucun collider n'est configure.
+    _body_track = None
     # Frame Blender courante au moment ou bq.bake a ete invoque : restauree
     # dans _cleanup, sur TOUS les chemins de sortie (fin normale,
     # annulation, exception) — voir _advance_scene_frame, qui fait avancer
@@ -2221,6 +2569,16 @@ class BQ_OT_bake(bpy.types.Operator):
                 for obj in scene.objects
                 if obj.bourrasque.role == "COLLIDER"
             ]
+            # Indice de corps STABLE (jalon M17, phase A) : l'ordre de
+            # collecte ci-dessus EST l'ordre transmis a
+            # `Sim.set_collider_bodies`, TOUS les colliders y figurant
+            # (dynamiques et fixes, voir _build_rigid_bodies) pour que
+            # l'attribution `tri_body` reste coherente.
+            for body_index, state in enumerate(self._collider_states):
+                state.body_index = body_index
+            self._dynamic_collider_states = [
+                state for state in self._collider_states if state.dynamic
+            ]
 
             for emitter_index, (obj, mat_index) in enumerate(emitter_specs):
                 op = obj.bourrasque
@@ -2404,17 +2762,53 @@ class BQ_OT_bake(bpy.types.Operator):
 
             self._frame_count = props.frame_end - props.frame_start + 1
 
-            # D10 : PRE-EXTRACTION de la geometrie des colliders animes,
-            # frame par frame, ICI sur le thread PRINCIPAL — le thread de
-            # calcul lance plus bas (voir _bake_worker) ne doit plus jamais
-            # toucher bpy/le depsgraph (voir la garde en tete de module).
-            # Reutilise _advance_scene_frame (avance self._frame_index puis
-            # self._scene, evalue self._depsgraph) et _collect_collider_frame
-            # (extraction pure) telles quelles, exactement comme le faisait
-            # l'ancienne boucle modale frame par frame.
+            # D10 : PRE-EXTRACTION de la geometrie des colliders FIXES
+            # animes, frame par frame, ICI sur le thread PRINCIPAL — le
+            # thread de calcul lance plus bas (voir _bake_worker) ne doit
+            # plus jamais toucher bpy/le depsgraph (voir la garde en tete de
+            # module). Reutilise _advance_scene_frame (avance
+            # self._frame_index puis self._scene, evalue self._depsgraph)
+            # et _collect_collider_frame (extraction pure, qui IGNORE
+            # desormais les colliders dynamiques — voir sa docstring)
+            # exactement comme le faisait l'ancienne boucle modale frame par
+            # frame.
             self._collider_frames = None
+            self._body_track = None
             if self._collider_states:
                 origin, size = self._domain_transform
+
+                # M17/phase A : maillage de repos + proprietes massiques des
+                # colliders DYNAMIQUES, captures UNE SEULE FOIS, a la
+                # PREMIERE frame du bake (D6/D7 du plan) — donc AVANT la
+                # boucle de pre-extraction ci-dessous, sur la meme frame
+                # qu'elle (idx == 0). Un collider FIXE ne passe jamais par
+                # ce chemin : ni controle de maillage ferme, ni calcul de
+                # proprietes massiques ne lui sont appliques.
+                self._frame_index = 0
+                self._advance_scene_frame()
+                warnings = []
+                for state in self._dynamic_collider_states:
+                    try:
+                        warning = _setup_dynamic_collider(
+                            state, self._depsgraph, origin, size
+                        )
+                    except ValueError as exc:
+                        self.report({"ERROR"}, str(exc))
+                        self._cleanup(context)
+                        return {"CANCELLED"}
+                    if warning is not None:
+                        warnings.append(warning)
+                for warning in warnings:
+                    self.report({"WARNING"}, warning)
+
+                # Un corps par collider (dynamique ET fixe), meme ordre que
+                # self._collider_states == body_index : voir
+                # _build_rigid_bodies. Appele UNE SEULE FOIS (voir
+                # bq_set_collider_bodies, bourrasque.h) — jamais par frame.
+                bodies = _build_rigid_bodies(self._collider_states)
+                self._sim.set_collider_bodies(bodies)
+                self._body_track = []
+
                 frames = []
                 for idx in range(self._frame_count):
                     self._frame_index = idx
@@ -2454,7 +2848,8 @@ class BQ_OT_bake(bpy.types.Operator):
                     self._progress, self._cancel_event, self._sim,
                     self._writer, self._frame_count, self._frame_dt,
                     self._inflow_states, self._usable_bounds,
-                    self._collider_frames,
+                    self._collider_frames, self._dynamic_collider_states,
+                    self._body_track,
                 ),
                 daemon=True,
             )
@@ -2537,6 +2932,12 @@ class BQ_OT_bake(bpy.types.Operator):
             return {"CANCELLED"}
 
         if self._cancel_event.is_set():
+            # Annulation : les keyframes des corps dynamiques sont posees
+            # sur les frames EFFECTIVEMENT calculees avant de nettoyer (D8
+            # du plan — le travail deja fait n'est jamais jete). Voir
+            # _post_keyframes, qui lit self._body_track/self._dynamic_
+            # collider_states, tous deux reinitialises par _cleanup().
+            self._post_keyframes(context)
             self._cleanup(context)
             self.report({"INFO"}, "Bake annulé.")
             return {"CANCELLED"}
@@ -2626,25 +3027,43 @@ class BQ_OT_bake(bpy.types.Operator):
 
         Delegue a `_collect_collider_frame` (fonction PURE, aucun bpy au-
         dela de `self._depsgraph` deja resolu par `_advance_scene_frame`)
-        pour l'extraction geometrique, puis applique le resultat a
-        `self._sim` — ce dernier appel EST le seul geste propre a cette
-        methode d'instance. Conservee UNIQUEMENT pour la compatibilite des
-        scripts de `tools/repro/*.py` (voir `_emit_inflow_sites` pour la
-        meme discipline) : le thread de calcul de `BQ_OT_bake` (voir
-        `_bake_worker`) n'appelle jamais cette methode, il consomme
-        directement `self._collider_frames`, PRE-EXTRAIT par
-        `_collect_collider_frame` sur le thread principal avant son
-        lancement (voir `BQ_OT_bake.invoke` et la garde en tete de module).
+        pour l'extraction geometrique des colliders FIXES, la combine
+        (`_combine_collider_geometry`) a la geometrie des colliders
+        DYNAMIQUES reconstruite depuis l'etat rigide COURANT
+        (`self._sim.read_collider_bodies`, `_dynamic_collider_geometry`),
+        puis applique le resultat a `self._sim` — ces derniers gestes SONT
+        les seuls propres a cette methode d'instance. Conservee pour la
+        compatibilite des scripts de `tools/repro/*.py` (voir
+        `_emit_inflow_sites` pour la meme discipline) : le thread de calcul
+        de `BQ_OT_bake` (voir `_bake_worker`) n'appelle jamais cette
+        methode, il consomme directement `self._collider_frames`,
+        PRE-EXTRAIT par `_collect_collider_frame` sur le thread principal
+        avant son lancement (voir `BQ_OT_bake.invoke` et la garde en tete de
+        module), et reconstruit sa propre part dynamique en pur numpy.
+
+        `getattr(self, "_dynamic_collider_states", ())` : les scripts de
+        `tools/repro/*.py` anterieurs a ce jalon lient cette methode a un
+        faux operateur minimal qui ne definit pas cet attribut — absent, on
+        le traite comme "aucun collider dynamique" (comportement inchange).
         """
         if not self._collider_states:
             return
 
         origin, size = self._domain_transform
-        tri_all, vel_all, fric_all = _collect_collider_frame(
+        static_frame = _collect_collider_frame(
             self._collider_states, self._depsgraph, origin, size,
             self._frame_dt, self.report,
         )
-        self._sim.set_colliders(tri_all, vel_all, fric_all)
+        dynamic_states = getattr(self, "_dynamic_collider_states", ())
+        if dynamic_states:
+            body_state = self._sim.read_collider_bodies()
+            dynamic_geo = _dynamic_collider_geometry(dynamic_states, body_state)
+            tri_all, vel_all, fric_all, body_all = _combine_collider_geometry(
+                static_frame, dynamic_geo
+            )
+        else:
+            tri_all, vel_all, fric_all, body_all = static_frame
+        self._sim.set_colliders(tri_all, vel_all, fric_all, tri_body=body_all)
 
     def _advance_frame(self):
         """Avance la simulation d'UNE frame : avance la frame Blender (pour
@@ -2663,12 +3082,71 @@ class BQ_OT_bake(bpy.types.Operator):
         self._pos_buffer = self._sim.read_positions(out=self._pos_buffer)
         self._writer.append_frame(self._pos_buffer)
 
+    # -- keyframes des corps rigides dynamiques (D8 du plan) -------------
+
+    def _post_keyframes(self, context):
+        """Pose les keyframes `location`/`rotation_quaternion` des colliders
+        DYNAMIQUES sur les frames EFFECTIVEMENT bakees (D8 du plan) —
+        appelee AVANT `_cleanup` (qui reinitialise `self._collider_states`/
+        `self._dynamic_collider_states`/`self._body_track`), aussi bien en
+        fin normale (`_finish`) qu'en annulation (`modal`) : le travail deja
+        calcule n'est jamais jete.
+
+        Un collider FIXE (`dynamic` faux) n'est JAMAIS keyframe ici — seuls
+        `self._dynamic_collider_states` sont parcourus.
+
+        `self._body_track[frame_index]` est l'etat de TOUS les corps, en
+        espace SOLVEUR, apres le pas de la frame `frame_index` (voir
+        `_bake_worker`). La position se convertit en monde par
+        `solver_to_world` (point). L'orientation se convertit par
+        `_solver_quat_to_world` (conjugaison par la rotation fixe
+        solveur<->monde, voir sa docstring) AVANT d'etre composee avec
+        `com0_world`/`m0` (deja en espace monde, captures par
+        `_setup_dynamic_collider`) via `rigidbody.compose_body_transform`.
+        """
+        if not self._dynamic_collider_states or not self._body_track:
+            return
+
+        from . import rigidbody
+
+        origin, size = self._domain_transform
+        frame_start = self._scene.bourrasque.frame_start
+        n_done = len(self._body_track)
+
+        for state in self._dynamic_collider_states:
+            obj = state.obj
+            obj.rotation_mode = "QUATERNION"
+            for frame_index in range(n_done):
+                row = self._body_track[frame_index][state.body_index]
+                x_solver = row[0:3]
+                q_solver = row[3:7]
+
+                x_world = np.array(
+                    solver_to_world(tuple(x_solver), origin, size),
+                    dtype=np.float64,
+                )
+                q_world = _solver_quat_to_world(q_solver)
+
+                m = rigidbody.compose_body_transform(
+                    x_world, q_world, state.com0_world, state.m0
+                )
+                loc, quat, _uniform_scale_ok = rigidbody.decompose_loc_rot(m)
+
+                blender_frame = frame_start + frame_index
+                obj.location = tuple(loc)
+                obj.rotation_quaternion = tuple(quat)
+                obj.keyframe_insert(data_path="location", frame=blender_frame)
+                obj.keyframe_insert(
+                    data_path="rotation_quaternion", frame=blender_frame
+                )
+
     # -- fin normale : ferme proprement puis rafraichit l'affichage ------
 
     def _finish(self, context):
         scene = self._scene
         n_particles = self._sim.particle_count
         mat_array = self._sim.read_materials()
+        self._post_keyframes(context)
         self._cleanup(context)
 
         from . import display
@@ -2743,6 +3221,8 @@ class BQ_OT_bake(bpy.types.Operator):
         self._inflow_states = ()
         self._saturated = False
         self._collider_states = ()
+        self._dynamic_collider_states = ()
+        self._body_track = None
 
         # Restaure la frame Blender d'origine, sur TOUS les chemins de
         # sortie (fin normale, ESC, exception) : `_advance_scene_frame` a
@@ -2756,6 +3236,97 @@ class BQ_OT_bake(bpy.types.Operator):
         BQ_OT_bake.cancel_requested = False
         BQ_OT_bake._active_instance = None
         _tag_redraw(context)
+
+
+# ---------------------------------------------------------------------------
+# BQ_OT_clear_rigid_keys
+# ---------------------------------------------------------------------------
+
+
+class BQ_OT_clear_rigid_keys(bpy.types.Operator):
+    """Retire les keyframes `location`/`rotation_quaternion` posees par un
+    bake precedent (voir `BQ_OT_bake._post_keyframes`, D8 du plan) sur les
+    colliders DYNAMIQUES de la scene.
+
+    Ne touche JAMAIS un collider FIXE (`dynamic` faux), meme s'il porte sa
+    propre animation posee a la main par l'artiste (obstacle anime, cas
+    majoritaire) — c'est le piege du jalon : cet operateur cible les corps
+    DYNAMIQUES, pas tous les colliders. Ne supprime que les F-curves
+    `location`/`rotation_quaternion` de l'action courante, jamais
+    `animation_data_clear()` en bloc : un collider dynamique ne devrait
+    porter aucune autre animation (D6 — « dynamique » est un interrupteur
+    exclusif avec l'anim), mais ne pas presumer d'un `custom property
+    driver` ou autre F-curve qu'un artiste y aurait tout de meme ajoute.
+    """
+
+    bl_idname = "bq.clear_rigid_keys"
+    bl_label = "Effacer les clés des corps rigides"
+    bl_description = (
+        "Retire les clés location/rotation posées par le bake sur les "
+        "colliders dynamiques (n'affecte jamais un collider fixe)"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return any(
+            obj.bourrasque.role == "COLLIDER" and obj.bourrasque.dynamic
+            for obj in context.scene.objects
+        )
+
+    @staticmethod
+    def _fcurve_containers(anim):
+        """Renvoie la liste des conteneurs de F-curves (chacun offrant
+        `.find(data_path, index=...)` et `.remove(fcurve)`) portant
+        potentiellement les clés posees par `_post_keyframes` sur `anim`.
+
+        Deux representations coexistent selon la version de Blender :
+        `action.fcurves` directement (action "legacy", < 4.4) ou un
+        `ActionChannelbag` par `(layer, strip)` (action "layered",
+        Blender 4.4+/5.x — meme motif que `add_animated_fixed_collider`
+        dans `tools/repro/verify_rigidbody_bake.py`). Renvoie une liste vide
+        si `anim`/son action est absente.
+        """
+        action = anim.action if anim is not None else None
+        if action is None:
+            return []
+        try:
+            return [action.fcurves]
+        except AttributeError:
+            pass
+        containers = []
+        for layer in action.layers:
+            for strip in layer.strips:
+                channelbag = strip.channelbag(anim.action_slot)
+                if channelbag is not None:
+                    containers.append(channelbag.fcurves)
+        return containers
+
+    def execute(self, context):
+        cleared = 0
+        for obj in context.scene.objects:
+            if obj.bourrasque.role != "COLLIDER" or not obj.bourrasque.dynamic:
+                continue
+
+            removed_here = False
+            for container in self._fcurve_containers(obj.animation_data):
+                for data_path, n_components in (
+                    ("location", 3),
+                    ("rotation_quaternion", 4),
+                ):
+                    for index in range(n_components):
+                        fcurve = container.find(data_path, index=index)
+                        if fcurve is not None:
+                            container.remove(fcurve)
+                            removed_here = True
+            if removed_here:
+                cleared += 1
+
+        self.report(
+            {"INFO"},
+            f"Clés retirées sur {cleared} collider(s) dynamique(s).",
+        )
+        return {"FINISHED"}
 
 
 # ---------------------------------------------------------------------------
@@ -3706,6 +4277,7 @@ classes = (
     BQ_OT_migrate_materials,
     BQ_OT_bake,
     BQ_OT_cancel_bake,
+    BQ_OT_clear_rigid_keys,
     BQ_OT_free_cache,
     BQ_OT_free_mesh_cache,
     BQ_OT_bake_mesh,

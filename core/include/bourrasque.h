@@ -150,13 +150,17 @@ BQ_API int bq_read_cnrm(BqSim* sim, float* dst);
  *
  * Couplage fluide -> solide (M17, phase A) : le solveur porte l'etat de
  * chaque corps (position, orientation, vitesses) et l'integre a la cadence
- * du sous-pas -- l'impulsion que le fluide donne a un corps est recoltee
- * gratuitement la ou la condition de contact la retire au fluide
- * (troisieme loi de Newton, cf. k_grid_update dans mlsmpm.cu), aucune
- * integrale de pression a reconstruire. Python possede la geometrie
- * (maillage, proprietes massiques) et relit l'etat apres chaque bq_step ;
- * le solveur ne connait que la boite englobante physique du corps (masse,
- * inertie) et son etat cinematique.
+ * du sous-pas. Depuis M17/A5, ce couplage est IMPLICITE : le corps et la
+ * masse de fluide qui le touche sont resolus comme un choc parfaitement
+ * inelastique (systeme lineaire 6x6 par corps, cf. k_body_solve dans
+ * mlsmpm.cu) plutot que par application d'une impulsion explicite puis
+ * esperance de convergence -- inconditionnellement stable, conservatif par
+ * construction (ce que la condition de contact de k_grid_update retire
+ * ensuite au fluide, avec la vitesse de mur RESOLUE, est exactement ce que
+ * ce choc lui avait deja impute). Python possede la geometrie (maillage,
+ * proprietes massiques) et relit l'etat apres chaque bq_step ; le solveur
+ * ne connait que la boite englobante physique du corps (masse, inertie) et
+ * son etat cinematique.
  */
 typedef struct BqRigidBody {
     int   dynamic;          /* 0 = collider cinematique/statique, comportement actuel inchange */
@@ -168,7 +172,19 @@ typedef struct BqRigidBody {
     float v[3];             /* vitesse lineaire initiale */
     float w[3];             /* vitesse angulaire initiale */
     int   use_gravity;
-    float added_mass;       /* alpha, cf. D5 du plan */
+    float added_mass;       /* DEPRECIE depuis M17/A5, SANS EFFET (valeur ignoree par le
+                               solveur, jamais lue). Portait le facteur alpha de la masse
+                               ajoutee explicite (D5 du plan) : approximation qui divisait
+                               l'impulsion recue par le corps sans jamais restituer le
+                               reste au fluide -- un puits de quantite de mouvement mesure
+                               (derive de 20,7% a alpha=1 sur le test de conservation),
+                               pas un simple compromis de stabilite. Remplace par un
+                               couplage implicite inconditionnellement stable (choc
+                               inelastique corps/fluide, cf. k_body_solve dans mlsmpm.cu)
+                               qui ne necessite plus aucun reglage. Champ conserve, jamais
+                               retire : l'ABI est deja a 11 et le champ est expose cote
+                               Python (extension/props.py) -- BQ_ABI_VERSION ne change pas
+                               pour cette tache. */
     int   lock_lin[3];      /* 1 = axe monde bloque en translation */
     int   lock_ang[3];
     float restitution;      /* reserve pour la phase B (contact corps-corps), non lu ici */
@@ -195,9 +211,19 @@ BQ_API int bq_set_collider_bodies(BqSim* sim, const BqRigidBody* bodies, int n_b
 BQ_API int bq_read_collider_bodies(BqSim* sim, float* dst);
 
 /* Copie vers `dst` (n_bodies*7 floats par corps : impulsion lineaire [3],
-   impulsion angulaire (couple) [3], masse de fluide en contact [1]) le
-   wrench recolte par le DERNIER sous-pas effectue -- diagnostic, et utilise
-   par les tests de validation de conservation de quantite de mouvement.
+   moment angulaire [3], masse de fluide couplee [1]) le wrench du DERNIER
+   sous-pas effectue -- diagnostic, et utilise par les tests de validation de
+   conservation de quantite de mouvement.
+
+   Depuis M17/A5 (couplage implicite), ce n'est PLUS la somme brute recoltee
+   a la grille (celle-ci n'est plus une impulsion mais une quantite de
+   mouvement de fluide-en-contact, cf. k_grid_gather dans mlsmpm.cu) : c'est
+   l'impulsion et le moment EFFECTIFS, c'est-a-dire ce que le corps a
+   REELLEMENT recu ce sous-pas en resolvant le choc inelastique avec le
+   fluide -- m_b*(v_new-v_avant) et I_b*(w_new-w_avant). La 7e valeur (masse
+   de fluide couplee) reste la masse totale de noeuds de grille entree dans
+   la resolution, comme en phase A1.
+
    N'est PAS une somme sur la frame : chaque sous-pas remet l'accumulateur a
    zero (cf. bq_step). Renvoie le nombre de corps copies (peut etre 0), ou
    -1 sur erreur. */

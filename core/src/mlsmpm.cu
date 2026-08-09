@@ -4,11 +4,13 @@
  * fichier. Chaque kernel est la transcription d'un bloc de Sim.substep().
  * En cas de doute sur une formule, la reference NumPy fait foi.
  *
- * Pipeline par substep :
- *   1. k_clear_grid  : remise a zero (masse, quantite de mouvement)
- *   2. k_p2g         : maj de F, contrainte de Cauchy, scatter atomique
- *   3. k_grid_update : v = mv/m, gravite, conditions aux limites separantes
- *   4. k_g2p         : gather v et C (APIC), advection, maj de J (eau)
+ * Pipeline par substep (fluide seul -- cf. bq_step pour l'ordre complet
+ * quand des corps rigides sont declares, M17) :
+ *   1. k_clear_grid        : remise a zero (masse, quantite de mouvement)
+ *   2. k_p2g                : maj de F, contrainte de Cauchy, scatter atomique
+ *   3. k_grid_apply_gravity : v = mv/m, gravite
+ *   4. k_grid_update         : conditions aux limites separantes (contact)
+ *   5. k_g2p                 : gather v et C (APIC), advection, maj de J (eau)
  */
 #define BQ_BUILD
 #include "bourrasque.h"
@@ -118,6 +120,60 @@ __device__ inline float3 vcross(float3 a, float3 b) {
 }
 __device__ inline float vdot(float3 a, float3 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+/* Matrice de produit vectoriel [a]x, telle que [a]x * v == a x v pour tout v
+ * (utilisee par le couplage implicite fluide-solide, cf. k_body_solve). */
+__device__ inline mat3 skew(float3 a) {
+    mat3 r{};
+    r.m[0] =  0.f;  r.m[1] = -a.z;  r.m[2] =  a.y;
+    r.m[3] =  a.z;  r.m[4] =  0.f;  r.m[5] = -a.x;
+    r.m[6] = -a.y;  r.m[7] =  a.x;  r.m[8] =  0.f;
+    return r;
+}
+
+/* Resolution d'un systeme lineaire 6x6 par elimination de Gauss avec pivot
+ * partiel -- utilise par k_body_solve pour le couplage implicite corps/fluide
+ * (M17/A5). n_bodies est petit (<= BQ_MAX_BODIES = 64) : un thread par corps,
+ * elimination sequentielle, largement suffisant. Le systeme construit par
+ * k_body_solve est symetrique defini positif (cf. commentaire de ce noyau),
+ * mais le pivot partiel est conserve comme garde-fou peu couteux plutot que
+ * de s'appuyer sur Cholesky, qui suppose la SPD-tude exacte et diverge
+ * silencieusement au moindre residu numerique. A[6][6] est detruite par
+ * l'appel (elimination en place). */
+__device__ inline void solve6x6(float A[6][6], float b[6], float x[6]) {
+    for (int col = 0; col < 6; ++col) {
+        int piv = col;
+        float best = fabsf(A[col][col]);
+        for (int r = col + 1; r < 6; ++r) {
+            float v = fabsf(A[r][col]);
+            if (v > best) { best = v; piv = r; }
+        }
+        if (piv != col) {
+            for (int c = 0; c < 6; ++c) { float t = A[col][c]; A[col][c] = A[piv][c]; A[piv][c] = t; }
+            float t = b[col]; b[col] = b[piv]; b[piv] = t;
+        }
+        float diag = A[col][col];
+        /* garde-fou : un systeme degenere (corps sans inertie propre sur un
+         * axe, par exemple) ne doit jamais produire une division par ~0 --
+         * seul un corps mal configure cote Python en paierait le prix (une
+         * reponse figee sur cet axe), jamais un NaN qui contaminerait toute
+         * la boucle de sous-pas. */
+        if (fabsf(diag) < 1e-12f) diag = (diag >= 0.f) ? 1e-12f : -1e-12f;
+        for (int r = col + 1; r < 6; ++r) {
+            float f = A[r][col] / diag;
+            if (f == 0.f) continue;
+            for (int c = col; c < 6; ++c) A[r][c] -= f * A[col][c];
+            b[r] -= f * b[col];
+        }
+    }
+    for (int r = 5; r >= 0; --r) {
+        float s = b[r];
+        for (int c = r + 1; c < 6; ++c) s -= A[r][c] * x[c];
+        float diag = A[r][r];
+        if (fabsf(diag) < 1e-12f) diag = (diag >= 0.f) ? 1e-12f : -1e-12f;
+        x[r] = s / diag;
+    }
 }
 
 /* ------------------------------------------------------- colliders : geo */
@@ -924,24 +980,48 @@ __device__ inline bool normal_corroborated(const float* __restrict__ sdf,
            sdf[(bi * res.y + bj) * res.z + bk] < 0.f;
 }
 
+/* Applique la masse (mv -> v) et la gravite a chaque noeud de grille -- ex-
+ * premiere moitie de k_grid_update, sortie en noyau independant (M17/A5)
+ * parce que l'ordre du sous-pas exige desormais que la grille porte deja
+ * "la vitesse apres gravite" AVANT la recolte du couplage implicite
+ * (k_grid_gather, cf. plus bas) et AVANT la resolution du systeme 6x6
+ * (k_body_solve) -- la condition de contact (ce que fait encore
+ * k_grid_update) ne peut, elle, s'appliquer qu'APRES : c'est l'etat resolu
+ * du corps qui doit fournir la vitesse de mur.
+ *
+ * Comportement NUMERIQUEMENT IDENTIQUE a l'ancien bloc inline : memes
+ * operations flottantes, dans le meme ordre, sur la meme cellule -- scinder
+ * ce calcul en son propre noyau ne change aucun bit de resultat, seulement
+ * le sous-pas ou il s'execute par rapport au couplage corps rigide. Tourne
+ * sur TOUTE la grille, avec ou sans corps declare (n_bodies == 0 compris) :
+ * c'est le meme calcul qu'avant pour ce cas, cf. non-regression D14. */
+__global__ void k_grid_apply_gravity(float4* grid, int ncell) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= ncell) return;
+    float4 g = grid[id];
+    if (g.w <= 0.f) return;
+    float3 v = make_float3(g.x / g.w, g.y / g.w, g.z / g.w);
+    v.y += c_p.dt * c_p.gravity_y;
+    grid[id] = make_float4(v.x, v.y, v.z, g.w);
+}
+
 __global__ void k_grid_update(float4* grid, const float* __restrict__ sdf,
                               const float4* __restrict__ cvel,
                               const float4* __restrict__ cnrm,
                               const int* __restrict__ cbody,
                               const BqRigidBody* __restrict__ bodies,
-                              float* __restrict__ wrench, int ncell) {
+                              int ncell) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= ncell) return;
     float4 g = grid[id];
     if (g.w <= 0.f) return;
 
-    float3 v = make_float3(g.x / g.w, g.y / g.w, g.z / g.w);
-    v.y += c_p.dt * c_p.gravity_y;
-    /* v_pre : capturee APRES la gravite, juste avant la condition de
-     * contact -- c'est elle qui sert de reference a la recolte d'impulsion
-     * plus bas (D1, plan M17) : un corps qui porte une colonne d'eau doit en
-     * sentir le poids, donc la gravite doit deja etre dans v_pre. */
-    float3 v_pre = v;
+    /* La grille porte deja "vitesse apres gravite" (k_grid_apply_gravity,
+     * execute plus tot dans le sous-pas -- cf. bq_step). Ce noyau n'a plus
+     * qu'a resoudre la condition de contact ; la recolte d'impulsion (D1
+     * jusqu'a A1) a ete DEPLACEE vers k_grid_gather/k_body_solve (M17/A5,
+     * couplage implicite) -- ce noyau ne touche donc plus a d_body_wrench. */
+    float3 v = make_float3(g.x, g.y, g.z);
 
     int3 res = c_p.res; int bnd = c_p.bound;
     int i = id / (res.y * res.z);
@@ -1019,38 +1099,6 @@ __global__ void k_grid_update(float4* grid, const float* __restrict__ sdf,
         }
     }
 
-    /* Recolte de l'impulsion (D1, plan M17) : la quantite de mouvement
-     * retiree au noeud par le bloc de contact ci-dessus, masse * (v_pre -
-     * v), est EXACTEMENT l'impulsion que le fluide donne au corps
-     * (troisieme loi de Newton -- ce que le collider a donne au fluide est
-     * masse*(v-v_pre), le corps recoit l'oppose). Nulle des que le bloc
-     * ci-dessus n'a pas modifie v (pas de corps, corps non dynamique, hors
-     * bande de contact, normale nulle, ou vn >= 0 en mode unilateral) --
-     * l'atomicAdd est alors un ajout de zero, sans effet mais sans branche
-     * supplementaire a maintenir.
-     *
-     * Restriction a phi > -h (D1) : au-dela, la cellule est dans
-     * l'interieur PROFOND du solide (au-dela de la bande de contact), donc
-     * seulement atteignable par une particule ayant fuite a travers la
-     * geometrie -- une impulsion recoltee la serait fantome, sans rapport
-     * avec un contact de surface reel. Les parois du domaine (clamps plus
-     * bas dans ce noyau) ne portent jamais de body_id (cf. D2), donc ne
-     * contribuent jamais ici. */
-    if (body_dyn && phi > -h) {
-        float3 dp = make_float3(g.w * (v_pre.x - v.x),
-                                g.w * (v_pre.y - v.y),
-                                g.w * (v_pre.z - v.z));
-        float3 xnode = make_float3(i * c_p.dx, j * c_p.dx, k * c_p.dx);
-        const BqRigidBody& bd = bodies[body_id];
-        float3 bx = make_float3(bd.x[0], bd.x[1], bd.x[2]);
-        float3 r = vsub(xnode, bx);
-        float3 dtau = vcross(r, dp);
-        float* wr = wrench + 7 * body_id;
-        atomicAdd(&wr[0], dp.x); atomicAdd(&wr[1], dp.y); atomicAdd(&wr[2], dp.z);
-        atomicAdd(&wr[3], dtau.x); atomicAdd(&wr[4], dtau.y); atomicAdd(&wr[5], dtau.z);
-        atomicAdd(&wr[6], g.w);
-    }
-
     /* Conditions separantes : composante normale annulee vers la paroi.
      *
      * Le test porte sur j <= b, et non j < b : le clamp de position de k_g2p
@@ -1095,16 +1143,17 @@ __global__ void k_grid_update(float4* grid, const float* __restrict__ sdf,
     grid[id] = make_float4(v.x, v.y, v.z, g.w);
 }
 
-/* Integration des corps rigides (D5, plan M17), un thread par corps. Ne
- * fait rien si le corps est cinematique/statique : sa position/orientation
- * est fournie par l'appelant (Blender), le solveur n'y touche jamais.
+/* Prediction des corps rigides (M17/A5), un thread par corps -- ex-
+ * k_integrate_bodies, ampute de tout ce qui touchait l'impulsion fluide
+ * (celle-ci est desormais integree implicitement par k_body_solve, apres
+ * k_grid_gather). Ne fait rien si le corps est cinematique/statique : sa
+ * position/orientation est fournie par l'appelant (Blender), le solveur n'y
+ * touche jamais.
  *
- * Masse ajoutee (D5) : m_eff = mass + added_mass * m_contact, ou m_contact
- * (7e accumulateur du wrench) est la masse de fluide qui a effectivement
- * contribue a l'impulsion ce sous-pas -- gratuite, recoltee par le meme
- * atomicAdd que la force. Attenue un couplage explicite instable quand un
- * corps est leger devant la masse de fluide en contact, sans seuil
- * arbitraire sur dv.
+ * Ce noyau applique les SEULES forces qui ne viennent pas du fluide :
+ * gravite et terme gyroscopique. C'est le "v_b, w_b" de la derivation du
+ * couplage implicite (cf. k_body_solve) -- l'etat du corps juste avant
+ * qu'il ne "percute" la masse de fluide en contact.
  *
  * Rotation : l'inertie inverse est portee en repere de CORPS
  * (BqRigidBody::inv_inertia), tournee en repere MONDE via R * I_inv * R^T
@@ -1113,33 +1162,18 @@ __global__ void k_grid_update(float4* grid, const float* __restrict__ sdf,
  * necessaire des qu'un corps n'a pas une inertie isotrope -- une toupie qui
  * ne le recevrait pas ne precederait jamais).
  *
- * Masse ajoutee en rotation : approximation SCALAIRE assumee (l'effet est en
- * toute rigueur tensoriel -- la masse ajoutee depend de la direction et de
- * la forme du corps face a l'ecoulement). On se contente de diviser la
- * contribution de la torque FLUIDE (pas le terme gyroscopique, qui n'a rien
- * a voir avec le contact) par le meme facteur mass/m_eff que la translation,
- * cf. commentaire de la spec (plan-milestone-17.md, D5/A1). */
-__global__ void k_integrate_bodies(BqRigidBody* __restrict__ bodies,
-                                   const float* __restrict__ wrench,
-                                   int n_bodies) {
+ * Verrous d'axe appliques ICI (etat predit) ET A NOUVEAU apres k_body_solve
+ * (D13 du plan M17) : la resolution du systeme 6x6 peut reintroduire une
+ * composante verrouillee (le fluide pousse sur un axe bloque -> la ligne/
+ * colonne correspondante du systeme n'est pas annulee, seul le verrou final
+ * l'est). Les appliquer aussi ici evite que le "v_b, w_b" servant de membre
+ * de droite au solve porte deja une composante qui devrait etre nulle. */
+__global__ void k_body_predict(BqRigidBody* __restrict__ bodies, int n_bodies) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_bodies) return;
     if (!bodies[b].dynamic) return;
 
-    const float* wr = wrench + 7 * b;
-    float3 imp = make_float3(wr[0], wr[1], wr[2]);
-    float3 tau = make_float3(wr[3], wr[4], wr[5]);
-    float  m_contact = wr[6];
-
-    float mass = bodies[b].mass;
-    float m_eff = mass + bodies[b].added_mass * m_contact;
-    float mass_factor = 1.f; /* mass/m_eff, applique a la seule torque fluide */
-
     float3 v = make_float3(bodies[b].v[0], bodies[b].v[1], bodies[b].v[2]);
-    if (m_eff > 1e-8f) {
-        v.x += imp.x / m_eff; v.y += imp.y / m_eff; v.z += imp.z / m_eff;
-        mass_factor = mass / m_eff;
-    }
     if (bodies[b].use_gravity) v.y += c_p.dt * c_p.gravity_y;
 
     mat3 Ib_inv;
@@ -1151,11 +1185,9 @@ __global__ void k_integrate_bodies(BqRigidBody* __restrict__ bodies,
     float3 w = make_float3(bodies[b].w[0], bodies[b].w[1], bodies[b].w[2]);
     float3 gyro = vcross(w, matvec(Iw, w));
 
-    float3 tau_eff = make_float3(tau.x * mass_factor, tau.y * mass_factor, tau.z * mass_factor);
-    float3 rhs = make_float3(tau_eff.x - c_p.dt * gyro.x,
-                             tau_eff.y - c_p.dt * gyro.y,
-                             tau_eff.z - c_p.dt * gyro.z);
-    float3 dw = matvec(Iw_inv, rhs);
+    float3 dw = matvec(Iw_inv, make_float3(-c_p.dt * gyro.x,
+                                           -c_p.dt * gyro.y,
+                                           -c_p.dt * gyro.z));
     w.x += dw.x; w.y += dw.y; w.z += dw.z;
 
     /* Verrous d'axe (repere MONDE) : composante mise a zero apres
@@ -1171,10 +1203,304 @@ __global__ void k_integrate_bodies(BqRigidBody* __restrict__ bodies,
     bodies[b].w[0] = w.x; bodies[b].w[1] = w.y; bodies[b].w[2] = w.z;
 }
 
+/* Recolte de grille pour le couplage implicite (M17/A5), un thread par
+ * cellule. Remplace la recolte d'impulsion explicite de A1 (masse *
+ * (v_pre - v) apres coup) par les cinq sommes necessaires a poser le choc
+ * parfaitement inelastique corps/fluide-en-contact (cf. derivation complete
+ * dans le commentaire de k_body_solve) :
+ *
+ *   S_m  = somme des masses de noeud                    (scalaire)
+ *   S_p  = somme m_n * v_n                               (quantite de
+ *          mouvement du fluide en contact, AVANT le choc)
+ *   S_L  = somme m_n * (r x v_n)                          (moment cinetique
+ *          du fluide en contact autour du centre de masse du corps, AVANT)
+ *   S_mr = somme m_n * r                                  (premier moment,
+ *          couple les deux blocs du systeme 6x6 -- nul si le fluide en
+ *          contact est distribue symetriquement autour du corps)
+ *   S_rr = somme m_n * (dot(r,r)*Id - r r^T)               ("tenseur
+ *          d'inertie" du fluide en contact autour du meme point, meme
+ *          formule que l'inertie d'un nuage de points ponctuels)
+ *
+ * avec r = x_noeud - x_corps, v_n LUE APRES GRAVITE (k_grid_apply_gravity
+ * s'est deja execute ce sous-pas, cf. bq_step) -- un corps qui porte une
+ * colonne d'eau doit en sentir le poids, exactement comme en A1.
+ *
+ * Ensemble de cellules : la bande de contact ETROITE (solid_here == phi<0,
+ * OU cnrm.w < h -- EXACTEMENT le meme garde-fou que le bloc de contact de
+ * k_grid_update), phi <= -h (interieur profond) exclu en plus. PAS "toute
+ * cellule non profondement interieure dans l'AABB du corps" : cbody est
+ * attribue par k_sdf_unsigned sur toute l'AABB des triangles DILATEE de
+ * 3*dx (cf. bq_set_colliders) pour les besoins de la recherche du SDF, une
+ * region bien plus large que la bande de contact reelle (h =
+ * BQ_CONTACT_BAND_MULT*dx = 0.5*dx, largement plus etroite que le pad de
+ * 3*dx). Sans cette restriction, m_contact mesure ~10 pour un cube de
+ * 0.12 m (la region dilatee entiere) au lieu d'une fraction de cette
+ * valeur, et le corps s'enfonce bien au-dela de l'equilibre d'Archimede :
+ * le signal de pression a la surface du corps est noye dans la moyenne de
+ * mouvement du fluide ambiant sur toute la region dilatee.
+ *
+ * SUPPLEMENT INDISPENSABLE, decouvert par la mesure (le test de conservation
+ * D13/A1, 10^-6 en A1, degradait a plus de 50% sans ce filtre) : au sein
+ * meme de la bande de contact, il faut EXCLURE les noeuds qui ne seront
+ * PAS effectivement bloques par k_grid_update -- c'est-a-dire reproduire
+ * ici le test UNILATERAL "vn < 0 ou bidir" de k_grid_update, avec la
+ * vitesse de corps PREDITE (avant solve, seule disponible a ce stade) en
+ * lieu et place de la vitesse resolue. Pourquoi cette exclusion est
+ * necessaire et pas seulement souhaitable : le systeme 6x6 de k_body_solve
+ * est un TAUTOLOGIE de conservation -- "corps + integralite de la bande
+ * recoltee, fusionnes" conserve exactement sa propre quantite de mouvement.
+ * Mais si un noeud de la bande n'est ensuite PAS touche par k_grid_update
+ * (parce qu'il s'eloignait du corps, vn >= 0, mode unilateral), sa vitesse
+ * REELLE reste celle d'AVANT le choc -- alors que le corps, lui, a deja
+ * absorbe la part de quantite de mouvement que ce noeud etait cense
+ * apporter au choc fusionne. Le systeme perd alors sa propriete
+ * conservative : le corps gagne une quantite de mouvement qu'aucun noeud
+ * de fluide n'a reellement cedee. Mesure sur le jet de la verification de
+ * conservation (fluide tres agite pres du corps, beaucoup de noeuds
+ * "rebondissent" hors de la bande a chaque sous-pas) : l'ecart entre noeuds
+ * bloques et noeuds simplement proches est loin d'etre negligeable --
+ * d'ou la derive a 52%. Avec ce filtre, la recolte redevient une
+ * SURESTIMATION LEGERE (et non plus une fuite) de la masse effectivement
+ * entrainee : la vitesse de corps utilisee ici est PREDITE, pas RESOLUE, et
+ * la friction de k_grid_update peut encore laisser glisser un noeud declare
+ * "bloque" ici -- mais l'ecart entre les deux etats du corps sur un seul
+ * sous-pas est petit, contrairement a l'ecart entre "s'eloigne" et
+ * "s'approche" du corps, qui est la vraie source de la fuite corrigee
+ * ci-dessus. */
+__global__ void k_grid_gather(const float4* __restrict__ grid,
+                              const float* __restrict__ sdf,
+                              const float4* __restrict__ cnrm,
+                              const int* __restrict__ cbody,
+                              const BqRigidBody* __restrict__ bodies,
+                              float* __restrict__ gather, int ncell) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= ncell) return;
+    float4 g = grid[id];
+    if (g.w <= 0.f) return;
+
+    int body_id = cbody[id];
+    if (body_id < 0 || !bodies[body_id].dynamic) return;
+
+    float h = BQ_CONTACT_BAND_MULT * c_p.dx;
+    float phi = sdf[id];
+    if (phi <= -h) return; /* interieur profond : jamais un contact reel */
+    float4 cn = cnrm[id];
+    bool solid_here = (phi < 0.f);
+    if (!(solid_here || cn.w < h)) return; /* hors bande de contact -- meme garde-fou que k_grid_update */
+
+    int3 res = c_p.res;
+    int i = id / (res.y * res.z);
+    int j = (id / res.z) % res.y;
+    int k = id % res.z;
+    float3 xnode = make_float3(i * c_p.dx, j * c_p.dx, k * c_p.dx);
+
+    const BqRigidBody& bd = bodies[body_id];
+    float3 bx = make_float3(bd.x[0], bd.x[1], bd.x[2]);
+    float3 r = vsub(xnode, bx);
+
+    float3 v_n = make_float3(g.x, g.y, g.z); /* grille deja en vitesse (post-gravite) */
+    float  m_n = g.w;
+
+    /* Filtre unilateral (cf. commentaire du noyau) : normale nulle -> pas de
+     * contact geometrique fiable, rien a recolter. Sinon, meme test que
+     * k_grid_update (vn < 0 OU normale non corroboree = bidirectionnel),
+     * mais avec la vitesse de corps PREDITE (bd.v/bd.w, pas encore resolue
+     * par k_body_solve -- ce noyau s'execute avant). */
+    float3 n = make_float3(cn.x, cn.y, cn.z);
+    if (n.x == 0.f && n.y == 0.f && n.z == 0.f) return;
+    bool bidir = !normal_corroborated(sdf, res, i, j, k, n);
+    float3 bv = make_float3(bd.v[0], bd.v[1], bd.v[2]);
+    float3 bw = make_float3(bd.w[0], bd.w[1], bd.w[2]);
+    float3 wxr = vcross(bw, r);
+    float3 vc = make_float3(bv.x + wxr.x, bv.y + wxr.y, bv.z + wxr.z);
+    float vn = vdot(vsub(v_n, vc), n);
+    if (!(vn < 0.f || bidir)) return; /* le noeud s'eloigne : jamais bloque, jamais recolte */
+
+    float* acc = gather + 16 * body_id;
+    atomicAdd(&acc[0], m_n);
+
+    float3 mv = make_float3(m_n * v_n.x, m_n * v_n.y, m_n * v_n.z);
+    atomicAdd(&acc[1], mv.x); atomicAdd(&acc[2], mv.y); atomicAdd(&acc[3], mv.z);
+
+    float3 L = vcross(r, v_n);
+    atomicAdd(&acc[4], m_n * L.x); atomicAdd(&acc[5], m_n * L.y); atomicAdd(&acc[6], m_n * L.z);
+
+    atomicAdd(&acc[7], m_n * r.x); atomicAdd(&acc[8], m_n * r.y); atomicAdd(&acc[9], m_n * r.z);
+
+    /* S_rr, symetrique : xx, yy, zz, xy, xz, yz (6 composantes independantes
+     * de dot(r,r)*Id - r r^T, mise a l'echelle par m_n). */
+    float rr = vdot(r, r);
+    atomicAdd(&acc[10], m_n * (rr - r.x * r.x));
+    atomicAdd(&acc[11], m_n * (rr - r.y * r.y));
+    atomicAdd(&acc[12], m_n * (rr - r.z * r.z));
+    atomicAdd(&acc[13], m_n * (-r.x * r.y));
+    atomicAdd(&acc[14], m_n * (-r.x * r.z));
+    atomicAdd(&acc[15], m_n * (-r.y * r.z));
+}
+
+/* Resolution du couplage implicite fluide-solide (M17/A5), un thread par
+ * corps -- coeur de la tache A5. Remplace la masse ajoutee (D5/A1), une
+ * approximation structurellement fausse (elle divisait l'impulsion recue
+ * sans jamais la restituer, cf. plan-milestone-17.md D5) par un CHOC
+ * PARFAITEMENT INELASTIQUE entre le corps et la masse de fluide qui le
+ * touche : au lieu d'appliquer une impulsion puis d'esperer que ca
+ * converge, on resout directement la vitesse commune (v_new, w_new) que le
+ * corps ET le fluide en contact adopteraient s'ils ne faisaient plus qu'un
+ * solide rigide le temps de ce sous-pas.
+ *
+ * DERIVATION (a refaire a la main avant de faire confiance aux signes
+ * ci-dessous -- c'est l'exigence de la spec de cette tache, et la raison
+ * d'etre de ce commentaire).
+ *
+ * Choc inelastique : le corps (masse m_b, inertie I_b, vitesses v_b/w_b
+ * APRES gravite et terme gyroscopique -- cf. k_body_predict) et le fluide en
+ * contact (masse totale S_m repartie sur des noeuds de position r_i =
+ * x_i - x_b et de vitesse v_i, cf. k_grid_gather) fusionnent en un seul
+ * solide rigide instantane de vitesses (v_new, w_new) autour du centre de
+ * masse du CORPS (pas du systeme fusionne -- x_b ne bouge pas pendant un
+ * sous-pas, on peut donc exprimer toutes les quantites autour de ce point
+ * fixe sans avoir a re-deriver un centre de masse combine).
+ *
+ * Quantite de mouvement lineaire du solide fusionne, vitesse d'un point
+ * rigide etant v_new + w_new x r_i au noeud i :
+ *   P = m_b*v_new + somme m_i*(v_new + w_new x r_i)
+ *     = (m_b + S_m)*v_new + w_new x (somme m_i*r_i)
+ *     = (m_b + S_m)*v_new + w_new x S_mr
+ *     = (m_b + S_m)*v_new - S_mr x w_new                    (a x b = -b x a)
+ *     = (m_b + S_m)*v_new - [S_mr]x * w_new
+ * Egalee a la quantite de mouvement AVANT le choc : m_b*v_b + S_p.
+ *   => ligne 1 du systeme : (m_b+S_m)*v_new - [S_mr]x*w_new = m_b*v_b + S_p
+ *
+ * Moment cinetique autour de x_b, meme construction : la contribution du
+ * corps lui-meme est I_b*w_new (son centre de masse EST x_b, pas de terme
+ * m_b*r x v puisque r=0 pour le corps) ; celle du noeud i est
+ * r_i x [m_i*(v_new + w_new x r_i)] = m_i*(r_i x v_new) + m_i*(r_i x (w_new x r_i)).
+ * Le premier terme sur tous les noeuds : somme m_i*(r_i x v_new) = S_mr x v_new
+ * = -v_new x S_mr = [S_mr]x * v_new... attention au sens : r x v_new =
+ * -(v_new x r) = -[v_new]x*r, mais on veut factoriser par v_new PAS par r ;
+ * l'identite utile est a x b = -[b]x*a, donc r_i x v_new = -[v_new]x*r_i =
+ * [r_i]x*v_new (car [a]x*b = a x b = -(b x a) = -[b]x*a) : somme m_i*[r_i]x*v_new
+ * = [S_mr]x * v_new. Le second terme est le tenseur d'inertie standard d'un
+ * nuage de points autour de l'origine : somme m_i*(r_i x (w x r_i)) =
+ * (somme m_i*(dot(r_i,r_i)*Id - r_i r_i^T)) * w_new = S_rr * w_new
+ * (identite vectorielle a x (b x a) = dot(a,a)*b - dot(a,b)*a, appliquee a
+ * chaque noeud puis sommee -- c'est exactement la definition du tenseur
+ * d'inertie d'une masse ponctuelle autour d'un axe passant par l'origine).
+ * Moment cinetique total fusionne :
+ *   L = I_b*w_new + [S_mr]x*v_new + S_rr*w_new
+ *     = [S_mr]x*v_new + (I_b + S_rr)*w_new
+ * Egale au moment cinetique AVANT le choc : I_b*w_b + S_L (S_L = somme
+ * m_i*(r_i x v_i), calcule directement dans k_grid_gather).
+ *   => ligne 2 du systeme : [S_mr]x*v_new + (I_b+S_rr)*w_new = I_b*w_b + S_L
+ *
+ * D'ou le systeme 6x6 assemble ci-dessous -- il correspond EXACTEMENT a
+ * celui de la spec de la tache, blocs hors-diagonale antisymetriques et
+ * transposes l'un de l'autre ([S_mr]x^T = -[S_mr]x), donc symetrique defini
+ * positif tant que m_b > 0 (toujours vrai pour un corps dynamique) et I_b
+ * non singuliere (garanti par construction cote Python, cf. rigidbody.py).
+ *
+ * POURQUOI c'est inconditionnellement stable : v_new est une MOYENNE
+ * PONDEREE des vitesses avant choc (ponderation par les masses), jamais une
+ * extrapolation au-dela. Un corps tres leger (m_b << S_m) voit v_new tendre
+ * vers la vitesse du fluide, jamais au-dela -- contrairement a la masse
+ * ajoutee (A1), qui appliquait l'integralite de l'impulsion recoltee a une
+ * masse effective plus grande SANS jamais restituer le reste au fluide (un
+ * puits de quantite de mouvement, cf. plan D5). Ici, rien n'est perdu ni
+ * cree : ce qui est retire au fluide par la condition de contact de
+ * k_grid_update (qui vient APRES, avec la vitesse resolue comme vitesse de
+ * mur) est exactement ce que ce choc lui avait deja impute -- conservatif
+ * par construction, pas par chance.
+ *
+ * Wrench de diagnostic (bq_read_collider_wrench) : impulsion EFFECTIVE
+ * m_b*(v_new-v_b) et moment effectif I_b*(w_new-w_b) -- ce que le corps a
+ * REELLEMENT recu ce sous-pas, pas la somme brute recoltee (qui n'est plus
+ * calculee telle quelle : S_p/S_L sont une quantite de mouvement, pas une
+ * impulsion). S_m (masse de fluide couplee) reporte tel quel en 7e valeur,
+ * comme en A1. */
+__global__ void k_body_solve(BqRigidBody* __restrict__ bodies,
+                             const float* __restrict__ gather,
+                             float* __restrict__ wrench, int n_bodies) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_bodies) return;
+    if (!bodies[b].dynamic) return;
+
+    const float* acc = gather + 16 * b;
+    float  S_m  = acc[0];
+    float3 S_p  = make_float3(acc[1], acc[2], acc[3]);
+    float3 S_L  = make_float3(acc[4], acc[5], acc[6]);
+    float3 S_mr = make_float3(acc[7], acc[8], acc[9]);
+    mat3 S_rr;
+    S_rr.m[0] = acc[10]; S_rr.m[4] = acc[11]; S_rr.m[8] = acc[12];
+    S_rr.m[1] = S_rr.m[3] = acc[13];
+    S_rr.m[2] = S_rr.m[6] = acc[14];
+    S_rr.m[5] = S_rr.m[7] = acc[15];
+
+    float mass = bodies[b].mass;
+    float3 v_b = make_float3(bodies[b].v[0], bodies[b].v[1], bodies[b].v[2]);
+    float3 w_b = make_float3(bodies[b].w[0], bodies[b].w[1], bodies[b].w[2]);
+
+    mat3 Ib_inv;
+    for (int e = 0; e < 9; ++e) Ib_inv.m[e] = bodies[b].inv_inertia[e];
+    mat3 R = quat_to_mat3(bodies[b].q);
+    mat3 Iw_inv = matmul(matmul(R, Ib_inv), transpose(R));
+    mat3 Iw = inverse(Iw_inv); /* I_b en repere MONDE, cf. derivation ci-dessus */
+
+    mat3 Smr_x = skew(S_mr);
+
+    /* assemblage du systeme 6x6, cf. derivation dans le commentaire du noyau */
+    float A[6][6];
+    float rhs[6], sol[6];
+    float mtot = mass + S_m;
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) {
+            A[r][c]         = (r == c) ? mtot : 0.f;   /* (m_b+S_m)*Id */
+            A[r][3 + c]     = -Smr_x.m[3 * r + c];      /* -[S_mr]x */
+            A[3 + r][c]     =  Smr_x.m[3 * r + c];      /* +[S_mr]x */
+            A[3 + r][3 + c] =  Iw.m[3 * r + c] + S_rr.m[3 * r + c]; /* I_b+S_rr */
+        }
+
+    float3 rhs_lin = make_float3(mass * v_b.x + S_p.x, mass * v_b.y + S_p.y, mass * v_b.z + S_p.z);
+    float3 Ib_wb = matvec(Iw, w_b);
+    float3 rhs_ang = make_float3(Ib_wb.x + S_L.x, Ib_wb.y + S_L.y, Ib_wb.z + S_L.z);
+    rhs[0] = rhs_lin.x; rhs[1] = rhs_lin.y; rhs[2] = rhs_lin.z;
+    rhs[3] = rhs_ang.x; rhs[4] = rhs_ang.y; rhs[5] = rhs_ang.z;
+
+    solve6x6(A, rhs, sol);
+    float3 v_new = make_float3(sol[0], sol[1], sol[2]);
+    float3 w_new = make_float3(sol[3], sol[4], sol[5]);
+
+    /* Verrous d'axe (repere MONDE) A NOUVEAU apres le solve (D13, plan M17) :
+     * le systeme ci-dessus ne "connait" pas les verrous, il peut donc
+     * reintroduire une composante que k_body_predict avait annulee (le
+     * fluide pousse sur l'axe bloque -> couplage vers les autres composantes
+     * via les blocs hors-diagonale). Contrainte dure, pas une force de
+     * rappel : mise a zero apres coup, comme en A1. */
+    if (bodies[b].lock_lin[0]) v_new.x = 0.f;
+    if (bodies[b].lock_lin[1]) v_new.y = 0.f;
+    if (bodies[b].lock_lin[2]) v_new.z = 0.f;
+    if (bodies[b].lock_ang[0]) w_new.x = 0.f;
+    if (bodies[b].lock_ang[1]) w_new.y = 0.f;
+    if (bodies[b].lock_ang[2]) w_new.z = 0.f;
+
+    /* wrench de diagnostic : impulsion/moment EFFECTIFS (cf. commentaire du
+     * noyau) -- calcules AVANT d'ecraser bodies[b].v/w avec l'etat resolu. */
+    float* wr = wrench + 7 * b;
+    wr[0] = mass * (v_new.x - v_b.x);
+    wr[1] = mass * (v_new.y - v_b.y);
+    wr[2] = mass * (v_new.z - v_b.z);
+    float3 dw_eff = make_float3(w_new.x - w_b.x, w_new.y - w_b.y, w_new.z - w_b.z);
+    float3 tau_eff = matvec(Iw, dw_eff);
+    wr[3] = tau_eff.x; wr[4] = tau_eff.y; wr[5] = tau_eff.z;
+    wr[6] = S_m;
+
+    bodies[b].v[0] = v_new.x; bodies[b].v[1] = v_new.y; bodies[b].v[2] = v_new.z;
+    bodies[b].w[0] = w_new.x; bodies[b].w[1] = w_new.y; bodies[b].w[2] = w_new.z;
+}
+
 /* Avancee des corps rigides (D5, plan M17), un thread par corps -- separe
- * de k_integrate_bodies (et non fusionne) parce que la phase B du jalon
- * inserera le solveur de contact corps-corps entre les deux (cf. D13 du
- * plan). Ne fait rien si le corps est cinematique/statique. */
+ * de k_body_solve (et non fusionne) parce que la phase B du jalon inserera
+ * le solveur de contact corps-corps entre les deux (cf. D13 du plan). Ne
+ * fait rien si le corps est cinematique/statique. */
 __global__ void k_advance_bodies(BqRigidBody* __restrict__ bodies, int n_bodies) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_bodies) return;
@@ -1789,16 +2115,24 @@ struct BqSim {
      * corps. */
     int* d_cbody = nullptr;
     /* etat + parametres des corps rigides, capacite fixe BQ_MAX_BODIES (cf.
-     * sa def) : x/q/v/w sont mutes en place par k_integrate_bodies et
-     * k_advance_bodies a chaque sous-pas, dynamic/mass/inv_inertia/... sont
+     * sa def) : x/q/v/w sont mutes en place par k_body_predict, k_body_solve
+     * et k_advance_bodies a chaque sous-pas, dynamic/mass/inv_inertia/... sont
      * fournis une fois par bq_set_collider_bodies et jamais modifies par le
      * solveur. */
     BqRigidBody* d_bodies = nullptr;
-    /* accumulateur d'impulsion par corps (D1), 7 floats/corps (impulsion
-     * lineaire [3], couple [3], masse de fluide en contact [1]) -- remis a
-     * zero a CHAQUE sous-pas (cf. bq_step), jamais alloue au-dela de
-     * BQ_MAX_BODIES. */
+    /* impulsion EFFECTIVE par corps, diagnostic (M17/A5) : 7 floats/corps
+     * (impulsion lineaire [3], couple [3], masse de fluide couplee [1]).
+     * Ecrit en une seule fois par k_body_solve (pas d'atomicAdd -- un seul
+     * thread par corps), remis a zero a CHAQUE sous-pas (cf. bq_step) pour
+     * qu'un corps cinematique/statique (jamais touche par k_body_solve, qui
+     * sort tot pour dynamic=0) lise 0 plutot qu'une valeur perimee du
+     * sous-pas precedent. */
     float* d_body_wrench = nullptr;
+    /* accumulateur des cinq sommes de la recolte de grille (M17/A5, cf.
+     * k_grid_gather) : 16 floats/corps -- S_m [1], S_p [3], S_L [3],
+     * S_mr [3], S_rr [6, symetrique xx,yy,zz,xy,xz,yz]. Remis a zero a
+     * CHAQUE sous-pas, jamais alloue au-dela de BQ_MAX_BODIES. */
+    float* d_body_gather = nullptr;
     int n_bodies = 0;
 
     /* grille de buckets (CSR), reconstruite sur l'hote a chaque appel de
@@ -1957,6 +2291,7 @@ BQ_API BqSim* bq_create(const BqConfig* cfg) {
         cudaMalloc(&s->d_cbody, ncell * sizeof(int)) != cudaSuccess ||
         cudaMalloc(&s->d_bodies, BQ_MAX_BODIES * sizeof(BqRigidBody)) != cudaSuccess ||
         cudaMalloc(&s->d_body_wrench, BQ_MAX_BODIES * 7 * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&s->d_body_gather, BQ_MAX_BODIES * 16 * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&s->d_ext, ncell * sizeof(uint8_t)) != cudaSuccess ||
         cudaMalloc(&s->d_changed, sizeof(int)) != cudaSuccess ||
         cudaMalloc(&s->d_x2, cap * sizeof(float3)) != cudaSuccess ||
@@ -2055,7 +2390,7 @@ BQ_API void bq_destroy(BqSim* s) {
     cudaFree(s->d_sdf); cudaFree(s->d_cvel); cudaFree(s->d_cnrm);
     cudaFree(s->d_tri); cudaFree(s->d_trivel); cudaFree(s->d_trifric);
     cudaFree(s->d_tri_body); cudaFree(s->d_cbody);
-    cudaFree(s->d_bodies); cudaFree(s->d_body_wrench);
+    cudaFree(s->d_bodies); cudaFree(s->d_body_wrench); cudaFree(s->d_body_gather);
     cudaFree(s->d_bucket_off); cudaFree(s->d_bucket_tri);
     cudaFree(s->d_ext); cudaFree(s->d_changed);
     cudaFree(s->d_x2);  cudaFree(s->d_v2);  cudaFree(s->d_C2);
@@ -2720,25 +3055,48 @@ BQ_API int bq_step(BqSim* s, float frame_dt) {
     dim3 bpb(64), gpb((BQ_MAX_BODIES + 63) / 64);
 
     for (int i = 0; i < substeps; ++i) {
-        /* Ordre du sous-pas (D13, plan M17) : la recolte d'impulsion de
-         * k_grid_update doit lire un accumulateur remis a zero a CHAQUE
-         * sous-pas -- une somme sur toute la frame melangerait des
-         * geometries de corps qui ont deja bouge d'un sous-pas a l'autre.
-         * cudaMemsetAsync, aucune synchronisation hote introduite (contrainte
-         * de performance existante de cette boucle). Saute integralement
-         * si aucun corps n'est declare : chemin actuel intact (D3,
-         * non-regression). */
-        if (s->n_bodies > 0)
+        /* Ordre du sous-pas (D13 du plan, REVU par M17/A5 -- couplage
+         * implicite) :
+         *   k_clear_grid -> k_p2g -> k_grid_apply_gravity -> k_body_predict
+         *   -> k_grid_gather -> k_body_solve -> k_grid_update (contact, mur
+         *   vif = etat RESOLU) -> k_advance_bodies -> k_g2p.
+         *
+         * k_grid_gather doit lire une grille qui porte deja "vitesse apres
+         * gravite" (d'ou k_grid_apply_gravity avant), et k_grid_update doit
+         * lire un etat de corps deja RESOLU par k_body_solve (d'ou son
+         * deplacement apres, alors qu'il portait autrefois lui-meme
+         * l'application de la gravite). Les accumulateurs de corps
+         * (d_body_gather : cinq sommes de la recolte ; d_body_wrench :
+         * wrench EFFECTIF de diagnostic) sont remis a zero a CHAQUE sous-pas
+         * -- une somme sur toute la frame melangerait des geometries de
+         * corps qui ont deja bouge d'un sous-pas a l'autre. cudaMemsetAsync,
+         * aucune synchronisation hote introduite (contrainte de performance
+         * existante de cette boucle). */
+        if (s->n_bodies > 0) {
+            cudaMemsetAsync(s->d_body_gather, 0, (size_t)s->n_bodies * 16 * sizeof(float));
             cudaMemsetAsync(s->d_body_wrench, 0, (size_t)s->n_bodies * 7 * sizeof(float));
+        }
         k_clear_grid<<<gc, bp>>>(s->d_grid, ncell);
         k_p2g<<<gp, bp>>>(s->d_x, s->d_v, s->d_C, s->d_F, s->d_J, s->d_mat,
                           s->d_grid, s->n);
-        k_grid_update<<<gc, bp>>>(s->d_grid, s->d_sdf, s->d_cvel, s->d_cnrm,
-                                  s->d_cbody, s->d_bodies, s->d_body_wrench, ncell);
+        /* Tourne INCONDITIONNELLEMENT (meme n_bodies == 0) : c'est le meme
+         * calcul (v = mv/m, +gravite) que l'ancien bloc inline de
+         * k_grid_update, scinde pour que la grille porte deja "vitesse
+         * apres gravite" avant la recolte du couplage implicite -- aucun
+         * changement de comportement pour ce cas (D14, non-regression). */
+        k_grid_apply_gravity<<<gc, bp>>>(s->d_grid, ncell);
         if (s->n_bodies > 0) {
-            k_integrate_bodies<<<gpb, bpb>>>(s->d_bodies, s->d_body_wrench, s->n_bodies);
-            /* phase B (plan M17) inserera ici k_contact_solve, entre
-             * l'integration des forces et l'avancee des positions. */
+            k_body_predict<<<gpb, bpb>>>(s->d_bodies, s->n_bodies);
+            k_grid_gather<<<gc, bp>>>(s->d_grid, s->d_sdf, s->d_cnrm, s->d_cbody, s->d_bodies,
+                                      s->d_body_gather, ncell);
+            k_body_solve<<<gpb, bpb>>>(s->d_bodies, s->d_body_gather, s->d_body_wrench,
+                                       s->n_bodies);
+        }
+        k_grid_update<<<gc, bp>>>(s->d_grid, s->d_sdf, s->d_cvel, s->d_cnrm,
+                                  s->d_cbody, s->d_bodies, ncell);
+        if (s->n_bodies > 0) {
+            /* phase B (plan M17) inserera ici k_contact_solve, entre le
+             * couplage fluide et l'avancee des positions. */
             k_advance_bodies<<<gpb, bpb>>>(s->d_bodies, s->n_bodies);
         }
         k_g2p<<<gp, bp>>>(s->d_x, s->d_v, s->d_C, s->d_J, s->d_mat,

@@ -22,6 +22,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <array>
 
 static float V0[3] = {0.f, 0.f, 0.f};
 
@@ -143,27 +144,62 @@ static int test_heavy() {
         return pos;
     };
 
-    /* Bruit intra-binaire d'abord (2 executions du cas statique, deja
-     * dynamic=0 aujourd'hui -- chemin non touche par cette tache) : c'est
-     * l'enveloppe a laquelle comparer l'ecart statique/dynamique-lourd. */
-    auto pos_static_a = run(false);
-    auto pos_static_b = run(false);
-    auto pos_heavy = run(true);
+    /* A1b : l'enveloppe de bruit d'A1 etait estimee sur DEUX executions --
+     * pas exploitable. Au moins 5 executions de CHAQUE cote (statique
+     * dynamic=0, et dynamique-lourd dynamic=1 masse 1e6), enveloppe de
+     * bruit intra-configuration mesuree DES DEUX cotes (max sur toutes les
+     * paires), comparee a l'ecart inter-configuration des moyennes. */
+    const int N_RUNS = 5;
+    std::vector<std::array<double,3>> statB(N_RUNS), heavyB(N_RUNS);
+    for (int i = 0; i < N_RUNS; ++i) {
+        auto pos = run(false);
+        double b[3]; barycenter(pos, b);
+        statB[i] = {b[0], b[1], b[2]};
+        printf("  statique   run %d : n=%zu barycentre=(%.8f,%.8f,%.8f)\n",
+               i, pos.size()/3, b[0], b[1], b[2]);
+    }
+    for (int i = 0; i < N_RUNS; ++i) {
+        auto pos = run(true);
+        double b[3]; barycenter(pos, b);
+        heavyB[i] = {b[0], b[1], b[2]};
+        printf("  dyn.lourd  run %d : n=%zu barycentre=(%.8f,%.8f,%.8f)\n",
+               i, pos.size()/3, b[0], b[1], b[2]);
+    }
 
-    double bA[3], bB[3], bH[3];
-    barycenter(pos_static_a, bA);
-    barycenter(pos_static_b, bB);
-    barycenter(pos_heavy, bH);
-    double noise = sqrt((bA[0]-bB[0])*(bA[0]-bB[0]) + (bA[1]-bB[1])*(bA[1]-bB[1]) + (bA[2]-bB[2])*(bA[2]-bB[2]));
-    double dev = sqrt((bA[0]-bH[0])*(bA[0]-bH[0]) + (bA[1]-bH[1])*(bA[1]-bH[1]) + (bA[2]-bH[2])*(bA[2]-bH[2]));
-    printf("  n particules : statique_a=%zu statique_b=%zu dynamique_lourd=%zu\n",
-           pos_static_a.size()/3, pos_static_b.size()/3, pos_heavy.size()/3);
-    printf("  barycentre statique_a    = (%.6f, %.6f, %.6f)\n", bA[0], bA[1], bA[2]);
-    printf("  barycentre statique_b    = (%.6f, %.6f, %.6f)\n", bB[0], bB[1], bB[2]);
-    printf("  barycentre dynamique_lourd = (%.6f, %.6f, %.6f)\n", bH[0], bH[1], bH[2]);
-    printf("  bruit intra-binaire (statique_a vs statique_b) : %.6f m\n", noise);
-    printf("  ecart statique vs dynamique-lourd               : %.6f m (%.2fx le bruit)\n",
-           dev, noise > 1e-9 ? dev/noise : -1.0);
+    auto intra_envelope = [](const std::vector<std::array<double,3>>& v) -> double {
+        double mx = 0.0;
+        for (size_t i = 0; i < v.size(); ++i)
+            for (size_t j = i+1; j < v.size(); ++j) {
+                double dx=v[i][0]-v[j][0], dy=v[i][1]-v[j][1], dz=v[i][2]-v[j][2];
+                double d = sqrt(dx*dx+dy*dy+dz*dz);
+                if (d > mx) mx = d;
+            }
+        return mx;
+    };
+    double noiseStat = intra_envelope(statB);
+    double noiseHeavy = intra_envelope(heavyB);
+    double noise_env = std::max(noiseStat, noiseHeavy);
+
+    auto mean3 = [](const std::vector<std::array<double,3>>& v) -> std::array<double,3> {
+        std::array<double,3> m{0,0,0};
+        for (auto& b : v) { m[0]+=b[0]; m[1]+=b[1]; m[2]+=b[2]; }
+        m[0]/=v.size(); m[1]/=v.size(); m[2]/=v.size();
+        return m;
+    };
+    auto mStat = mean3(statB), mHeavy = mean3(heavyB);
+    double dx = mStat[0]-mHeavy[0], dy = mStat[1]-mHeavy[1], dz = mStat[2]-mHeavy[2];
+    double dev = sqrt(dx*dx+dy*dy+dz*dz);
+
+    printf("\n  enveloppe de bruit intra-statique  (max sur %d paires) : %.8f m\n",
+           N_RUNS*(N_RUNS-1)/2, noiseStat);
+    printf("  enveloppe de bruit intra-dyn.lourd (max sur %d paires) : %.8f m\n",
+           N_RUNS*(N_RUNS-1)/2, noiseHeavy);
+    printf("  enveloppe retenue (max des deux)                        : %.8f m\n", noise_env);
+    printf("  barycentre moyen statique  (dynamic=0) = (%.8f, %.8f, %.8f)\n", mStat[0], mStat[1], mStat[2]);
+    printf("  barycentre moyen dyn.lourd (dynamic=1) = (%.8f, %.8f, %.8f)\n", mHeavy[0], mHeavy[1], mHeavy[2]);
+    printf("  ecart inter-configuration (statique vs dyn.lourd)      : %.8f m (%.2fx l'enveloppe)\n",
+           dev, noise_env > 1e-12 ? dev/noise_env : -1.0);
+    printf("  VERDICT : %s\n", dev <= 2.0*noise_env ? "DANS LE BRUIT" : "HORS BRUIT -- A INVESTIGUER");
     return 0;
 }
 
@@ -235,7 +271,11 @@ static int test_momentum() {
             }
         }
         px *= p_mass; py *= p_mass; pz *= p_mass;
+        double fluid_p[3] = {px, py, pz};
         float bs[13]; bq_read_collider_bodies(sim, bs);
+        fprintf(stderr, "    [dbg] fluid_P=(%.6f,%.6f,%.6f) body_v=(%.6f,%.6f,%.6f) body_P=(%.6f,%.6f,%.6f)\n",
+                fluid_p[0], fluid_p[1], fluid_p[2], bs[7], bs[8], bs[9],
+                body.mass*bs[7], body.mass*bs[8], body.mass*bs[9]);
         px += body.mass * bs[7]; py += body.mass * bs[8]; pz += body.mass * bs[9];
         p[0]=px; p[1]=py; p[2]=pz;
         *min_wall = mw_dist;

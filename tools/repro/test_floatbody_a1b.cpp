@@ -17,15 +17,21 @@
  * une chute libre qui n'a RIEN a voir avec le couplage -- piege verifie et
  * documente ici pour ne pas le retomber.
  *
- * Usage : test_floatbody_a1b <density> <added_mass> [frames]
+ * Usage : test_floatbody_a1b <density> <added_mass> [frames] [bulk]
  *   density    : kg/m3 du corps (eau = 1000)
- *   added_mass : alpha (cf. D5 du plan-milestone-17)
+ *   added_mass : alpha -- SANS EFFET depuis M17/A5 (couplage implicite, cf.
+ *                bourrasque.h), conserve comme parametre pour ne pas casser
+ *                l'appelant existant, ignore par le solveur.
  *   frames     : nombre de frames de MESURE a 24 Hz (defaut 72 = 3s),
  *                APRES 1s de pre-etablissement de la colonne (cf. plus bas)
+ *   bulk       : module de compression de l'eau, Pa (defaut 4e4 -- cf.
+ *                etape 0 de la spec M17/A5 : a bulk=4e4 la colonne de 0.86m
+ *                comprime de plus de 20% sous son propre poids, ce qui a pu
+ *                etre confondu avec une instabilite du couplage)
  *
  * Sortie : une ligne CSV sur stdout, plus le detail par frame sur stderr
  * (pour diagnostic, pas parse) :
- *   density,alpha,diverged,diverge_frame,exited_water,exited_frame,
+ *   density,alpha,bulk,diverged,diverge_frame,exited_water,exited_frame,
  *   eq_frac,archimede_frac,amp_frac,amp_trend
  *
  * exited_water : le corps a touche le fond de la colonne d'eau -- PAS une
@@ -117,6 +123,7 @@ int main(int argc, char** argv) {
     float density = (float)atof(argv[1]);
     float alpha = (float)atof(argv[2]);
     int frames = (argc > 3) ? atoi(argv[3]) : 72; /* 3s a 24Hz */
+    float bulk = (argc > 4) ? (float)atof(argv[4]) : 4e4f; /* cf. etape 0, M17/A5 */
 
     BqConfig cfg; bq_default_config(&cfg);
     cfg.grid_res[0] = cfg.grid_res[1] = cfg.grid_res[2] = 48;
@@ -126,7 +133,7 @@ int main(int argc, char** argv) {
     if (!sim) { fprintf(stderr, "create: %s\n", bq_last_error()); return 1; }
 
     BqMaterial water{}; water.model = BQ_MODEL_WATER; water.rho = 1000.f;
-    water.bulk = 4e4f; water.gamma = 3.f;
+    water.bulk = bulk; water.gamma = 3.f;
     int mw = bq_add_material(sim, &water);
     if (mw < 0) { fprintf(stderr, "add_material: %s\n", bq_last_error()); return 1; }
 
@@ -135,8 +142,8 @@ int main(int argc, char** argv) {
      * laisse un corps dense la traverser tout entiere avant qu'un equilibre
      * ne puisse s'etablir -- il "tombe" alors en espace vide sous l'eau
      * (pas de sol rigide en phase A). Colonne a 0.77m ici. */
-    float surface_y = 0.85f;
-    float water_bottom = 0.08f;
+    float surface_y = 0.93f;
+    float water_bottom = 0.07f;
     float wlo[3] = {0.15f, water_bottom, 0.15f}, whi[3] = {0.85f, surface_y, 0.85f};
     if (bq_emit_box(sim, mw, wlo, whi, V0) < 0) {
         fprintf(stderr, "emit_box: %s\n", bq_last_error()); return 1;
@@ -152,13 +159,20 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* corps flottant : cube 0.12m de cote, centre initial AU NIVEAU de la
-     * surface (fraction immergee initiale = 0.5, point de depart commun a
-     * toutes les densites -- le systeme converge ensuite vers l'equilibre
-     * propre a chaque densite). */
+    /* corps flottant : cube 0.12m de cote. Position initiale PRES de
+     * l'equilibre analytique (fraction immergee = densite/1000, plafonnee
+     * a 1) plutot qu'un depart uniforme a mi-hauteur : sur une fenetre de
+     * mesure de 3s, un depart loin de l'equilibre consomme l'essentiel du
+     * budget en transitoire (chute libre le temps que la pression
+     * hydrostatique locale se construise autour du corps) et ne laisse
+     * rien pour observer le regime etabli. Le depart pres de l'equilibre
+     * n'empeche pas de mesurer l'oscillation ni la divergence -- il laisse
+     * juste le temps de les observer. */
     float h = 0.06f;
     float side = 2.f*h;
-    float x0[3] = {0.5f, surface_y, 0.5f};
+    float eq_target = density / 1000.f; if (eq_target > 1.f) eq_target = 1.f;
+    float cy0 = surface_y + h * (1.f - 2.f*eq_target);
+    float x0[3] = {0.5f, cy0, 0.5f};
     float q0[4] = {1.f, 0.f, 0.f, 0.f};
     std::vector<float> tri, trivel, trifric;
     int n_tri = build_tri(h, x0, q0, 0.3f, tri, trivel, trifric);
@@ -212,6 +226,8 @@ int main(int argc, char** argv) {
             diverged = true; diverge_frame = fr; break;
         }
         bq_read_collider_bodies(sim, bs);
+        float wr[7]; bq_read_collider_wrench(sim, wr);
+        fprintf(stderr, "    [diag] wrench dernier sous-pas Fy=%.6f m_contact=%.6f\n", wr[1], wr[6]);
         float by = bs[1];
         float vy = bs[8];
         bool bad = std::isnan(by) || std::isnan(vy) ||
@@ -265,8 +281,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    printf("%.1f,%.2f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f\n",
-           density, alpha, diverged ? 1 : 0, diverge_frame,
+    printf("%.1f,%.2f,%.0f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f\n",
+           density, alpha, bulk, diverged ? 1 : 0, diverge_frame,
            exited_water ? 1 : 0, exited_frame,
            eq_frac, archimede, amp_frac, trend);
 
