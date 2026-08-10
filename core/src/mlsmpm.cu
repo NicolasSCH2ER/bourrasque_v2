@@ -1399,7 +1399,22 @@ __global__ void k_body_predict(BqRigidBody* __restrict__ bodies,
     }
 
     float3 v = make_float3(bodies[b].v[0], bodies[b].v[1], bodies[b].v[2]);
-    if (bodies[b].use_gravity) v.y += c_p.dt * c_p.gravity_y;
+
+    \* La GRAVITE n'est plus appliquee ici : elle est passee dans k_body_solve,
+     * ou elle entre comme une FORCE (m_b * g * dt) divisee par la masse
+     * effective, et non comme une acceleration a part.
+     *
+     * C'est la correction du defaut central du jalon (cf. A8,
+     * plan-milestone-17.md). Les deux formulations essayees avant lui
+     * commettaient la meme erreur sous deux formes : la masse ajoutee divisait
+     * la poussee sans diviser le poids (tout coulait), et le couplage implicite
+     * soudait le corps a la vitesse ABSOLUE du fluide -- quasi nulle au repos
+     * hydrostatique -- ce qui le clouait sur place quelle que soit la force
+     * recue (mesure : 10,7 % de l'acceleration attendue des la premiere frame).
+     *
+     * Diviser poussee ET poids par la meme masse effective preserve
+     * l'equilibre : un corps leger flotte, et l'equilibre atteint est bien
+     * celui d'Archimede, la masse ajoutee ne faisant que ralentir l'approche. */
 
     mat3 Ib_inv;
     for (int e = 0; e < 9; ++e) Ib_inv.m[e] = bodies[b].inv_inertia[e];
@@ -1684,11 +1699,40 @@ __global__ void k_body_solve(BqRigidBody* __restrict__ bodies,
             A[3 + r][3 + c] =  Iw.m[3 * r + c] + S_rr.m[3 * r + c]; /* I_b+S_rr */
         }
 
-    float3 rhs_lin = make_float3(mass * v_b.x + S_p.x, mass * v_b.y + S_p.y, mass * v_b.z + S_p.z);
-    float3 Ib_wb = matvec(Iw, w_b);
-    float3 rhs_ang = make_float3(Ib_wb.x + S_L.x, Ib_wb.y + S_L.y, Ib_wb.z + S_L.z);
-    rhs[0] = rhs_lin.x; rhs[1] = rhs_lin.y; rhs[2] = rhs_lin.z;
-    rhs[3] = rhs_ang.x; rhs[4] = rhs_ang.y; rhs[5] = rhs_ang.z;
+    /* Second membre = A * u_b + f, et NON "m_b*v_b + S_p" comme jusqu'a A7.
+     *
+     * La difference est tout le correctif A8. Avec l'ancien second membre, le
+     * systeme resolvait un CHOC INELASTIQUE : le corps adoptait la vitesse
+     * commune du fluide en contact, soit v_new = (m_b v_b + S_p)/(m_b + S_m).
+     * Developpe, cela contient un terme -S_m*v_b/(m_b+S_m) qui tire la vitesse
+     * du corps vers celle du fluide -- quasi nulle au repos hydrostatique. Avec
+     * S_m >> m_b (mesure : S_m ~ 8 m_b sur un corps flottant), le corps etait
+     * cloue sur place et ne recevait que la fraction m_b/(m_b+S_m) de
+     * l'impulsion : 10,7 % mesures a la premiere frame, alors meme que la force
+     * recoltee, elle, est correcte (verifie en A7, proportionnelle au volume
+     * immerge a 8 % pres).
+     *
+     * Avec rhs = A*u_b + f, la solution est exactement u_new = u_b + A^-1 f :
+     * une forme de MASSE AJOUTEE. Le terme de trainee vers le fluide disparait,
+     * la masse effective (m_b + S_m) ne fait plus que ralentir la reponse. Le
+     * point d'equilibre redevient donc celui ou poussee = poids, c'est-a-dire
+     * Archimede -- la soudure, elle, n'avait aucun equilibre propre : elle
+     * fixait le corps la ou etait le fluide.
+     *
+     * f porte l'impulsion fluide ET le poids, tous deux divises par la meme
+     * masse effective : c'est la symetrie qui manquait aux deux formulations
+     * precedentes. */
+    float3 f_lin = S_p;
+    if (bodies[b].use_gravity) f_lin.y += mass * c_p.dt * c_p.gravity_y;
+
+    float u_b[6] = {v_b.x, v_b.y, v_b.z, w_b.x, w_b.y, w_b.z};
+    for (int r = 0; r < 6; ++r) {
+        float acc_r = 0.f;
+        for (int c = 0; c < 6; ++c) acc_r += A[r][c] * u_b[c];
+        rhs[r] = acc_r;
+    }
+    rhs[0] += f_lin.x; rhs[1] += f_lin.y; rhs[2] += f_lin.z;
+    rhs[3] += S_L.x;   rhs[4] += S_L.y;   rhs[5] += S_L.z;
 
     solve6x6(A, rhs, sol);
     float3 v_new = make_float3(sol[0], sol[1], sol[2]);
