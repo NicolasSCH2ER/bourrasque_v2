@@ -1400,7 +1400,7 @@ __global__ void k_body_predict(BqRigidBody* __restrict__ bodies,
 
     float3 v = make_float3(bodies[b].v[0], bodies[b].v[1], bodies[b].v[2]);
 
-    \* La GRAVITE n'est plus appliquee ici : elle est passee dans k_body_solve,
+    /* La GRAVITE n'est plus appliquee ici : elle est passee dans k_body_solve,
      * ou elle entre comme une FORCE (m_b * g * dt) divisee par la masse
      * effective, et non comme une acceleration a part.
      *
@@ -1699,40 +1699,37 @@ __global__ void k_body_solve(BqRigidBody* __restrict__ bodies,
             A[3 + r][3 + c] =  Iw.m[3 * r + c] + S_rr.m[3 * r + c]; /* I_b+S_rr */
         }
 
-    /* Second membre = A * u_b + f, et NON "m_b*v_b + S_p" comme jusqu'a A7.
+    /* Second membre : choc inelastique corps/fluide, PLUS le poids traite comme
+     * une FORCE (m_b * g * dt) et non comme une acceleration appliquee a part.
      *
-     * La difference est tout le correctif A8. Avec l'ancien second membre, le
-     * systeme resolvait un CHOC INELASTIQUE : le corps adoptait la vitesse
-     * commune du fluide en contact, soit v_new = (m_b v_b + S_p)/(m_b + S_m).
-     * Developpe, cela contient un terme -S_m*v_b/(m_b+S_m) qui tire la vitesse
-     * du corps vers celle du fluide -- quasi nulle au repos hydrostatique. Avec
-     * S_m >> m_b (mesure : S_m ~ 8 m_b sur un corps flottant), le corps etait
-     * cloue sur place et ne recevait que la fraction m_b/(m_b+S_m) de
-     * l'impulsion : 10,7 % mesures a la premiere frame, alors meme que la force
-     * recoltee, elle, est correcte (verifie en A7, proportionnelle au volume
-     * immerge a 8 % pres).
+     * Ce seul terme est le correctif A8, et c'est le defaut central du jalon.
+     * Les deux formulations essayees avant lui commettaient la meme erreur : la
+     * masse ajoutee divisait la poussee par la masse effective sans diviser le
+     * poids, et le couplage implicite divisait la poussee par (m_b + S_m) alors
+     * que la gravite arrivait entiere depuis k_body_predict. Dans les deux cas
+     * l'equilibre etait rompu du meme cote : tout coulait.
      *
-     * Avec rhs = A*u_b + f, la solution est exactement u_new = u_b + A^-1 f :
-     * une forme de MASSE AJOUTEE. Le terme de trainee vers le fluide disparait,
-     * la masse effective (m_b + S_m) ne fait plus que ralentir la reponse. Le
-     * point d'equilibre redevient donc celui ou poussee = poids, c'est-a-dire
-     * Archimede -- la soudure, elle, n'avait aucun equilibre propre : elle
-     * fixait le corps la ou etait le fluide.
+     * Ici les deux passent par la meme masse effective, donc v_new = v_b exige
+     * S_p/dt = m_b*|g| : poussee = poids. L'equilibre atteint est EXACTEMENT
+     * celui d'Archimede, la masse effective ne reglant que la vitesse a
+     * laquelle on l'atteint.
      *
-     * f porte l'impulsion fluide ET le poids, tous deux divises par la meme
-     * masse effective : c'est la symetrie qui manquait aux deux formulations
-     * precedentes. */
-    float3 f_lin = S_p;
-    if (bodies[b].use_gravity) f_lin.y += mass * c_p.dt * c_p.gravity_y;
-
-    float u_b[6] = {v_b.x, v_b.y, v_b.z, w_b.x, w_b.y, w_b.z};
-    for (int r = 0; r < 6; ++r) {
-        float acc_r = 0.f;
-        for (int c = 0; c < 6; ++c) acc_r += A[r][c] * u_b[c];
-        rhs[r] = acc_r;
-    }
-    rhs[0] += f_lin.x; rhs[1] += f_lin.y; rhs[2] += f_lin.z;
-    rhs[3] += S_L.x;   rhs[4] += S_L.y;   rhs[5] += S_L.z;
+     * TENTATIVE ECARTEE, a ne pas refaire : remplacer ce second membre par
+     * A*u_b + f (forme de masse ajoutee pure, sans le terme -S_m*v_b) rend bien
+     * au corps 90 % de son acceleration theorique a la premiere frame -- mais
+     * fait sauter le caractere RELATIF de la force. Le fluide entraine par le
+     * corps voit alors sa propre vitesse reinjectee dans S_p : boucle positive,
+     * emballement. Mesure : corps ejecte a 413 m/s et parti en balistique. Le
+     * terme -S_m*v_b n'est pas un amortissement parasite, c'est ce qui rend la
+     * force relative. */
+    float3 rhs_lin = make_float3(mass * v_b.x + S_p.x,
+                                 mass * v_b.y + S_p.y,
+                                 mass * v_b.z + S_p.z);
+    if (bodies[b].use_gravity) rhs_lin.y += mass * c_p.dt * c_p.gravity_y;
+    float3 Ib_wb = matvec(Iw, w_b);
+    float3 rhs_ang = make_float3(Ib_wb.x + S_L.x, Ib_wb.y + S_L.y, Ib_wb.z + S_L.z);
+    rhs[0] = rhs_lin.x; rhs[1] = rhs_lin.y; rhs[2] = rhs_lin.z;
+    rhs[3] = rhs_ang.x; rhs[4] = rhs_ang.y; rhs[5] = rhs_ang.z;
 
     solve6x6(A, rhs, sol);
     float3 v_new = make_float3(sol[0], sol[1], sol[2]);
@@ -4303,7 +4300,12 @@ BQ_API int bq_read_contacts(BqSim* s, float* dst, int max) {
     int h_count = 0;
     BQ_CUDA_CHECK(cudaMemcpy(&h_count, s->d_contact_count, sizeof(int), cudaMemcpyDeviceToHost));
     if (dst == NULL || max <= 0 || h_count == 0) return h_count;
+    /* h_count est incremente par atomicAdd SANS plafond (cf. k_gen_contacts) :
+     * il peut donc depasser BQ_MAX_CONTACTS. Sans ce second clamp, un appelant
+     * qui passe max > BQ_MAX_CONTACTS provoque une lecture device hors bornes
+     * de d_contacts, qui n'est alloue qu'a BQ_MAX_CONTACTS. */
     int n_copy = (h_count < max) ? h_count : max;
+    if (n_copy > BQ_MAX_CONTACTS) n_copy = BQ_MAX_CONTACTS;
     std::vector<BqContact> tmp((size_t)n_copy);
     BQ_CUDA_CHECK(cudaMemcpy(tmp.data(), s->d_contacts, (size_t)n_copy * sizeof(BqContact),
                              cudaMemcpyDeviceToHost));
@@ -4612,9 +4614,22 @@ BQ_API int bq_step(BqSim* s, float frame_dt) {
             if (has_fluid) {
                 k_grid_gather<<<gc, bp>>>(s->d_grid, s->d_sdf, s->d_cnrm, s->d_cbody, s->d_bodies,
                                           s->d_body_gather, ncell);
-                k_body_solve<<<gpb, bpb>>>(s->d_bodies, s->d_body_gather, s->d_body_wrench,
-                                           s->n_bodies);
             }
+            /* k_body_solve est lance MEME SANS FLUIDE, et ce n'est pas un
+             * detail : depuis A9 c'est lui qui applique la gravite des corps
+             * (comme une force divisee par la masse effective, cf. son second
+             * membre). Le mettre sous `if (has_fluid)` -- ce qu'une premiere
+             * version de A9 faisait -- privait de gravite tout corps rigide
+             * d'une scene sans particule fluide : les corps flottaient en
+             * l'air, et les trois verifications de la porte de phase B (repos,
+             * empilement, energie), toutes specifiees SANS fluide, mesuraient
+             * en silence autre chose que ce qu'elles annoncaient.
+             *
+             * Sans fluide c'est sans danger : d_body_gather vient d'etre remis
+             * a zero juste au-dessus, donc S_m = 0 et le systeme 6x6 se reduit
+             * exactement a v += dt * g. */
+            k_body_solve<<<gpb, bpb>>>(s->d_bodies, s->d_body_gather, s->d_body_wrench,
+                                       s->n_bodies);
         }
         if (has_fluid) {
             k_grid_update<<<gc, bp>>>(s->d_grid, s->d_sdf, s->d_cvel, s->d_cnrm,

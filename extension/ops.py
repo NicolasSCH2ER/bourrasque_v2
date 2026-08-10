@@ -1527,6 +1527,16 @@ class BQ_OT_migrate_materials(bpy.types.Operator):
         planned_materials, assignment = materials.plan_migration(emitter_dicts)
 
         library = scene.bourrasque.materials
+        # `friction_angle` est INDISPENSABLE ici : `material_key` le lit pour le
+        # modele SAND. Sans lui, ce dictionnaire levait KeyError des que la
+        # bibliotheque contenait un materiau sable -- il n'etait meme pas
+        # necessaire qu'un emetteur l'utilise. L'operateur est expose dans l'UI
+        # sous le libelle « Reparer », declenche des qu'un emetteur est pendant :
+        # l'artiste cliquait et recevait un traceback.
+        #
+        # Troisieme occurrence de la meme famille (apres `used_material_slot_count`
+        # et `BQ_OT_material_duplicate`) : tout endroit qui reconstruit a la main
+        # un dict de materiau doit porter TOUS les champs lus par `material_key`.
         by_key = {
             materials.material_key(
                 {
@@ -1536,6 +1546,7 @@ class BQ_OT_migrate_materials(bpy.types.Operator):
                     "poisson": mat.poisson,
                     "bulk": mat.bulk,
                     "gamma": mat.gamma,
+                    "friction_angle": mat.friction_angle,
                 }
             ): mat.name
             for mat in library

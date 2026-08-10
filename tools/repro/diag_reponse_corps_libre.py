@@ -155,5 +155,72 @@ def main():
         print("     coexistent, aucun n'est dominant.")
 
 
+
+
+# ---------------------------------------------------------------------------
+# Porte du jalon : un corps libre atteint-il l'equilibre d'ARCHIMEDE ?
+# ---------------------------------------------------------------------------
+
+def flotte(densite=500.0, frames=260):
+    """Corps libre lache immerge, laisse aller jusqu'a stabilisation. La
+    fraction immergee finale doit valoir densite/1000.
+
+    C'est la mesure que le couplage soude ne pouvait pas passer : il n'avait
+    aucun equilibre propre, il figeait le corps la ou etait le fluide. La forme
+    de masse ajoutee, elle, s'annule quand poussee = poids -- donc a Archimede."""
+    cfg = lib.BqConfig()
+    cfg.grid_res[0], cfg.grid_res[1], cfg.grid_res[2] = RES
+    cfg.cell_size, cfg.gravity_y, cfg.cfl = CELL, GRAVITY, 0.4
+    cfg.ppc_axis, cfg.max_particles = 2, 400000
+
+    center = (0.48, CY, RES[2] * CELL / 2.0)
+    ax = [np.arange(lo + SPACING / 2, hi, SPACING)
+          for lo, hi in zip(WATER_LO, WATER_HI)]
+    g = np.stack(np.meshgrid(*ax, indexing="ij"), -1).reshape(-1, 3)
+    half = np.array([SIDE / 2.0 + SPACING, SIDE / 2.0 + SPACING, 1e9])
+    pts = np.ascontiguousarray(
+        g[~np.all(np.abs(g - np.asarray(center)) < half, axis=1)], dtype=np.float32)
+    tri = box_tris(center)
+    n_tri = tri.shape[0]
+    masse = densite * V_CORPS
+
+    print(f"\n===== EQUILIBRE : densite {densite:.0f}, fraction attendue "
+          f"{densite/1000.0:.2f} =====")
+    with lib.Sim(cfg) as sim:
+        sim.add_material(lib.BQ_MODEL_WATER, RHO, bulk=BULK, gamma=GAMMA)
+        sim.emit_points(0, pts)
+        sim.set_collider_bodies([make_body(center, 1.0e5, False)])
+        sim.set_colliders(tri, np.zeros_like(tri),
+                          np.zeros(n_tri, np.float32), np.zeros(n_tri, np.int32))
+        for _ in range(SETTLE):
+            sim.step(FRAME_DT)
+
+        sim.set_collider_bodies([make_body(center, masse, True)])
+        for f in range(frames):
+            st = sim.read_collider_bodies()[0]
+            c = (float(st[0]), float(st[1]), float(st[2]))
+            # geometrie du collider retransmise a la pose courante : le champ
+            # vu par le fluide n'est rafraichi qu'une fois par frame (D4)
+            sim.set_colliders(box_tris(c), np.zeros((n_tri, 3, 3), np.float32),
+                              np.zeros(n_tri, np.float32), np.zeros(n_tri, np.int32))
+            sim.step(FRAME_DT)
+            if (f + 1) % 65 == 0:
+                st = sim.read_collider_bodies()[0]
+                print(f"    frame {f+1:4d} : y = {st[1]:.4f}  vy = {st[8]:+.4f}")
+        st = sim.read_collider_bodies()[0]
+        pos = sim.read_positions().copy()
+
+    cy_fin = float(st[1])
+    r = np.abs(pos[:, 0] - 0.48)
+    loin = pos[r > SIDE / 2.0 + 2 * CELL]
+    surf = float(np.percentile(loin[:, 1], 98))
+    frac = float(np.clip((surf - (cy_fin - SIDE / 2.0)) / SIDE, 0.0, 1.0))
+    print(f"  surface libre {surf:.4f}   centre du corps {cy_fin:.4f}")
+    print(f"  fraction immergee MESUREE {frac:.3f}   attendue {densite/1000.0:.3f}")
+    print(f"  vitesse finale {float(st[8]):+.4f} m/s")
+    return frac
+
+
 if __name__ == "__main__":
     main()
+    flotte(500.0)

@@ -68,9 +68,13 @@ typedef struct BqMaterial {
     float friction_angle; /* angle de frottement interne, en DEGRES (typ. 30-40).
                              Commande directement la pente du tas au repos :
                              c'est le reglage que l'artiste manipule. */
-    float cohesion;       /* 0 = sable sec. Decale le sommet du cone de
-                             Drucker-Prager : permet une legere traction, donc
-                             des amas qui tiennent (sable humide grossier). */
+    float cohesion;       /* NON IMPLEMENTEE dans ce build : bq_add_material
+                             REFUSE tout materiau SAND dont cohesion != 0, avec
+                             un message explicite. Doit donc valoir 0 (sable
+                             sec). Le champ est conserve parce que l'ABI est
+                             posee ; l'intention, quand elle sera cablee, est de
+                             decaler le sommet du cone de Drucker-Prager pour
+                             autoriser une legere traction (amas qui tiennent). */
 } BqMaterial;
 
 /* Version d'ABI de la bibliotheque compilee. A comparer a BQ_ABI_VERSION
@@ -326,8 +330,14 @@ BQ_API int bq_build_body_sdf(BqSim* sim, int body, const float* tri, int n_tri,
 /* Points d'echantillonnage de surface du corps `body`, repere de CORPS (D10,
    generes cote Python par extension/rigidbody.py). `pts` : 3*n floats xyz.
    Purement stocke pour l'instant -- consomme par la detection de contact
-   d'un lot ulterieur (M17, phase B). n == 0 efface les echantillons du
-   corps. Renvoie 0, ou -1 sur erreur. */
+   n == 0 efface les echantillons du corps. Renvoie 0, ou -1 sur erreur.
+
+   Consommes par k_gen_contacts : chaque echantillon de A est teste contre le
+   SDF local de B, dans les deux sens. Ils doivent etre DETERMINISTES d'un
+   appel a l'autre -- le solveur de contact apparie ses impulsions d'un
+   sous-pas au suivant par indice d'echantillon (warm starting), et un jeu de
+   points qui changerait casserait la stabilite des empilements. C'est ce que
+   garantit extension/rigidbody.py::surface_samples (graine fixe). */
 BQ_API int bq_set_body_samples(BqSim* sim, int body, const float* pts, int n);
 
 /* Diagnostic : copie la grille SDF locale brute du corps `body` vers `dst`
