@@ -43,10 +43,11 @@ class BourrasqueError(Exception):
 
 BQ_MODEL_ELASTIC = 0
 BQ_MODEL_WATER = 1
+BQ_MODEL_SAND = 2
 BQ_MAX_MATERIALS = 8
 
 # Doit rester synchronise avec la macro BQ_ABI_VERSION de core/include/bourrasque.h.
-BQ_ABI_VERSION = 11
+BQ_ABI_VERSION = 13
 
 # Champs de bits de BqMesherConfig.channels (cf. core/include/bourrasque.h) :
 # un seul canal existe pour l'instant, la vitesse par sommet (motion blur).
@@ -85,6 +86,10 @@ class BqMaterial(ctypes.Structure):
         ("nu", ctypes.c_float),
         ("bulk", ctypes.c_float),
         ("gamma", ctypes.c_float),
+        # SAND uniquement (Drucker-Prager, jalon M18) : angle de frottement
+        # interne en DEGRES, et cohesion (0 = sable sec).
+        ("friction_angle", ctypes.c_float),
+        ("cohesion", ctypes.c_float),
     ]
 
 
@@ -175,6 +180,10 @@ class BqRigidBody(ctypes.Structure):
         ("lock_lin", ctypes.c_int * 3),
         ("lock_ang", ctypes.c_int * 3),
         ("restitution", ctypes.c_float),
+        # Contact corps-corps (M17 phase B) : coefficient de Coulomb du corps.
+        # Le coefficient d'une PAIRE est la moyenne geometrique des deux,
+        # sqrt(muA * muB), cote coeur.
+        ("friction", ctypes.c_float),
     ]
 
 
@@ -495,6 +504,49 @@ def _declare_prototypes(dll):
     ]
     dll.bq_set_collider_bodies.restype = ctypes.c_int
 
+    # -- contact corps <-> corps (M17, phase B) ---------------------------
+
+    dll.bq_build_body_sdf.argtypes = [
+        BqSimPtr,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_float,
+        ctypes.c_int,
+    ]
+    dll.bq_build_body_sdf.restype = ctypes.c_int
+
+    dll.bq_set_body_samples.argtypes = [
+        BqSimPtr,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+    ]
+    dll.bq_set_body_samples.restype = ctypes.c_int
+
+    dll.bq_read_contacts.argtypes = [
+        BqSimPtr,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+    ]
+    dll.bq_read_contacts.restype = ctypes.c_int
+
+    dll.bq_contacts_last_overflow.argtypes = [BqSimPtr]
+    dll.bq_contacts_last_overflow.restype = ctypes.c_int
+
+    dll.bq_read_body_sleep.argtypes = [BqSimPtr, ctypes.POINTER(ctypes.c_uint8)]
+    dll.bq_read_body_sleep.restype = ctypes.c_int
+
+    dll.bq_set_body_pose.argtypes = [
+        BqSimPtr,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    dll.bq_set_body_pose.restype = ctypes.c_int
+
     dll.bq_read_collider_bodies.argtypes = [BqSimPtr, ctypes.POINTER(ctypes.c_float)]
     dll.bq_read_collider_bodies.restype = ctypes.c_int
 
@@ -716,8 +768,12 @@ class Sim:
             raise BourrasqueError(_last_error(self._dll))
         return code
 
-    def add_material(self, model, rho, E=0.0, nu=0.0, bulk=0.0, gamma=0.0):
-        mat = BqMaterial(model=model, rho=rho, E=E, nu=nu, bulk=bulk, gamma=gamma)
+    def add_material(self, model, rho, E=0.0, nu=0.0, bulk=0.0, gamma=0.0,
+                     friction_angle=0.0, cohesion=0.0):
+        """`friction_angle` (degres) et `cohesion` ne concernent que
+        `BQ_MODEL_SAND` ; les laisser a zero pour les autres modeles."""
+        mat = BqMaterial(model=model, rho=rho, E=E, nu=nu, bulk=bulk, gamma=gamma,
+                         friction_angle=friction_angle, cohesion=cohesion)
         return self._check(self._dll.bq_add_material(self._handle, ctypes.byref(mat)))
 
     def emit_box(self, mat_id, lo, hi, vel=(0.0, 0.0, 0.0)):
@@ -887,6 +943,109 @@ class Sim:
         return self._check(
             self._dll.bq_set_collider_bodies(self._handle, bodies_ptr, n_bodies)
         )
+
+    def build_body_sdf(self, body, triangles, target_cell, max_res=128):
+        """Construit et stocke le champ de distance signee LOCAL du corps
+        `body`, a partir de ses triangles de REPOS exprimes en repere de
+        corps (origine au centre de masse) — voir `bq_build_body_sdf`.
+
+        A appeler UNE SEULE FOIS par corps, au debut du bake : le corps
+        etant rigide, ce champ ne change jamais, une requete monde se
+        ramene a `p_local = R^T (p - x)` puis une lecture trilineaire.
+
+        `triangles` : ndarray `(n_tri, 3, 3)` float32, meme mise en forme
+        que `set_colliders`. `target_cell` : taille de voxel visee (le `dx`
+        du domaine, pour que la finesse du contact suive celle de la
+        simulation) ; `max_res` plafonne la resolution par axe — au-dela le
+        coeur agrandit le voxel et le signale sur stderr.
+        """
+        arr = np.ascontiguousarray(triangles, dtype=np.float32)
+        n_tri = arr.shape[0]
+        ptr = arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)) if n_tri else None
+        return self._check(
+            self._dll.bq_build_body_sdf(
+                self._handle, body, ptr, n_tri, float(target_cell), int(max_res)
+            )
+        )
+
+    def set_body_samples(self, body, points):
+        """Points d'echantillonnage de SURFACE du corps `body`, en repere de
+        corps (voir `bq_set_body_samples`). Produits par
+        `extension.rigidbody.surface_samples`, qui est DETERMINISTE : le
+        solveur de contact apparie ses impulsions d'un sous-pas a l'autre par
+        indice d'echantillon (warm starting), un jeu de points qui changerait
+        d'un appel a l'autre casserait la stabilite des empilements.
+
+        `points` : ndarray `(n, 3)`. `n == 0` efface les echantillons.
+        """
+        arr = np.ascontiguousarray(points, dtype=np.float32)
+        n = arr.shape[0]
+        ptr = arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)) if n else None
+        return self._check(self._dll.bq_set_body_samples(self._handle, body, ptr, n))
+
+    def set_body_pose(self, body, x, q, v=(0.0, 0.0, 0.0), w=(0.0, 0.0, 0.0)):
+        """Met a jour la pose ET la vitesse d'un corps CINEMATIQUE
+        (`dynamic == 0`) — voir `bq_set_body_pose`. A appeler par frame pour
+        un collider anime : rien d'autre ne fait avancer son `x`/`q`, et son
+        SDF de contact resterait sinon fige a la pose de la premiere frame.
+
+        Le coeur REFUSE un corps dynamique (sa pose appartient au solveur) et
+        un indice hors bornes. Contrairement a `set_collider_bodies`, cet
+        appel ne touche ni l'etat des autres corps, ni les compteurs de
+        sommeil, ni le cache de warm starting du contact — c'est toute sa
+        raison d'etre.
+
+        `v` et `w` comptent autant que la pose : le contact travaille sur la
+        vitesse RELATIVE. Sans elles, un mur qui avance ne transfere rien, il
+        penetre puis se fait repousser par la correction de position. Les
+        calculer par difference finie entre frames, comme la vitesse par
+        sommet des colliders animes pour le fluide.
+
+        `q` est en convention `(w, x, y, z)`, normalise defensivement cote
+        coeur.
+        """
+        return self._check(
+            self._dll.bq_set_body_pose(
+                self._handle,
+                int(body),
+                _vec3(x),
+                (ctypes.c_float * 4)(*[float(c) for c in q]),
+                _vec3(v),
+                _vec3(w),
+            )
+        )
+
+    def contact_count(self):
+        """Nombre de contacts detectes au DERNIER sous-pas (sans les copier)."""
+        return self._check(self._dll.bq_read_contacts(self._handle, None, 0))
+
+    def read_contacts(self, max_contacts=4096):
+        """Diagnostic : ndarray float32 `(k, 9)` — corps A, corps B (stockes
+        comme flottants), point[3], normale[3], profondeur. `k` est borne par
+        `max_contacts`. Voir `bq_read_contacts`."""
+        out = np.empty((max_contacts, 9), dtype=np.float32)
+        ptr = out.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        total = self._check(
+            self._dll.bq_read_contacts(self._handle, ptr, max_contacts)
+        )
+        return out[: min(total, max_contacts)]
+
+    def contacts_last_overflow(self):
+        """1 si le tampon de contacts a sature au dernier sous-pas. A
+        verifier plutot que de laisser une perte de contacts invisible —
+        meme discipline que `whitewater.last_refused`."""
+        return self._check(self._dll.bq_contacts_last_overflow(self._handle))
+
+    def read_body_sleep(self, out=None):
+        """Etat de sommeil des corps, ndarray uint8 `(n_bodies,)` : 1 =
+        endormi. Sans la mise en sommeil, un tas de debris fremit
+        indefiniment — defaut tres visible au rendu."""
+        n = getattr(self, "_n_bodies", 0)
+        if out is None or out.shape != (n,) or out.dtype != np.uint8:
+            out = np.empty((n,), dtype=np.uint8)
+        ptr = out.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)) if n else None
+        self._check(self._dll.bq_read_body_sleep(self._handle, ptr))
+        return out
 
     def read_collider_bodies(self, out=None):
         """Renvoie l'etat courant des corps, ndarray float32 de forme

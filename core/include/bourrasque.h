@@ -29,13 +29,23 @@ typedef struct BqSim BqSim; /* handle opaque */
 
 /* Version de l'ABI : a incrementer des que la disposition d'une struct
    publique ou la signature d'une fonction exportee change. */
-#define BQ_ABI_VERSION 11
+#define BQ_ABI_VERSION 13
 
-/* Modeles constitutifs. D'autres viendront (sable, neige) sans changer
- * l'API : c'est tout l'interet du pipeline MPM unifie. */
+/* Modeles constitutifs. D'autres viendront (neige) sans changer l'API :
+ * c'est tout l'interet du pipeline MPM unifie.
+ *
+ * ATTENTION aux dispatchs : jusqu'au jalon M18 le code supposait par endroits
+ * "pas ELASTIC => WATER" et retombait sur l'eau par un else muet. Avec un
+ * troisieme modele c'est un piege silencieux -- le pire ayant ete
+ * material_sound_speed, ou un sable de bulk nul donnait une vitesse du son
+ * nulle, donc un pas de temps non borne, donc une simulation qui explose loin
+ * de sa cause. Tout dispatch par modele doit etre EXHAUSTIF et echouer
+ * bruyamment sur un modele inconnu. */
 enum BqModel {
     BQ_MODEL_ELASTIC = 0, /* corotationnel fixe (E, nu)        */
-    BQ_MODEL_WATER   = 1  /* EOS de Tait J-based (bulk, gamma) */
+    BQ_MODEL_WATER   = 1, /* EOS de Tait J-based (bulk, gamma) */
+    BQ_MODEL_SAND    = 2  /* Drucker-Prager elastoplastique (E, nu,
+                             friction_angle, cohesion) -- Klar et al. 2016 */
 };
 
 typedef struct BqConfig {
@@ -50,10 +60,17 @@ typedef struct BqConfig {
 typedef struct BqMaterial {
     int   model;  /* BqModel                                   */
     float rho;    /* densite kg/m^3                            */
-    float E;      /* module de Young (ELASTIC)                 */
-    float nu;     /* coefficient de Poisson (ELASTIC)          */
+    float E;      /* module de Young (ELASTIC et SAND)         */
+    float nu;     /* coefficient de Poisson (ELASTIC et SAND)  */
     float bulk;   /* module de compressibilite k (WATER)       */
     float gamma;  /* exposant de Tait (WATER, typ. 3-7)        */
+    /* SAND uniquement (Drucker-Prager, cf. plan-milestone-18.md D2/D3) */
+    float friction_angle; /* angle de frottement interne, en DEGRES (typ. 30-40).
+                             Commande directement la pente du tas au repos :
+                             c'est le reglage que l'artiste manipule. */
+    float cohesion;       /* 0 = sable sec. Decale le sommet du cone de
+                             Drucker-Prager : permet une legere traction, donc
+                             des amas qui tiennent (sable humide grossier). */
 } BqMaterial;
 
 /* Version d'ABI de la bibliotheque compilee. A comparer a BQ_ABI_VERSION
@@ -187,7 +204,19 @@ typedef struct BqRigidBody {
                                pour cette tache. */
     int   lock_lin[3];      /* 1 = axe monde bloque en translation */
     int   lock_ang[3];
-    float restitution;      /* reserve pour la phase B (contact corps-corps), non lu ici */
+    float restitution;      /* coefficient de restitution normal au contact corps<->corps
+                               (M17/B3b, D11). Combinaison de paire : max(restA, restB) --
+                               un corps tres rebondissant impose sa restitution meme
+                               contre un corps mou. 0 par defaut. */
+    float friction;         /* coefficient de friction de Coulomb au contact corps<->corps
+                               (M17/B3b, D11 -- ABI 12 -> 13, champ AJOUTE). Combinaison de
+                               paire : moyenne geometrique sqrt(muA*muB) (D11 du plan),
+                               PAS la moyenne arithmetique -- un corps sans friction
+                               (mu=0) annule donc le frottement de la paire quel que soit
+                               l'autre corps, comme physiquement attendu (glace contre
+                               n'importe quoi glisse). N'a aucun rapport avec le
+                               `friction` par-triangle de bq_set_colliders, qui gouverne
+                               le contact FLUIDE<->solide, pas corps<->corps. */
 } BqRigidBody;
 
 /* sizeof(BqRigidBody) tel que la bibliotheque le voit -- meme motif que
@@ -210,6 +239,34 @@ BQ_API int bq_set_collider_bodies(BqSim* sim, const BqRigidBody* bodies, int n_b
    copies (peut etre 0 si aucun corps declare), ou -1 sur erreur. */
 BQ_API int bq_read_collider_bodies(BqSim* sim, float* dst);
 
+/* Met a jour la pose ET la vitesse d'un corps CINEMATIQUE (dynamic == 0),
+   sans toucher a l'etat des autres corps ni aux caches de contact (warm
+   start, sommeil). A appeler PAR SOUS-PAS ou par frame, contrairement a
+   bq_set_collider_bodies : ce n'est pas une reinitialisation, seuls x/q/v/w
+   du corps vise sont ecrases.
+
+   `x` : position du centre de masse, espace solveur. `q` : orientation,
+   convention (w, x, y, z), NORMALISEE defensivement avant stockage. `v`/`w`
+   comptent autant que la pose : le solveur de contact (k_contact_solve)
+   resout la vitesse RELATIVE entre corps, et k_grid_update lit la vitesse
+   vive d'un corps dynamique -- un mur cinematique sans vitesse penetrerait
+   puis repousserait par la seule correction de position (split impulse),
+   un contact mou et sale. Cote Python, v/w se calculent par difference finie
+   entre frames, comme la vitesse par sommet des colliders animes du chemin
+   fluide existant.
+
+   Le SDF local du corps (bq_build_body_sdf) n'a PAS besoin d'etre reconstruit
+   : il est en repere de corps, donc invariant par deplacement -- seule la
+   pose (x, q) change, la geometrie relative ne bouge pas.
+
+   Refuse (bq_last_error rempli, renvoie -1) : un corps dont dynamic != 0 (sa
+   pose est calculee par le solveur, l'ecraser depuis l'hote serait un bug
+   silencieux), ou un indice `body` hors de [0, n_bodies[ (n_bodies tel que
+   pose par le dernier bq_set_collider_bodies). Renvoie 0 sinon. */
+BQ_API int bq_set_body_pose(BqSim* sim, int body,
+                            const float x[3], const float q[4],
+                            const float v[3], const float w[3]);
+
 /* Copie vers `dst` (n_bodies*7 floats par corps : impulsion lineaire [3],
    moment angulaire [3], masse de fluide couplee [1]) le wrench du DERNIER
    sous-pas effectue -- diagnostic, et utilise par les tests de validation de
@@ -230,6 +287,125 @@ BQ_API int bq_read_collider_bodies(BqSim* sim, float* dst);
 BQ_API int bq_read_collider_wrench(BqSim* sim, float* dst);
 
 BQ_API const char* bq_last_error(void);
+
+/* ------------------------------------------------- SDF locaux par corps (M17, phase B, D9)
+ *
+ * Rigide, donc construit UNE SEULE FOIS par corps, au demarrage du bake --
+ * jamais reconstruit ensuite (contrairement au champ collider fusionne de
+ * bq_set_colliders, qui lui est reconstruit a chaque frame, en espace
+ * monde). Une requete au point p du MONDE devient p_local = R^T(p - x) (a
+ * la charge de l'appelant, cf. BqRigidBody::x/q pour x et R), puis une
+ * lecture trilineaire dans le champ local (body_sdf, cf. mlsmpm.cu). Sert au
+ * contact corps <-> corps (D10, lots suivants de M17/phase B) : a la surface
+ * d'un corps, son propre SDF fusionne vaudrait zero, d'ou la necessite d'un
+ * champ separe par corps.
+ */
+
+/* Construit et stocke le SDF local du corps `body`, a partir de ses
+   triangles de REPOS exprimes dans le repere de CORPS (origine au centre de
+   masse -- PAS l'espace monde, cf. BqRigidBody::x). `tri` : 9*n_tri floats
+   (3 sommets xyz par triangle), meme format que bq_set_colliders mais sans
+   vitesse ni friction (ce champ ne sert pas a entrainer le fluide). Grille
+   locale = AABB des triangles dilatee d'au moins 4 voxels de chaque cote
+   (une requete juste a l'exterieur du corps doit rendre une distance
+   positive utile, pas une sortie de grille) ; taille de voxel visee
+   `target_cell` (typiquement BqConfig::cell_size, pour une finesse de
+   contact coherente avec celle du fluide) ; plafond `max_res` voxels par
+   axe -- au-dela, le voxel est agrandi et un message est ecrit sur stderr
+   (meme discipline que la troncature de propagation de signe de
+   bq_set_colliders), jamais une troncature silencieuse.
+
+   Reconstruit et remplace le SDF existant du corps si un appel precedent en
+   avait deja pose un. `body` doit etre dans [0, 64[ (BQ_MAX_BODIES) --
+   n'exige PAS que bq_set_collider_bodies ait deja ete appele pour ce corps :
+   les deux pipelines (etat cinematique, geometrie de contact) sont
+   independants. Renvoie 0, ou -1 sur erreur (bq_last_error rempli). */
+BQ_API int bq_build_body_sdf(BqSim* sim, int body, const float* tri, int n_tri,
+                             float target_cell, int max_res);
+
+/* Points d'echantillonnage de surface du corps `body`, repere de CORPS (D10,
+   generes cote Python par extension/rigidbody.py). `pts` : 3*n floats xyz.
+   Purement stocke pour l'instant -- consomme par la detection de contact
+   d'un lot ulterieur (M17, phase B). n == 0 efface les echantillons du
+   corps. Renvoie 0, ou -1 sur erreur. */
+BQ_API int bq_set_body_samples(BqSim* sim, int body, const float* pts, int n);
+
+/* Diagnostic : copie la grille SDF locale brute du corps `body` vers `dst`
+   (doit contenir res_out[0]*res_out[1]*res_out[2] floats -- dimensionner
+   apres un premier appel avec dst == NULL pour lire seulement res_out, ou
+   par avance a max_res^3). `cell` recoit la taille de voxel EFFECTIVE (peut
+   differer de target_cell si le plafond a ete declenche a la construction),
+   `origin` le coin min de la grille locale (repere de corps) :
+   phi[(i*res_out[1]+j)*res_out[2]+k] est echantillonne au point
+   origin + (i,j,k)*cell, meme convention AUX NOEUDS que bq_read_sdf.
+   Chacun de dst/res_out/cell/origin peut etre NULL pour ne pas lire ce
+   canal. Renvoie le nombre de cellules (res_out[0]*res_out[1]*res_out[2]),
+   ou -1 si aucun SDF n'a ete construit pour ce corps (bq_last_error rempli). */
+BQ_API int bq_read_body_sdf(BqSim* sim, int body, float* dst, int res_out[3],
+                            float* cell, float origin[3]);
+
+/* Diagnostic et validation : interroge body_sdf() (cf. mlsmpm.cu) du corps
+   `body` en `n` points DEJA EXPRIMES EN REPERE DE CORPS (p_local =
+   R^T(p_monde - x_corps), a la charge de l'appelant -- cette fonction ne
+   connait pas la pose monde du corps, le champ etant rigide n'en a pas
+   besoin). `pts_local` : 3*n floats. `phi_out` : n floats. `grad_out` : n*3
+   floats, ou NULL pour ne pas calculer le gradient (differences centrees,
+   calculees a la volee, cf. mlsmpm.cu). Renvoie n, ou -1 sur erreur. */
+BQ_API int bq_query_body_sdf(BqSim* sim, int body, const float* pts_local, int n,
+                             float* phi_out, float* grad_out);
+
+/* ---------------------------------------------- contact corps <-> corps (M17, phase B, B3b)
+ *
+ * DETECTION (B3a) + RESOLUTION (B3b) : cette section genere des contacts a
+ * la cadence du sous-pas (dans bq_step, entre k_body_solve et
+ * k_advance_bodies, cf. D13) et les RESOUT par impulsions sequentielles
+ * (Gauss-Seidel projete, motif Catto -- cf. k_contact_solve dans mlsmpm.cu) :
+ * non-penetration (lambda_n >= 0), friction de Coulomb (|lambda_t| <=
+ * mu*lambda_n), split impulse pour la correction de penetration (canal
+ * SEPARE de la vitesse reelle -- ce qui distingue un empilement stable d'un
+ * tas qui respire, cf. commentaire du noyau) et warm starting entre
+ * sous-pas, apparie par (corps A, corps B, indice d'echantillon).
+ *
+ * Broadphase : AABB monde de chaque corps (obtenue de son SDF local, cf.
+ * bq_build_body_sdf), test de recouvrement par paires O(n^2) -- n est de
+ * l'ordre de la dizaine, plafonne a BQ_MAX_BODIES. Les paires
+ * statique/statique sont ecartees (aucun mouvement relatif possible).
+ *
+ * Generation : pour chaque paire retenue (A, B), chaque point
+ * d'echantillonnage de surface de A (cf. bq_set_body_samples) est teste
+ * contre le SDF local de B, DANS LES DEUX SENS (A contre B, et B contre A --
+ * le contact sommet/face est asymetrique). phi_B(p) < 0 => contact : point
+ * monde, normale = normalize(R_B * gradient de phi_B), profondeur = -phi_B.
+ *
+ * Mise en sommeil : un corps dont |v| et |w| restent sous un seuil pendant N
+ * sous-pas consecutifs est gele (vitesses forcees a zero, plus touche par la
+ * gravite) ; reveille des que sa vitesse RESOLUE (contact ou couplage
+ * fluide implicite, les deux passent par la meme verification apres coup)
+ * depasse un second seuil, plus haut. Cf. bq_read_body_sleep.
+ */
+
+/* Copie vers `dst` (au plus max*9 floats -- par contact : corps A, corps B
+   (stockes comme float), point[3], normale[3], profondeur) les contacts du
+   DERNIER sous-pas execute par bq_step. Renvoie le nombre TOTAL de contacts
+   detectes ce sous-pas (peut depasser `max` -- seuls min(retour, max) sont
+   copies) ; dst == NULL pour ne lire que ce compte. Renvoie -1 sur erreur. */
+BQ_API int bq_read_contacts(BqSim* sim, float* dst, int max);
+
+/* 1 si le tampon de contacts a sature (au moins un contact refuse faute de
+   place) au DERNIER sous-pas execute, 0 sinon. Meme motif que
+   bq_whitewater_last_refused : a verifier plutot que de laisser une perte de
+   contacts invisible. */
+BQ_API int bq_contacts_last_overflow(BqSim* sim);
+
+/* Diagnostic (M17, phase B, B3b) : copie vers `dst` (n_bodies octets, 1 =
+   corps endormi, 0 = eveille ou statique/cinematique) l'etat de sommeil
+   courant des corps -- cf. section "mise en sommeil" ci-dessus. Un corps
+   dynamique reste eveille tant que |v| ou |w| depasse le seuil de sommeil
+   pendant moins de N sous-pas consecutifs ; se reveille des que sa vitesse
+   resolue redepasse un second seuil (plus haut, pour eviter un
+   endormissement/reveil qui papillonne). Renvoie le nombre de corps copies,
+   ou -1 sur erreur. */
+BQ_API int bq_read_body_sleep(BqSim* sim, uint8_t* dst);
 
 /* ---------------------------------------------------------------- mailleur
  *

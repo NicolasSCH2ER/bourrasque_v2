@@ -12,7 +12,7 @@ extension/ops.py qui est exerce, pas une reimplementation parallele.
 `BQ_OT_bake.invoke()` ne peut pas etre appele directement en `--background`
 (pas de fenetre, `wm.event_timer_add` echoue) : ce script reproduit donc la
 partie "mise en place" (creation de la Sim, materiaux, emission, collecte
-des colliders, `_setup_dynamic_collider`/`_build_rigid_bodies`/
+des colliders, `_setup_collider_body`/`_build_rigid_bodies`/
 `set_collider_bodies`) en appelant les memes fonctions de production.
 
 Couvre, cas par cas :
@@ -252,7 +252,7 @@ def _setup_bake(scene, sim, origin, size, collider_objs, n_frames):
 
     `collider_objs` : liste d'objets Blender deja marques COLLIDER.
     Renvoie `(fake, error_message_or_None)` -- une ValueError levee par
-    `_setup_dynamic_collider` (maillage ouvert / volume degenere) est
+    `_setup_collider_body` (maillage ouvert / volume degenere) est
     capturee et renvoyee comme message plutot que de se propager, pour que
     l'appelant verifie le refus sans un try/except duplique a chaque site
     d'appel.
@@ -280,7 +280,7 @@ def _setup_bake(scene, sim, origin, size, collider_objs, n_frames):
         fake._advance_scene_frame()
         for state in dynamic_states:
             try:
-                ops._setup_dynamic_collider(state, fake._depsgraph, origin, size)
+                ops._setup_collider_body(state, fake._depsgraph, origin, size)
             except ValueError as exc:
                 return fake, str(exc)
         bodies = ops._build_rigid_bodies(collider_states)

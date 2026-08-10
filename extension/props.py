@@ -72,6 +72,16 @@ __all__ = (
 
 _PRESET_WATER = {"model": "WATER", "rho": 1000.0, "bulk": 4.0e4, "gamma": 3.0}
 _PRESET_JELLY = {"model": "ELASTIC", "rho": 1000.0, "young": 5.0e4, "poisson": 0.2}
+# Sable sec, sans cohesion (jalon M18, D7) : la cohesion cote coeur est
+# REFUSEE pour SAND aujourd'hui (`bq_add_material`), donc aucun preset ne
+# peut en proposer une valeur non nulle.
+_PRESET_SAND = {
+    "model": "SAND",
+    "rho": 1600.0,
+    "young": 3.5e5,
+    "poisson": 0.3,
+    "friction_angle": 35.0,
+}
 
 
 def _apply_preset(obj_props, values):
@@ -84,14 +94,18 @@ def _on_preset_update(self, context):
         _apply_preset(self, _PRESET_WATER)
     elif self.preset == "JELLY":
         _apply_preset(self, _PRESET_JELLY)
+    elif self.preset == "SAND":
+        _apply_preset(self, _PRESET_SAND)
     # CUSTOM : ne touche a rien.
 
 
 # Modele constitutif que chaque preset IMPLIQUE (derive de `_PRESET_WATER` /
-# `_PRESET_JELLY` ci-dessus, source de verite de ces valeurs).
+# `_PRESET_JELLY` / `_PRESET_SAND` ci-dessus, source de verite de ces
+# valeurs).
 _PRESET_IMPLIED_MODEL = {
     "WATER": _PRESET_WATER["model"],
     "JELLY": _PRESET_JELLY["model"],
+    "SAND": _PRESET_SAND["model"],
 }
 
 
@@ -193,6 +207,7 @@ class BqMaterialProps(PropertyGroup):
         items=(
             ("ELASTIC", "Élastique", "Modele corotationnel (E, nu)"),
             ("WATER", "Eau", "EOS de Tait (bulk, gamma)"),
+            ("SAND", "Sable", "Modele elastoplastique de Drucker-Prager (E, nu, angle de frottement)"),
         ),
         default="WATER",
         update=_on_model_update,
@@ -208,14 +223,14 @@ class BqMaterialProps(PropertyGroup):
 
     young: FloatProperty(
         name="Module de Young",
-        description="Module de Young E (modele elastique)",
+        description="Module de Young E (modele elastique/sable)",
         default=5.0e4,
         min=1e-6,
     )
 
     poisson: FloatProperty(
         name="Coefficient de Poisson",
-        description="Coefficient de Poisson nu (modele elastique)",
+        description="Coefficient de Poisson nu (modele elastique/sable)",
         default=0.2,
         min=0.0,
         max=0.49,
@@ -236,11 +251,38 @@ class BqMaterialProps(PropertyGroup):
         max=7.0,
     )
 
+    friction_angle: FloatProperty(
+        name="Angle de frottement",
+        description=(
+            "Angle de frottement interne, en degrés (modèle sable) : "
+            "commande la pente du tas au repos. Le cœur refuse toute "
+            "valeur hors de l'intervalle ouvert ]0°, 90°["
+        ),
+        default=35.0,
+        min=1e-3,
+        max=89.999,
+        subtype="NONE",
+        unit="NONE",
+    )
+
+    cohesion: FloatProperty(
+        name="Cohésion",
+        description=(
+            "Cohésion du sable (modèle sable) — NON IMPLÉMENTÉE côté "
+            "solveur : le cœur refuse aujourd'hui tout matériau sable "
+            "avec une cohésion non nulle. Volontairement absente de "
+            "l'interface (voir ui.py) ; laisser à 0"
+        ),
+        default=0.0,
+        min=0.0,
+    )
+
     preset: EnumProperty(
         name="Preset",
         items=(
             ("WATER", "Eau", "Preset eau (modele Tait)"),
             ("JELLY", "Gelée", "Preset gelee (modele elastique)"),
+            ("SAND", "Sable", "Preset sable (modele de Drucker-Prager)"),
             ("CUSTOM", "Personnalisé", "Parametres personnalises"),
         ),
         default="WATER",
@@ -1059,6 +1101,7 @@ def used_material_slot_count(scene):
                     "poisson": mat.poisson,
                     "bulk": mat.bulk,
                     "gamma": mat.gamma,
+                    "friction_angle": mat.friction_angle,
                 }
             )
         )

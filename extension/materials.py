@@ -57,18 +57,22 @@ _DEFAULT_NAME = "Matériau"
 _PRESET_LABELS = {
     "WATER": "Eau",
     "JELLY": "Gelée",
+    "SAND": "Sable",
 }
 # Modele constitutif que chaque preset IMPLIQUE (cf. `_PRESET_WATER` /
-# `_PRESET_JELLY` dans props.py, source de verite de ces valeurs). Sert a
-# n'utiliser le libelle d'un preset que s'il est COHERENT avec le modele
-# reellement porte par l'emetteur -- voir `_label_for_emitter`.
+# `_PRESET_JELLY` / `_PRESET_SAND` dans props.py, source de verite de ces
+# valeurs). Sert a n'utiliser le libelle d'un preset que s'il est COHERENT
+# avec le modele reellement porte par l'emetteur -- voir
+# `_label_for_emitter`.
 _PRESET_MODEL = {
     "WATER": "WATER",
     "JELLY": "ELASTIC",
+    "SAND": "SAND",
 }
 _MODEL_LABELS = {
     "WATER": "Eau",
     "ELASTIC": "Élastique",
+    "SAND": "Sable",
 }
 
 
@@ -78,14 +82,35 @@ def material_key(material):
     soit leur `name`). MEME semantique que la deduplication historique par
     tuple de valeurs (`ops.py`, avant cette refonte) : seuls les champs
     PERTINENTS pour le modele entrent dans la cle, les autres (herites du
-    PropertyGroup commun aux deux modeles) sont ignores meme s'ils different.
+    PropertyGroup commun aux modeles) sont ignores meme s'ils different.
 
     - ELASTIC -> `("ELASTIC", rho, young, poisson)`
     - WATER   -> `("WATER", rho, bulk, gamma)`
+    - SAND    -> `("SAND", rho, young, poisson, friction_angle)` -- l'angle
+      de frottement DOIT entrer dans la cle : deux sables qui ne different
+      que par cet angle sont deux materiaux physiquement distincts pour le
+      solveur (il commande la pente du tas au repos), les confondre serait
+      une perte silencieuse de reglage.
+
+    Dispatch EXHAUSTIF et explicite sur `model` : un modele non reconnu leve
+    plutot que de retomber silencieusement sur WATER (piege deja rencontre
+    sur ce jalon -- un `else` muet aurait mal encode/deduplique un troisieme
+    modele sans jamais le signaler).
     """
-    if material["model"] == "ELASTIC":
+    model = material["model"]
+    if model == "ELASTIC":
         return ("ELASTIC", material["rho"], material["young"], material["poisson"])
-    return ("WATER", material["rho"], material["bulk"], material["gamma"])
+    if model == "WATER":
+        return ("WATER", material["rho"], material["bulk"], material["gamma"])
+    if model == "SAND":
+        return (
+            "SAND",
+            material["rho"],
+            material["young"],
+            material["poisson"],
+            material["friction_angle"],
+        )
+    raise ValueError(f"material_key: modele inconnu {model!r}")
 
 
 def unique_name(desired, existing):

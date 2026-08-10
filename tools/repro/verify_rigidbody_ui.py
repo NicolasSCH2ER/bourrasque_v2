@@ -320,17 +320,26 @@ def test_fixed_collider_no_rigid_body_props():
         "dynamic" in drawn_props,
         f"props dessinées={drawn_props!r}",
     )
-    rigid_body_props = {
+    # M17/phase B (D12, tâche B4) : `restitution` (comme `friction`) régit
+    # DÉSORMAIS aussi le contact solide<->solide, où un collider FIXE est un
+    # corps de masse infinie comme un autre — il n'est donc plus une "fuite"
+    # qu'elle soit visible pour un collider fixe (revirement assumé par
+    # rapport à la phase A, où seul le couplage fluide<->solide existait).
+    check(
+        "collider fixe : `restitution` visible (D12, contact solide<->solide)",
+        "restitution" in drawn_props,
+        f"props dessinées={drawn_props!r}",
+    )
+    rigid_body_only_props = {
         "density",
         "use_gravity",
         "lock_location",
         "lock_rotation",
-        "restitution",
         "added_mass",
     }
-    leaked = drawn_props & rigid_body_props
+    leaked = drawn_props & rigid_body_only_props
     check(
-        "collider fixe : AUCUNE propriété de corps rigide dessinée (D14)",
+        "collider fixe : aucune propriété EXCLUSIVEMENT dynamique dessinée (D14)",
         not leaked,
         f"fuite={leaked!r}",
     )
@@ -531,6 +540,93 @@ def test_dashboard_rigid_bodies(n_dynamic):
 test_dashboard_rigid_bodies(0)
 test_dashboard_rigid_bodies(1)
 test_dashboard_rigid_bodies(3)
+
+
+# ---------------------------------------------------------------------------
+# 7) Tableau de bord : colliders au maillage non fermé (M17/phase B, B4)
+# ---------------------------------------------------------------------------
+print("\n=== 7) Tableau de bord : colliders au maillage non fermé (B4) ===")
+
+
+def test_dashboard_open_mesh_colliders():
+    from extension import ops
+
+    scene = fresh_scene()
+    make_domain(scene)
+    add_collider((0, 0, 0), (0.3, 0.3, 0.3), "Fixe", dynamic=False)
+
+    # Sans bake prealable : rien ne doit apparaitre (cache vide, D9/point 3
+    # de B4 -- jamais recalcule depuis un draw()).
+    results = draw_all_panels(bpy.context, "dashboard sans bake")
+    rec = results.get("BQ_PT_dashboard")
+    check(
+        "sans bake : aucune mention de maillage non fermé",
+        rec is not None
+        and not any("non fermé" in t.lower() for t in rec.label_texts),
+        f"labels={rec.label_texts if rec else None!r}",
+    )
+
+    # Simule un bake qui a memorise un collider statique au maillage ouvert
+    # (motif reel : BQ_OT_bake.invoke ecrit ops._OPEN_MESH_COLLIDERS[scene.name]).
+    ops._OPEN_MESH_COLLIDERS[scene.name] = ("OpenPlane",)
+    try:
+        results = draw_all_panels(bpy.context, "dashboard avec maillage ouvert mémorisé")
+        rec = results.get("BQ_PT_dashboard")
+        check(
+            "dessiné sans exception ni erreur RNA (icônes réelles)",
+            rec is not None,
+        )
+        check(
+            "le nom du collider apparaît",
+            rec is not None and any("OpenPlane" in t for t in rec.label_texts),
+            f"labels={rec.label_texts if rec else None!r}",
+        )
+        check(
+            "mention explicite « non fermé »",
+            rec is not None
+            and any("non fermé" in t.lower() for t in rec.label_texts),
+            f"labels={rec.label_texts if rec else None!r}",
+        )
+    finally:
+        ops._OPEN_MESH_COLLIDERS.pop(scene.name, None)
+
+
+test_dashboard_open_mesh_colliders()
+
+
+# ---------------------------------------------------------------------------
+# 8) Sous-panneau Collider : rappel par-objet (maillage non fermé mémorisé)
+# ---------------------------------------------------------------------------
+print("\n=== 8) Sous-panneau Collider : rappel par-objet (B4) ===")
+
+
+def test_collider_panel_open_mesh_reminder():
+    from extension import ops
+
+    scene = fresh_scene()
+    make_domain(scene)
+    plane = add_open_mesh_collider((0, 0, 0), "OpenPlaneObj", dynamic=False)
+    select_only(plane)
+
+    ops._OPEN_MESH_COLLIDERS[scene.name] = ("OpenPlaneObj",)
+    try:
+        results = draw_all_panels(bpy.context, "collider statique ouvert mémorisé")
+        rec = results.get("BQ_PT_collider")
+        check(
+            "dessiné sans exception ni erreur RNA",
+            rec is not None,
+        )
+        check(
+            "rappel « non fermé » affiché sur l'objet lui-même",
+            rec is not None
+            and any("non fermé" in t.lower() for t in rec.label_texts),
+            f"labels={rec.label_texts if rec else None!r}",
+        )
+    finally:
+        ops._OPEN_MESH_COLLIDERS.pop(scene.name, None)
+
+
+test_collider_panel_open_mesh_reminder()
 
 
 print()

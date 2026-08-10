@@ -34,6 +34,18 @@ def _elastic(rho=1000.0, young=1e5, poisson=0.3, bulk=0.0, gamma=0.0):
     return dict(model="ELASTIC", rho=rho, young=young, poisson=poisson, bulk=bulk, gamma=gamma)
 
 
+def _sand(rho=1600.0, young=3.5e5, poisson=0.3, friction_angle=35.0, bulk=0.0, gamma=0.0):
+    return dict(
+        model="SAND",
+        rho=rho,
+        young=young,
+        poisson=poisson,
+        bulk=bulk,
+        gamma=gamma,
+        friction_angle=friction_angle,
+    )
+
+
 # -- material_key -----------------------------------------------------------
 
 
@@ -60,6 +72,45 @@ def test_material_key_elastic_vs_water_same_rho():
         "ELASTIC vs WATER de meme rho -> cles differentes",
         material_key(a) != material_key(b),
     )
+
+
+def test_material_key_sand_same_params_same_key():
+    a = _sand(friction_angle=35.0)
+    b = _sand(friction_angle=35.0)
+    check("SAND: memes parametres -> meme cle", material_key(a) == material_key(b))
+
+
+def test_material_key_sand_differs_by_friction_angle():
+    """L'angle de frottement DOIT entrer dans la cle de deduplication : deux
+    sables qui ne different que par cet angle sont deux materiaux distincts
+    pour le solveur, les confondre serait une perte silencieuse."""
+    a = _sand(friction_angle=35.0)
+    b = _sand(friction_angle=40.0)
+    check(
+        "SAND: angle de frottement different -> cle differente",
+        material_key(a) != material_key(b),
+        f"{material_key(a)} vs {material_key(b)}",
+    )
+
+
+def test_material_key_sand_vs_elastic_same_rho_young_poisson():
+    a = _sand(rho=1000.0, young=1e5, poisson=0.3)
+    b = _elastic(rho=1000.0, young=1e5, poisson=0.3)
+    check(
+        "SAND vs ELASTIC de memes rho/young/poisson -> cles differentes",
+        material_key(a) != material_key(b),
+    )
+
+
+def test_material_key_unknown_model_raises():
+    """Dispatch EXHAUSTIF : un modele non reconnu doit lever bruyamment,
+    jamais retomber silencieusement sur WATER."""
+    try:
+        material_key(dict(model="PLASMA", rho=1.0))
+    except ValueError:
+        check("modele inconnu -> ValueError", True)
+    else:
+        check("modele inconnu -> ValueError", False, "aucune exception levee")
 
 
 # -- unique_name --------------------------------------------------------------
@@ -236,6 +287,44 @@ def test_collect_used_materials_empty_or_dangling_name_reported_missing():
     )
 
 
+def test_collect_used_materials_sands_differing_by_friction_angle_stay_distinct():
+    """Deux sables qui ne different QUE par l'angle de frottement doivent
+    produire deux specs distincts, pas un seul (piege explicitement signale
+    par la spec de ce jalon : l'angle de frottement est physiquement
+    pertinent, le confondre avec un autre sable serait une perte
+    silencieuse)."""
+    sand_35 = dict(name="Sable35", **_sand(friction_angle=35.0))
+    sand_40 = dict(name="Sable40", **_sand(friction_angle=40.0))
+    library = [sand_35, sand_40]
+    assignments = [("EmitterA", "Sable35"), ("EmitterB", "Sable40")]
+    specs, indices, missing = collect_used_materials(library, assignments)
+    check(
+        "deux sables d'angles differents -> 2 specs distincts",
+        len(specs) == 2,
+        f"len(specs)={len(specs)}",
+    )
+    check("pas de manquant", missing == [])
+    check(
+        "les deux emetteurs recoivent des index differents",
+        indices[0] != indices[1],
+        f"indices={indices}",
+    )
+
+
+def test_collect_used_materials_sands_same_friction_angle_merge():
+    sand_a = dict(name="SableA", **_sand(friction_angle=35.0))
+    sand_b = dict(name="SableB", **_sand(friction_angle=35.0))  # meme cle
+    library = [sand_a, sand_b]
+    assignments = [("EmitterA", "SableA"), ("EmitterB", "SableB")]
+    specs, indices, missing = collect_used_materials(library, assignments)
+    check(
+        "deux sables identiques (meme angle) -> 1 seul spec",
+        len(specs) == 1,
+        f"len(specs)={len(specs)}",
+    )
+    check("les deux emetteurs recoivent le meme index", indices[0] == indices[1])
+
+
 def test_collect_used_materials_empty_library_and_assignments():
     specs, indices, missing = collect_used_materials([], [])
     check(
@@ -265,10 +354,16 @@ def test_end_to_end_matches_legacy_tuple_dedup():
     legacy_specs = []
     legacy_emitter_index = []
     for e in emitters_raw:
+        # Dispatch EXHAUSTIF, meme discipline que `materials.material_key` :
+        # `plan_migration` ne route jamais de SAND ici (les champs herites
+        # DEPRECIES d'`BqObjectProps` n'ont jamais eu d'enum SAND), mais un
+        # `else` muet resterait un piege si ca changeait un jour.
         if e["model"] == "ELASTIC":
             key = ("ELASTIC", e["rho"], e["young"], e["poisson"])
-        else:
+        elif e["model"] == "WATER":
             key = ("WATER", e["rho"], e["bulk"], e["gamma"])
+        else:
+            raise ValueError(f"modele inconnu {e['model']!r}")
         if key in legacy_keys:
             idx = legacy_keys.index(key)
         else:
@@ -306,6 +401,10 @@ if __name__ == "__main__":
     test_material_key_water_ignores_young_poisson()
     test_material_key_water_differs_by_bulk()
     test_material_key_elastic_vs_water_same_rho()
+    test_material_key_sand_same_params_same_key()
+    test_material_key_sand_differs_by_friction_angle()
+    test_material_key_sand_vs_elastic_same_rho_young_poisson()
+    test_material_key_unknown_model_raises()
 
     test_unique_name_free_unchanged()
     test_unique_name_single_collision()
@@ -323,6 +422,8 @@ if __name__ == "__main__":
     test_collect_used_materials_unused_material_excluded()
     test_collect_used_materials_merges_same_key_different_names()
     test_collect_used_materials_empty_or_dangling_name_reported_missing()
+    test_collect_used_materials_sands_differing_by_friction_angle_stay_distinct()
+    test_collect_used_materials_sands_same_friction_angle_merge()
     test_collect_used_materials_empty_library_and_assignments()
 
     test_end_to_end_matches_legacy_tuple_dedup()

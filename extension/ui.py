@@ -42,7 +42,7 @@ import bpy
 import mathutils
 from bpy.types import Panel, UIList
 
-from . import cache, lib, meshcache, whitewatercache
+from . import cache, lib, meshcache, ops, whitewatercache
 from .props import (
     collider_triangle_count,
     domain_resolution,
@@ -571,6 +571,39 @@ def _draw_dashboard_rigid_bodies(layout, scene, props):
     )
 
 
+def _draw_dashboard_open_mesh_colliders(layout, scene):
+    """Colliders STATIQUES au maillage non fermé, signalés au DERNIER bake
+    (M17, phase B, tâche B4, point 3) : un plane (ou tout maillage ouvert)
+    ne peut porter aucun champ de distance signée (D9) et ne participera
+    donc jamais au contact solide↔solide, même s'il reste un collider
+    fluide parfaitement valide — c'est précisément le piège que vit un
+    artiste qui essaie d'arrêter un cube dynamique avec un plane.
+
+    Lecture SEULE d'un cache mémorisé par `BQ_OT_bake.invoke`
+    (`ops.open_mesh_collider_names`) : ne relance JAMAIS
+    `sampling.check_mesh_closed` ici (lancer de rayons sur un BVH, bien trop
+    coûteux pour un `draw()` appelé à chaque redessin). N'affiche donc rien
+    tant qu'aucun bake n'a encore été lancé sur cette scène.
+    """
+    names = ops.open_mesh_collider_names(scene)
+    if not names:
+        return
+
+    box = layout.box()
+    box.label(text="Colliders au maillage non fermé", icon="ERROR")
+    for name in names[:5]:
+        box.label(text=f"— {name}")
+    if len(names) > 5:
+        box.label(text=f"… et {len(names) - 5} autre(s)")
+    box.label(
+        text="Ne participent pas au contact solide↔solide (fluide inchangé)."
+    )
+    box.label(
+        text="Utilisez une boîte fermée, même très aplatie, pour arrêter "
+        "un solide dynamique."
+    )
+
+
 def _draw_dashboard_particle_estimate(layout, scene, props):
     box = layout.box()
     box.label(text="Particules estimées", icon="PARTICLES")
@@ -733,6 +766,7 @@ class BQ_PT_dashboard(Panel):
         _draw_dashboard_materials(layout, scene, props)
         _draw_dashboard_elements(layout, scene)
         _draw_dashboard_rigid_bodies(layout, scene, props)
+        _draw_dashboard_open_mesh_colliders(layout, scene)
         _draw_dashboard_particle_estimate(layout, scene, props)
 
         res_layout = mesh_layout(scene)
@@ -1026,12 +1060,50 @@ class BQ_PT_collider(Panel):
         obj = context.active_object
         obj_props = obj.bourrasque
         layout.prop(obj_props, "friction")
+        layout.prop(obj_props, "restitution")
+        # `friction`/`restitution` gouvernent DEUX contacts distincts (M17,
+        # phase B, tache B4) : le frottement/l'elasticite du FLUIDE contre
+        # cet obstacle (comme depuis M6), ET desormais le frottement de
+        # Coulomb / la restitution au contact avec les AUTRES SOLIDES
+        # (combinaison de paire : moyenne geometrique pour la friction,
+        # maximum pour la restitution -- cf. BqRigidBody, bourrasque.h) --
+        # y compris pour un collider FIXE (D12 : masse infinie, meme
+        # traitement de contact qu'un corps dynamique). Precise ici en toutes
+        # lettres : les libelles RNA de props.py (tooltips) ne le disent pas
+        # encore pour `friction`, hors perimetre de ce lot (props.py non
+        # touche).
+        info = layout.box()
+        info.scale_y = 0.8
+        info.label(
+            text="S'appliquent aussi au contact avec les autres solides",
+            icon="INFO",
+        )
+
+        # Point 3 de B4 : rappel GRATUIT (dict memorise au dernier bake, cf.
+        # ops.open_mesh_collider_names -- jamais un nouvel appel a
+        # `check_mesh_closed` ici) si CET objet a ete signale comme collider
+        # statique au maillage non ferme lors du dernier bake.
+        if obj_props.role == "COLLIDER" and not obj_props.dynamic:
+            if obj.name in ops.open_mesh_collider_names(scene):
+                warn = layout.box()
+                warn.label(
+                    text="Maillage non fermé : ne participe pas au contact "
+                    "solide↔solide.",
+                    icon="ERROR",
+                )
+                warn.label(
+                    text="Utilisez une boîte fermée (même très aplatie) "
+                    "pour arrêter un solide dynamique."
+                )
+
         layout.prop(obj_props, "dynamic")
 
         # D14 du plan M17 : le collider FIXE (le cas majoritaire, cf.
         # docstring du module) ne doit rien perdre, donc rien de plus ne se
         # dessine ci-dessous quand `dynamic` est faux -- pas de propriete de
-        # corps rigide, pas d'avertissement, pas d'information de masse.
+        # corps rigide, pas d'avertissement d'echelle, pas d'information de
+        # masse (`friction`/`restitution` sont deja dessines plus haut,
+        # desormais valables aussi pour un collider fixe -- D12).
         if not obj_props.dynamic:
             return
 
@@ -1039,7 +1111,6 @@ class BQ_PT_collider(Panel):
         layout.prop(obj_props, "use_gravity")
         layout.prop(obj_props, "lock_location")
         layout.prop(obj_props, "lock_rotation")
-        layout.prop(obj_props, "restitution")
 
         # -- Masse calculee, lecture seule (D7 du plan M17) ----------------
         #
@@ -1055,7 +1126,7 @@ class BQ_PT_collider(Panel):
         # chaque frame de survol de souris. Un maillage OUVERT donne donc
         # simplement un volume sans signification physique, affiche tel
         # quel sans faire planter le panneau -- le bake, lui, refuse
-        # proprement (voir `ops._setup_dynamic_collider`).
+        # proprement (voir `ops._setup_collider_body`).
         try:
             from .sampling import (
                 _evaluated_object_and_depsgraph,
@@ -1166,6 +1237,16 @@ class BQ_PT_materials(Panel):
         elif mat.model == "WATER":
             editor.prop(mat, "bulk")
             editor.prop(mat, "gamma")
+        elif mat.model == "SAND":
+            editor.prop(mat, "young")
+            editor.prop(mat, "poisson")
+            editor.prop(mat, "friction_angle")
+            # `cohesion` est VOLONTAIREMENT absente de l'UI : le coeur
+            # refuse aujourd'hui tout materiau SAND avec une cohesion non
+            # nulle (voir props.py, BqMaterialProps.cohesion). Exposer un
+            # champ editable dont toute valeur non nulle ferait echouer le
+            # bake serait un piege pour l'artiste -- meme traitement que
+            # `added_mass` au jalon precedent.
 
         editor.prop(mat, "viewport_color")
 
