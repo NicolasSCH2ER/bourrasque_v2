@@ -31,3 +31,22 @@ flip_fluids_addon/
 insydium_nexus/
 /Fluid-Sim-main
 /graphify-out
+
+# Logs de build et de tests (tenus hors du depot, regenerables)
+*.log
+build_log*.txt
+build_output.txt
+
+# Binaires et artefacts compiles produits par les harnais de tools/repro
+*.exe
+*.dll
+
+# Sauvegardes Blender
+*.blend1
+
+# Exports de maillage produits par l'extension
+/*.glb
+
+# Outillage d'assistant local
+.claude/
+CLAUDE.md
